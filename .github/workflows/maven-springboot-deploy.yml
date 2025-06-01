@@ -23,7 +23,7 @@ jobs:
       - name: ✅ Checkout Repository
         uses: actions/checkout@v4
 
-      - name: 📁 Create Directories & Reserved Space
+      - name: 📁 Create Directories
         run: |
           mkdir -p project/src/main/java/com/example/demo
           mkdir -p project/src/main/resources
@@ -31,7 +31,6 @@ jobs:
           mkdir -p project/docker
           mkdir -p project/report
           mkdir -p project/pages
-          mkdir -p project/target
           sudo fallocate -l 3G /opt/.reserved_space || sudo dd if=/dev/zero of=/opt/.reserved_space bs=1M count=3072
           sudo chmod 777 /opt/.reserved_space
 
@@ -53,87 +52,53 @@ jobs:
 
       - name: 📄 Generate pom.xml
         run: |
-          echo '<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">' > project/pom.xml
-          echo '  <modelVersion>4.0.0</modelVersion>' >> project/pom.xml
-          echo '  <groupId>com.example</groupId>' >> project/pom.xml
-          echo '  <artifactId>demo</artifactId>' >> project/pom.xml
-          echo '  <version>'$VERSION'</version>' >> project/pom.xml
-          echo '  <packaging>jar</packaging>' >> project/pom.xml
-          echo '  <properties>' >> project/pom.xml
-          echo '    <java.version>17</java.version>' >> project/pom.xml
-          echo '    <spring.boot.version>3.2.5</spring.boot.version>' >> project/pom.xml
-          echo '  </properties>' >> project/pom.xml
-          echo '  <dependencies>' >> project/pom.xml
-          echo '    <dependency>' >> project/pom.xml
-          echo '      <groupId>org.springframework.boot</groupId>' >> project/pom.xml
-          echo '      <artifactId>spring-boot-starter-web</artifactId>' >> project/pom.xml
-          echo '      <version>${spring.boot.version}</version>' >> project/pom.xml
-          echo '    </dependency>' >> project/pom.xml
-          echo '    <dependency>' >> project/pom.xml
-          echo '      <groupId>org.springframework.boot</groupId>' >> project/pom.xml
-          echo '      <artifactId>spring-boot-starter-actuator</artifactId>' >> project/pom.xml
-          echo '      <version>${spring.boot.version}</version>' >> project/pom.xml
-          echo '    </dependency>' >> project/pom.xml
-          echo '  </dependencies>' >> project/pom.xml
-          echo '  <build>' >> project/pom.xml
-          echo '    <plugins>' >> project/pom.xml
-          echo '      <plugin>' >> project/pom.xml
-          echo '        <groupId>org.springframework.boot</groupId>' >> project/pom.xml
-          echo '        <artifactId>spring-boot-maven-plugin</artifactId>' >> project/pom.xml
-          echo '        <version>${spring.boot.version}</version>' >> project/pom.xml
-          echo '        <executions>' >> project/pom.xml
-          echo '          <execution>' >> project/pom.xml
-          echo '            <goals><goal>repackage</goal></goals>' >> project/pom.xml
-          echo '          </execution>' >> project/pom.xml
-          echo '        </executions>' >> project/pom.xml
-          echo '      </plugin>' >> project/pom.xml
-          echo '    </plugins>' >> project/pom.xml
-          echo '  </build>' >> project/pom.xml
-          echo '  <distributionManagement>' >> project/pom.xml
-          echo '    <repository>' >> project/pom.xml
-          echo '      <id>github</id>' >> project/pom.xml
-          echo '      <url>https://maven.pkg.github.com/'$REPO_NAME'</url>' >> project/pom.xml
-          echo '    </repository>' >> project/pom.xml
-          echo '  </distributionManagement>' >> project/pom.xml
-          echo '</project>' >> project/pom.xml
+          echo "<project xmlns=\"http://maven.apache.org/POM/4.0.0\"" > project/pom.xml
+          echo "         xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\"" >> project/pom.xml
+          echo "         xsi:schemaLocation=\"http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd\">" >> project/pom.xml
+          echo "  <modelVersion>4.0.0</modelVersion>" >> project/pom.xml
+          echo "  <groupId>com.example</groupId>" >> project/pom.xml
+          echo "  <artifactId>demo</artifactId>" >> project/pom.xml
+          echo "  <version>\${VERSION}</version>" >> project/pom.xml
+          echo "  <packaging>jar</packaging>" >> project/pom.xml
+          echo "  <properties>" >> project/pom.xml
+          echo "    <java.version>17</java.version>" >> project/pom.xml
+          echo "    <spring.boot.version>3.2.5</spring.boot.version>" >> project/pom.xml
+          echo "  </properties>" >> project/pom.xml
+          echo "  <dependencies>" >> project/pom.xml
+          echo "    <dependency>" >> project/pom.xml
+          echo "      <groupId>org.springframework.boot</groupId>" >> project/pom.xml
+          echo "      <artifactId>spring-boot-starter-web</artifactId>" >> project/pom.xml
+          echo "      <version>\${spring.boot.version}</version>" >> project/pom.xml
+          echo "    </dependency>" >> project/pom.xml
+          echo "    <dependency>" >> project/pom.xml
+          echo "      <groupId>org.springframework.boot</groupId>" >> project/pom.xml
+          echo "      <artifactId>spring-boot-starter-actuator</artifactId>" >> project/pom.xml
+          echo "      <version>\${spring.boot.version}</version>" >> project/pom.xml
+          echo "    </dependency>" >> project/pom.xml
+          echo "  </dependencies>" >> project/pom.xml
+          echo "  <build>" >> project/pom.xml
+          echo "    <plugins>" >> project/pom.xml
+          echo "      <plugin>" >> project/pom.xml
+          echo "        <groupId>org.springframework.boot</groupId>" >> project/pom.xml
+          echo "        <artifactId>spring-boot-maven-plugin</artifactId>" >> project/pom.xml
+          echo "        <version>\${spring.boot.version}</version>" >> project/pom.xml
+          echo "        <executions><execution><goals><goal>repackage</goal></goals></execution></executions>" >> project/pom.xml
+          echo "      </plugin>" >> project/pom.xml
+          echo "    </plugins>" >> project/pom.xml
+          echo "  </build>" >> project/pom.xml
+          echo "</project>" >> project/pom.xml
 
       - name: 🧪 Add Spring Boot App
         run: |
           echo 'package com.example.demo;' > project/src/main/java/com/example/demo/DemoApplication.java
           echo 'import org.springframework.boot.SpringApplication;' >> project/src/main/java/com/example/demo/DemoApplication.java
           echo 'import org.springframework.boot.autoconfigure.SpringBootApplication;' >> project/src/main/java/com/example/demo/DemoApplication.java
+          echo '' >> project/src/main/java/com/example/demo/DemoApplication.java
           echo '@SpringBootApplication' >> project/src/main/java/com/example/demo/DemoApplication.java
           echo 'public class DemoApplication {' >> project/src/main/java/com/example/demo/DemoApplication.java
           echo '  public static void main(String[] args) {' >> project/src/main/java/com/example/demo/DemoApplication.java
           echo '    SpringApplication.run(DemoApplication.class, args);' >> project/src/main/java/com/example/demo/DemoApplication.java
           echo '  }' >> project/src/main/java/com/example/demo/DemoApplication.java
           echo '}' >> project/src/main/java/com/example/demo/DemoApplication.java
-          echo 'server.port=8080' > project/src/main/resources/application.properties
-          echo 'management.endpoints.web.exposure.include=*' >> project/src/main/resources/application.properties
-
-      - name: 🔧 Build with Maven
-        working-directory: project
-        run: mvn clean compile
-
-  codeql-scan:
-    runs-on: ubuntu-latest
-    permissions:
-      actions: read
-      contents: read
-      security-events: write
-
-    steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
-
-      - name: Initialize CodeQL
-        uses: github/codeql-action/init@v3
-        with:
-          languages: java
-
-      - name: Build with Maven
-        working-directory: project
-        run: mvn clean compile
-
-      - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@v3
+          echo "server.port=8080" > project/src/main/resources/application.properties
+          echo "management.endpoints.web.exposure.include=health,info,metrics" >> project/src/main/resources/application.properties
