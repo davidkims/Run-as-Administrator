@@ -2,9 +2,9 @@ name: PowerShell SARIF Analysis
 
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
   pull_request:
-    branches: [ "main" ]
+    branches: ["main"]
 
 permissions:
   contents: write
@@ -26,12 +26,38 @@ jobs:
           mkdir -p scripts
           echo 'Write-Host "Hello, world!"' > scripts/sample.ps1
 
-      - name: 🧪 Run Invoke-ScriptAnalyzer and Generate SARIF
+      - name: 🧪 Run PSScriptAnalyzer and Build SARIF
         shell: pwsh
         run: |
-          Install-Module -Name PSScriptAnalyzer -Force -Scope CurrentUser
-          $results = Invoke-ScriptAnalyzer -Path "./scripts" -Recurse -Severity Error,Warning,Information -Format Sarif
-          $results | Out-File results.sarif -Encoding utf8
+          Install-Module -Name PSScriptAnalyzer -Force -Scope CurrentUser -AllowClobber
+          $results = Invoke-ScriptAnalyzer -Path "./scripts" -Recurse -Severity Error,Warning,Information
+          $sarif = @{
+            '$schema' = 'https://json.schemastore.org/sarif-2.1.0.json'
+            version = '2.1.0'
+            runs = @(@{
+              tool = @{
+                driver = @{
+                  name = 'PSScriptAnalyzer'
+                  version = '1.24.0'
+                }
+              }
+              results = @()
+            })
+          }
+          foreach ($res in $results) {
+            $sarif.runs[0].results += @{
+              ruleId = $res.RuleName
+              level = $res.Severity.ToLower()
+              message = @{ text = $res.Message }
+              locations = @(@{
+                physicalLocation = @{
+                  artifactLocation = @{ uri = $res.ScriptPath }
+                  region = @{ startLine = $res.Line }
+                }
+              })
+            }
+          }
+          $sarif | ConvertTo-Json -Depth 10 | Out-File results.sarif -Encoding utf8
 
       - name: 📤 Upload SARIF to GitHub Code Scanning
         id: sarif-upload
