@@ -1,52 +1,55 @@
-name: PSScriptAnalyzer with Auto-Generated Settings
+name: PSScriptAnalyzer with Auto-Generated Script
 
 on:
   push:
     branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
-  schedule:
-    - cron: '37 9 * * 3'
-
-permissions:
-  contents: read
 
 jobs:
   analyze-powershell:
-    name: Analyze PowerShell Code
     runs-on: ubuntu-latest
-
-    permissions:
-      contents: read
-      security-events: write
-      actions: read
 
     steps:
       - name: 📥 Checkout code
         uses: actions/checkout@v4
 
+      - name: 📝 Generate PowerShell test script
+        run: |
+          mkdir -p scripts
+          echo 'Write-Host "This is a bad practice"' > scripts/sample.ps1
+          echo '$files = gci' >> scripts/sample.ps1
+          echo '$secure = "supersecret" | ConvertTo-SecureString -AsPlainText -Force' >> scripts/sample.ps1
+          echo '$unusedVar = 123' >> scripts/sample.ps1
+          echo 'try {' >> scripts/sample.ps1
+          echo '  1 / 0' >> scripts/sample.ps1
+          echo '} catch {' >> scripts/sample.ps1
+          echo '  # do nothing' >> scripts/sample.ps1
+          echo '}' >> scripts/sample.ps1
+          echo 'function Remove-Something {' >> scripts/sample.ps1
+          echo '  param ($Name)' >> scripts/sample.ps1
+          echo '  Remove-Item -Path $Name -Force' >> scripts/sample.ps1
+          echo '}' >> scripts/sample.ps1
+          echo 'Remove-Something -Name "C:\\Temp\\dummy.txt"' >> scripts/sample.ps1
+
       - name: 🛠 Generate .psd1 configuration file
         run: |
           mkdir -p .github
-          cat << 'EOF' > .github/psscriptanalyzer-settings.psd1
-@{
-    IncludeRules = @(
-        'PSAvoidGlobalAliases',
-        'PSAvoidUsingConvertToSecureStringWithPlainText',
-        'PSAvoidUsingWriteHost'
-    )
-    Rules = @{
-        PSAvoidUsingWriteHost = @{
-            Severity = 'Warning'
-        }
-    }
-}
-EOF
+          echo '@{' > .github/psscriptanalyzer-settings.psd1
+          echo '    IncludeRules = @(' >> .github/psscriptanalyzer-settings.psd1
+          echo "        'PSAvoidGlobalAliases'," >> .github/psscriptanalyzer-settings.psd1
+          echo "        'PSAvoidUsingConvertToSecureStringWithPlainText'," >> .github/psscriptanalyzer-settings.psd1
+          echo "        'PSAvoidUsingWriteHost'," >> .github/psscriptanalyzer-settings.psd1
+          echo "        'PSUseDeclaredVarsMoreThanAssignments'," >> .github/psscriptanalyzer-settings.psd1
+          echo "        'PSAvoidUsingEmptyCatchBlock'," >> .github/psscriptanalyzer-settings.psd1
+          echo "        'PSUseShouldProcessForStateChangingFunctions'" >> .github/psscriptanalyzer-settings.psd1
+          echo '    )' >> .github/psscriptanalyzer-settings.psd1
+          echo '}' >> .github/psscriptanalyzer-settings.psd1
 
       - name: 🧪 Run PSScriptAnalyzer
         uses: microsoft/psscriptanalyzer-action@6b2948b1944407914a58661c49941824d149734f
         with:
-          path: ./
+          path: ./scripts
           recurse: true
           settingsPath: .github/psscriptanalyzer-settings.psd1
           output: results.sarif
