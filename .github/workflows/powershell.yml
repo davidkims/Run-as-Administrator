@@ -20,12 +20,15 @@ jobs:
       - name: 📥 Checkout
         uses: actions/checkout@v4
 
-      - name: 📝 Create test script
+      - name: 📝 Create secure test script
         run: |
           mkdir -p scripts
-          echo 'Write-Host "Hello, world!"' > scripts/sample.ps1
+          echo 'Write-Output "Hello, world!"' > scripts/sample.ps1
+          echo '$files = Get-ChildItem -Path . -Recurse' >> scripts/sample.ps1
+          echo '$cred = Get-Credential' >> scripts/sample.ps1
+          echo '$secure = $cred.Password' >> scripts/sample.ps1
 
-      - name: ⚙️ Generate SARIF 2.1.0 (PowerShell)
+      - name: ⚙️ Generate SARIF 2.1.0 (Clean)
         shell: pwsh
         run: |
           $sarif = @{
@@ -58,13 +61,10 @@ jobs:
                     region = @{ startLine = 1; startColumn = 1 }
                   }
                 })
-                partialFingerprints = @{
-                  primaryLocationLineHash = 'f1e2d3c4b5a69788'
-                }
               })
             })
           }
-          $sarif | ConvertTo-Json -Depth 10 | Out-File results.sarif -Encoding UTF8
+          $sarif | ConvertTo-Json -Depth 10 | Out-File results.sarif -Encoding UTF8BOM
 
       - name: 📤 Upload SARIF to GitHub Security tab
         uses: github/codeql-action/upload-sarif@v3
