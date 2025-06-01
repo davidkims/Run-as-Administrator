@@ -52,7 +52,7 @@ jobs:
 
       - name: 📄 Generate pom.xml
         run: |
-          cat > project/pom.xml << 'EOF'
+          cat <<'EOF' > project/pom.xml
 <project xmlns="http://maven.apache.org/POM/4.0.0"
          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
          xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
@@ -85,7 +85,9 @@ jobs:
         <version>${spring.boot.version}</version>
         <executions>
           <execution>
-            <goals><goal>repackage</goal></goals>
+            <goals>
+              <goal>repackage</goal>
+            </goals>
           </execution>
         </executions>
       </plugin>
@@ -94,7 +96,7 @@ jobs:
   <distributionManagement>
     <repository>
       <id>github</id>
-      <url>https://maven.pkg.github.com/${{ github.repository }}</url>
+      <url>https://maven.pkg.github.com/${REPO_NAME}</url>
     </repository>
   </distributionManagement>
 </project>
@@ -102,7 +104,7 @@ EOF
 
       - name: 🧪 Add Spring Boot App
         run: |
-          cat > project/src/main/java/com/example/demo/DemoApplication.java << 'EOF'
+          cat <<'EOF' > project/src/main/java/com/example/demo/DemoApplication.java
 package com.example.demo;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
@@ -123,7 +125,7 @@ EOF
 
       - name: 🐳 Generate Dockerfile
         run: |
-          cat > project/Dockerfile << 'EOF'
+          cat <<'EOF' > project/Dockerfile
 FROM eclipse-temurin:17-jdk-alpine
 COPY target/*.jar app.jar
 ENTRYPOINT ["java","-jar","/app.jar"]
@@ -160,7 +162,7 @@ EOF
 
       - name: 🐳 Generate docker-compose.yml
         run: |
-          cat > project/docker/docker-compose.yml << 'EOF'
+          cat <<EOF > project/docker/docker-compose.yml
 version: '3'
 services:
   app:
@@ -171,7 +173,7 @@ EOF
 
       - name: ☸ Generate K8s Deployment YAML
         run: |
-          cat > project/k8s/deployment.yaml << 'EOF'
+          cat <<EOF > project/k8s/deployment.yaml
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -190,7 +192,7 @@ spec:
       - name: app
         image: $IMAGE_NAME
         ports:
-      - containerPort: 8080
+        - containerPort: 8080
 ---
 apiVersion: v1
 kind: Service
