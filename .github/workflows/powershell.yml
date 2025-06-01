@@ -1,4 +1,4 @@
-name: PSScriptAnalyzer with Secure + Insecure Sample
+name: PSScriptAnalyzer with User Profile Error Check
 
 on:
   push:
@@ -20,32 +20,34 @@ jobs:
       - name: 📥 Checkout repository
         uses: actions/checkout@v4
 
-      - name: 📝 Create insecure sample.ps1 (violates rules)
+      - name: 📝 Create insecure PowerShell test (sample.ps1)
         run: |
           mkdir -p scripts
           echo 'Write-Host "Bad practice"' > scripts/sample.ps1
           echo '$files = gci' >> scripts/sample.ps1
-          echo '# ❗ This is insecure. Do NOT use in real scripts.' >> scripts/sample.ps1
+          echo '# ❗ insecure test case for PSScriptAnalyzer' >> scripts/sample.ps1
           echo '$secure = "plaintext" | ConvertTo-SecureString -AsPlainText -Force' >> scripts/sample.ps1
 
-      - name: 🛡️ Create secure secure-sample.ps1 (compliant)
+      - name: 🛡️ Create secure PowerShell test (secure-sample.ps1)
         run: |
-          echo '# ✅ Secure method using Read-Host' > scripts/secure-sample.ps1
+          echo '# ✅ Secure: Read-Host' > scripts/secure-sample.ps1
           echo '$secure = Read-Host "Enter your password" -AsSecureString' >> scripts/secure-sample.ps1
           echo '' >> scripts/secure-sample.ps1
-          echo '# ✅ Preferred way using Get-Credential' >> scripts/secure-sample.ps1
+          echo '# ✅ Secure: Get-Credential' >> scripts/secure-sample.ps1
           echo '$cred = Get-Credential' >> scripts/secure-sample.ps1
 
-      - name: ⚙️ Generate .psd1 PSScriptAnalyzer config
+      - name: ⚙️ Generate PSScriptAnalyzer settings.psd1
         run: |
           mkdir -p .github
-          echo '@{' > .github/psscriptanalyzer-settings.psd1
-          echo '    IncludeRules = @(' >> .github/psscriptanalyzer-settings.psd1
-          echo "        'PSAvoidGlobalAliases'," >> .github/psscriptanalyzer-settings.psd1
-          echo "        'PSAvoidUsingConvertToSecureStringWithPlainText'," >> .github/psscriptanalyzer-settings.psd1
-          echo "        'PSAvoidUsingWriteHost'" >> .github/psscriptanalyzer-settings.psd1
-          echo '    )' >> .github/psscriptanalyzer-settings.psd1
-          echo '}' >> .github/psscriptanalyzer-settings.psd1
+          cat << 'EOF' > .github/psscriptanalyzer-settings.psd1
+@{
+    IncludeRules = @(
+        'PSAvoidGlobalAliases',
+        'PSAvoidUsingConvertToSecureStringWithPlainText',
+        'PSAvoidUsingWriteHost'
+    )
+}
+EOF
 
       - name: 🧪 Run PSScriptAnalyzer
         uses: microsoft/psscriptanalyzer-action@6b2948b1944407914a58661c49941824d149734f
@@ -55,7 +57,15 @@ jobs:
           settingsPath: .github/psscriptanalyzer-settings.psd1
           output: results.sarif
 
-      - name: 📤 Upload SARIF to GitHub Security
+      - name: 🔍 Simulate Windows user profile log analysis (for SARIF)
+        run: |
+          mkdir -p logs
+          echo 'Analyzing Windows Event Logs (simulated)...' > logs/user-profile.log
+          echo '[Warning] EventID 1511: User profile could not be loaded. TEMP profile used.' >> logs/user-profile.log
+          echo '[Error] EventID 1500: The user profile service failed the logon.' >> logs/user-profile.log
+          echo '[Info] EventID 1509: ntuser.dat could not be loaded due to permission issue.' >> logs/user-profile.log
+
+      - name: 📤 Try uploading SARIF to GitHub Security
         id: upload
         continue-on-error: true
         uses: github/codeql-action/upload-sarif@v3
@@ -63,15 +73,17 @@ jobs:
           sarif_file: results.sarif
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: 🌐 Convert SARIF to HTML report (fallback)
+      - name: 🌐 Convert SARIF + logs to HTML (fallback)
         if: steps.upload.outcome == 'failure'
         run: |
           npm install -g @microsoft/sarif-multitool
           mkdir -p report
           sarif-multitool rewrite --force --uriBaseId "file://" results.sarif --output report/results.sarif
           sarif-multitool export report/results.sarif --format html --output report/index.html
+          echo "<hr><h2>User Profile Error Summary</h2>" >> report/index.html
+          cat logs/user-profile.log >> report/index.html
 
-      - name: 🚀 Deploy HTML to GitHub Pages
+      - name: 🚀 Deploy HTML Report to GitHub Pages
         if: steps.upload.outcome == 'failure'
         uses: peaceiris/actions-gh-pages@v4
         with:
