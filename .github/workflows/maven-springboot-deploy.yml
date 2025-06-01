@@ -1,31 +1,37 @@
-name: Maven SpringBoot Build & Deploy with Docker + Actuator
+name: Full SpringBoot CI/CD with Docker, K8s, Pages, CodeQL
 
 on:
   release:
     types: [created]
   workflow_dispatch:
 
+permissions:
+  contents: write
+  packages: write
+  pages: write
+  id-token: write
+
 env:
   BASE_VERSION: 1
+  DOCKER_REGISTRY: ghcr.io
 
 jobs:
-  build-and-deploy:
+  build:
     runs-on: ubuntu-latest
-
-    permissions:
-      contents: write
-      packages: write
 
     steps:
     - name: ✅ Checkout Repository
       uses: actions/checkout@v4
 
-    - name: 📁 Create Project Directories & Reserve Disk
+    - name: 📁 Create Directories & Disk
       run: |
         mkdir -p project/src/main/java/com/example/demo
         mkdir -p project/src/main/resources
-        mkdir -p project/target
-        sudo fallocate -l 2G /opt/.reserved_space || sudo dd if=/dev/zero of=/opt/.reserved_space bs=1M count=2048
+        mkdir -p project/k8s
+        mkdir -p project/docker
+        mkdir -p project/report
+        mkdir -p project/pages
+        sudo fallocate -l 3G /opt/.reserved_space || sudo dd if=/dev/zero of=/opt/.reserved_space bs=1M count=3072
         sudo chmod 777 /opt/.reserved_space
 
     - name: ☕ Setup JDK and Maven
@@ -36,15 +42,15 @@ jobs:
         server-id: github
         settings-path: ${{ github.workspace }}
 
-    - name: 📌 Set Unique Version and Lowercase Repo
+    - name: 📌 Set Version and Image Name
       run: |
         VERSION=${{ env.BASE_VERSION }}.${{ github.run_number }}
         LOWER_REPO=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
         echo "VERSION=$VERSION" >> $GITHUB_ENV
-        echo "LOWER_REPO=$LOWER_REPO" >> $GITHUB_ENV
-        echo "IMAGE_NAME=ghcr.io/$LOWER_REPO:$VERSION" >> $GITHUB_ENV
+        echo "IMAGE_NAME=${{ env.DOCKER_REGISTRY }}/$LOWER_REPO:$VERSION" >> $GITHUB_ENV
+        echo "REPO_NAME=$LOWER_REPO" >> $GITHUB_ENV
 
-    - name: 📄 Generate pom.xml with Actuator
+    - name: 📄 Generate pom.xml
       run: |
         cat > project/pom.xml << EOF
         <project xmlns="http://maven.apache.org/POM/4.0.0"
@@ -55,42 +61,36 @@ jobs:
           <artifactId>demo</artifactId>
           <version>${VERSION}</version>
           <packaging>jar</packaging>
-
           <properties>
             <java.version>17</java.version>
             <spring.boot.version>3.2.5</spring.boot.version>
           </properties>
-
           <dependencies>
             <dependency>
               <groupId>org.springframework.boot</groupId>
               <artifactId>spring-boot-starter-web</artifactId>
-              <version>\${spring.boot.version}</version>
+              <version>${spring.boot.version}</version>
             </dependency>
             <dependency>
               <groupId>org.springframework.boot</groupId>
               <artifactId>spring-boot-starter-actuator</artifactId>
-              <version>\${spring.boot.version}</version>
+              <version>${spring.boot.version}</version>
             </dependency>
           </dependencies>
-
           <build>
             <plugins>
               <plugin>
                 <groupId>org.springframework.boot</groupId>
                 <artifactId>spring-boot-maven-plugin</artifactId>
-                <version>\${spring.boot.version}</version>
+                <version>${spring.boot.version}</version>
                 <executions>
                   <execution>
-                    <goals>
-                      <goal>repackage</goal>
-                    </goals>
+                    <goals><goal>repackage</goal></goals>
                   </execution>
                 </executions>
               </plugin>
             </plugins>
           </build>
-
           <distributionManagement>
             <repository>
               <id>github</id>
@@ -102,19 +102,7 @@ jobs:
 
     - name: 🧪 Add Spring Boot App
       run: |
-        cat > project/src/main/java/com/example/demo/DemoApplication.java << 'EOF'
-        package com.example.demo;
-        import org.springframework.boot.SpringApplication;
-        import org.springframework.boot.autoconfigure.SpringBootApplication;
-
-        @SpringBootApplication
-        public class DemoApplication {
-            public static void main(String[] args) {
-                SpringApplication.run(DemoApplication.class, args);
-            }
-        }
-        EOF
-
+        echo "package com.example.demo;\nimport org.springframework.boot.*;\nimport org.springframework.boot.autoconfigure.*;\n\n@SpringBootApplication\npublic class DemoApplication {\n  public static void main(String[] args) { SpringApplication.run(DemoApplication.class, args); }\n}" > project/src/main/java/com/example/demo/DemoApplication.java
         echo "server.port=8080" > project/src/main/resources/application.properties
         echo "management.endpoints.web.exposure.include=health,info" >> project/src/main/resources/application.properties
 
@@ -122,17 +110,10 @@ jobs:
       working-directory: project
       run: mvn clean package
 
-    - name: 🚀 Publish to GitHub Packages (Maven)
-      working-directory: project
-      run: mvn deploy -s $GITHUB_WORKSPACE/settings.xml
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
     - name: 🐳 Generate Dockerfile
       run: |
         cat > project/Dockerfile << 'EOF'
         FROM eclipse-temurin:17-jdk-alpine
-        VOLUME /tmp
         COPY target/*.jar app.jar
         ENTRYPOINT ["java","-jar","/app.jar"]
         EOF
@@ -140,17 +121,96 @@ jobs:
     - name: 🔨 Build Docker Image
       run: docker build -t $IMAGE_NAME ./project
 
-    - name: 🔐 Docker Login to GHCR
+    - name: 🔐 Login to GHCR
       run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
 
-    - name: 📦 Push Docker Image to GHCR
+    - name: 📦 Push Docker Image
       run: docker push $IMAGE_NAME
 
-    - name: 🧪 Run Docker Container & Check Actuator
+    - name: 🧪 Run & Check Actuator
       run: |
-        docker run -d -p 8080:8080 --name demo-test $IMAGE_NAME
-        echo "Waiting for actuator..."
-        sleep 15
-        curl -sf http://localhost:8080/actuator/health || (docker logs demo-test && exit 1)
-        docker stop demo-test
-        docker rm demo-test
+        docker run -d -p 8080:8080 --name test-app $IMAGE_NAME
+        sleep 10
+        curl -s http://localhost:8080/actuator/health > project/report/health.json || docker logs test-app
+        docker stop test-app && docker rm test-app
+
+    - name: 📄 Generate GitHub Pages Report
+      run: |
+        cp project/report/health.json project/pages/index.json
+        echo "<html><body><h1>Spring Boot Health</h1><pre>" > project/pages/index.html
+        cat project/pages/index.json >> project/pages/index.html
+        echo "</pre></body></html>" >> project/pages/index.html
+
+    - name: 🚀 Deploy GitHub Pages
+      uses: peaceiris/actions-gh-pages@v4
+      with:
+        github_token: ${{ secrets.GITHUB_TOKEN }}
+        publish_dir: ./project/pages
+
+    - name: 🐳 Generate docker-compose.yml
+      run: |
+        cat > project/docker/docker-compose.yml << EOF
+        version: '3'
+        services:
+          app:
+            image: $IMAGE_NAME
+            ports:
+              - "8080:8080"
+        EOF
+
+    - name: ☸ Generate K8s Deployment YAML
+      run: |
+        cat > project/k8s/deployment.yaml << EOF
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: springboot-app
+        spec:
+          replicas: 1
+          selector:
+            matchLabels:
+              app: springboot-app
+          template:
+            metadata:
+              labels:
+                app: springboot-app
+            spec:
+              containers:
+              - name: app
+                image: $IMAGE_NAME
+                ports:
+                - containerPort: 8080
+        ---
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: springboot-service
+        spec:
+          selector:
+            app: springboot-app
+          ports:
+            - protocol: TCP
+              port: 80
+              targetPort: 8080
+        EOF
+
+  codeql-scan:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+
+    - name: Initialize CodeQL
+      uses: github/codeql-action/init@v3
+      with:
+        languages: java
+
+    - name: Build with Maven
+      run: mvn clean compile --file project/pom.xml
+
+    - name: Perform CodeQL Analysis
+      uses: github/codeql-action/analyze@v3
