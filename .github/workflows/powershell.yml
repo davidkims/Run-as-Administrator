@@ -40,6 +40,8 @@ jobs:
           Install-Module -Name PSScriptAnalyzer -Force -Scope CurrentUser -AllowClobber
 
           $results = Invoke-ScriptAnalyzer -Path "./scripts" -Recurse -Severity Error,Warning,Information
+          $rules = Get-ScriptAnalyzerRule
+
           $sarif = @{
             '$schema' = 'https://json.schemastore.org/sarif-2.1.0.json'
             version = '2.1.0'
@@ -48,13 +50,23 @@ jobs:
                 driver = @{
                   name = 'PSScriptAnalyzer'
                   version = '1.24.0'
+                  rules = @()
                 }
               }
               results = @()
             })
           }
 
-          foreach ($res in $results) {
+          foreach ($rule in $rules) {
+            $sarif.runs[0].tool.driver.rules += @{
+              id = $rule.RuleName
+              name = $rule.RuleName
+              shortDescription = @{ text = $rule.CommonName }
+              helpUri = $rule.HelpLink
+            }
+          }
+
+          foreach ($res in $results | Where-Object { $_.Severity -eq 'Error' }) {
             $sarif.runs[0].results += @{
               ruleId = $res.RuleName
               level = $res.Severity.ToString().ToLowerInvariant()
@@ -81,14 +93,14 @@ jobs:
         if: steps.sarif-upload.outcome == 'failure'
         run: npm install -g @microsoft/sarif-multitool
 
-      - name: 🌐 Generate HTML Report with Summary Table
+      - name: 🌐 Generate HTML Report with Summary Table and Diff Highlight
         if: steps.sarif-upload.outcome == 'failure'
         run: |
           mkdir -p report
           sarif-multitool rewrite results.sarif -o report/results.sarif
-          echo "<html><body><h1>Fallback SARIF Report</h1>" > report/index.html
-          echo "<table border='1'><tr><th>Rule ID</th><th>Message</th><th>File</th><th>Line</th></tr>" >> report/index.html
-          cat results.sarif | jq -r '.runs[].results[] | "<tr><td>" + .ruleId + "</td><td>" + .message.text + "</td><td>" + .locations[0].physicalLocation.artifactLocation.uri + "</td><td>" + (.locations[0].physicalLocation.region.startLine|tostring) + "</td></tr>"' >> report/index.html
+          echo "<html><head><style>table { border-collapse: collapse; } th, td { padding: 6px; border: 1px solid black; } .error { background-color: #ffd6d6; }</style></head><body><h1>Fallback SARIF Report</h1>" > report/index.html
+          echo "<table><tr><th>Rule ID</th><th>Message</th><th>File</th><th>Line</th></tr>" >> report/index.html
+          cat results.sarif | jq -r '.runs[].results[] | "<tr class=\"error\"><td>" + .ruleId + "</td><td>" + .message.text + "</td><td>" + .locations[0].physicalLocation.artifactLocation.uri + "</td><td>" + (.locations[0].physicalLocation.region.startLine|tostring) + "</td></tr>"' >> report/index.html
           echo "</table><hr><pre>" >> report/index.html
           cat results.sarif >> report/index.html
           echo "</pre></body></html>" >> report/index.html
