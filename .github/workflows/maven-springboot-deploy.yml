@@ -171,7 +171,7 @@ services:
       - "8080:8080"
 EOF
 
-      - name: ☸ Generate K8s Deployment YAML
+      - name: ☘ Generate K8s Deployment YAML
         run: |
           cat <<EOF > project/k8s/deployment.yaml
 apiVersion: apps/v1
