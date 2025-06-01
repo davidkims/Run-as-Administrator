@@ -1,0 +1,56 @@
+# ⚠ This workflow uses third-party actions.
+# Terms of use: https://github.com/microsoft/action-psscriptanalyzer
+# Docs: https://github.com/PowerShell/PSScriptAnalyzer
+
+name: PSScriptAnalyzer
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  schedule:
+    - cron: '37 9 * * 3'  # ⏰ Weekly scheduled analysis every Wednesday at 09:37 UTC
+
+permissions:
+  contents: read
+
+jobs:
+  analyze-powershell:
+    name: Run PSScriptAnalyzer and upload SARIF
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read                     # Required for actions/checkout
+      security-events: write            # Required for uploading SARIF to GitHub
+      actions: read                     # Required for private repos to get Actions status
+
+    steps:
+      - name: 📥 Checkout source code
+        uses: actions/checkout@v4
+
+      - name: 🧪 Run PSScriptAnalyzer
+        uses: microsoft/psscriptanalyzer-action@6b2948b1944407914a58661c49941824d149734f
+        with:
+          path: ./                      # 🔍 Scan entire repository
+          recurse: true                 # 🔄 Include subdirectories
+          includeRule: |
+            PSAvoidGlobalAliases,
+            PSAvoidUsingConvertToSecureStringWithPlainText
+          output: results.sarif         # 💾 Output in SARIF format for GitHub upload
+
+      - name: 📤 Upload SARIF results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: results.sarif
+
+      - name: 🧾 Show findings summary
+        if: success()
+        run: |
+          echo "✅ Static analysis complete."
+          if [ -f results.sarif ]; then
+            echo "🔍 Results file located at results.sarif"
+            echo "📊 Use GitHub Security tab to review detected PowerShell code issues."
+          else
+            echo "⚠️ No SARIF file found. PSScriptAnalyzer might have failed or found no issues."
+          fi
