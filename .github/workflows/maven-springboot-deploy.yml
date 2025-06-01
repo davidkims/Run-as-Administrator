@@ -1,4 +1,4 @@
-name: Full SpringBoot CI/CD
+name: Full SpringBoot CI/CD with Docker, K8s, Pages, CodeQL
 
 on:
   release:
@@ -58,15 +58,15 @@ jobs:
           echo "  <modelVersion>4.0.0</modelVersion>" >> project/pom.xml
           echo "  <groupId>com.example</groupId>" >> project/pom.xml
           echo "  <artifactId>demo</artifactId>" >> project/pom.xml
-          echo "  <version>$VERSION</version>" >> project/pom.xml
+          echo "  <version>\${VERSION}</version>" >> project/pom.xml
           echo "  <packaging>jar</packaging>" >> project/pom.xml
           echo "  <properties><java.version>17</java.version><spring.boot.version>3.2.5</spring.boot.version></properties>" >> project/pom.xml
           echo "  <dependencies>" >> project/pom.xml
-          echo "    <dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-web</artifactId><version>3.2.5</version></dependency>" >> project/pom.xml
-          echo "    <dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-actuator</artifactId><version>3.2.5</version></dependency>" >> project/pom.xml
+          echo "    <dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-web</artifactId><version>\${spring.boot.version}</version></dependency>" >> project/pom.xml
+          echo "    <dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-actuator</artifactId><version>\${spring.boot.version}</version></dependency>" >> project/pom.xml
           echo "  </dependencies>" >> project/pom.xml
-          echo "  <build><plugins><plugin><groupId>org.springframework.boot</groupId><artifactId>spring-boot-maven-plugin</artifactId><version>3.2.5</version><executions><execution><goals><goal>repackage</goal></goals></execution></executions></plugin></plugins></build>" >> project/pom.xml
-          echo "  <distributionManagement><repository><id>github</id><url>https://maven.pkg.github.com/$REPO_NAME</url></repository></distributionManagement>" >> project/pom.xml
+          echo "  <build><plugins><plugin><groupId>org.springframework.boot</groupId><artifactId>spring-boot-maven-plugin</artifactId><version>\${spring.boot.version}</version><executions><execution><goals><goal>repackage</goal></goals></execution></executions></plugin></plugins></build>" >> project/pom.xml
+          echo "  <distributionManagement><repository><id>github</id><url>https://maven.pkg.github.com/\${REPO_NAME}</url></repository></distributionManagement>" >> project/pom.xml
           echo "</project>" >> project/pom.xml
 
       - name: 🧪 Add Spring Boot App
@@ -80,7 +80,6 @@ jobs:
           echo "    SpringApplication.run(DemoApplication.class, args);" >> project/src/main/java/com/example/demo/DemoApplication.java
           echo "  }" >> project/src/main/java/com/example/demo/DemoApplication.java
           echo "}" >> project/src/main/java/com/example/demo/DemoApplication.java
-
           echo "server.port=8080" > project/src/main/resources/application.properties
           echo "management.endpoints.web.exposure.include=health,info" >> project/src/main/resources/application.properties
 
