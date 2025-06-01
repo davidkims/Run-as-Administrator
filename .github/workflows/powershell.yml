@@ -1,7 +1,3 @@
-# ⚠ This workflow uses third-party actions.
-# Terms of use: https://github.com/microsoft/action-psscriptanalyzer
-# Docs: https://github.com/PowerShell/PSScriptAnalyzer
-
 name: PSScriptAnalyzer
 
 on:
@@ -10,7 +6,7 @@ on:
   pull_request:
     branches: [ "main" ]
   schedule:
-    - cron: '37 9 * * 3'  # ⏰ Weekly scheduled analysis every Wednesday at 09:37 UTC
+    - cron: '37 9 * * 3'
 
 permissions:
   contents: read
@@ -21,9 +17,9 @@ jobs:
     runs-on: ubuntu-latest
 
     permissions:
-      contents: read                     # Required for actions/checkout
-      security-events: write            # Required for uploading SARIF to GitHub
-      actions: read                     # Required for private repos to get Actions status
+      contents: read
+      security-events: write
+      actions: read
 
     steps:
       - name: 📥 Checkout source code
@@ -32,12 +28,10 @@ jobs:
       - name: 🧪 Run PSScriptAnalyzer
         uses: microsoft/psscriptanalyzer-action@6b2948b1944407914a58661c49941824d149734f
         with:
-          path: ./                      # 🔍 Scan entire repository
-          recurse: true                 # 🔄 Include subdirectories
-          includeRule: |
-            PSAvoidGlobalAliases,
-            PSAvoidUsingConvertToSecureStringWithPlainText
-          output: results.sarif         # 💾 Output in SARIF format for GitHub upload
+          path: ./
+          recurse: true
+          includeRule: '["PSAvoidGlobalAliases", "PSAvoidUsingConvertToSecureStringWithPlainText"]'
+          output: results.sarif
 
       - name: 📤 Upload SARIF results to GitHub Security tab
         uses: github/codeql-action/upload-sarif@v3
