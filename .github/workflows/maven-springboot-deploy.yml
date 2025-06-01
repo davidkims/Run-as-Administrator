@@ -53,56 +53,68 @@ jobs:
     - name: 📄 Generate pom.xml
       run: |
         cat > project/pom.xml << 'EOF'
-        <project xmlns="http://maven.apache.org/POM/4.0.0"
-                 xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-                 xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
-          <modelVersion>4.0.0</modelVersion>
-          <groupId>com.example</groupId>
-          <artifactId>demo</artifactId>
-          <version>${VERSION}</version>
-          <packaging>jar</packaging>
-          <properties>
-            <java.version>17</java.version>
-            <spring.boot.version>3.2.5</spring.boot.version>
-          </properties>
-          <dependencies>
-            <dependency>
-              <groupId>org.springframework.boot</groupId>
-              <artifactId>spring-boot-starter-web</artifactId>
-              <version>${spring.boot.version}</version>
-            </dependency>
-            <dependency>
-              <groupId>org.springframework.boot</groupId>
-              <artifactId>spring-boot-starter-actuator</artifactId>
-              <version>${spring.boot.version}</version>
-            </dependency>
-          </dependencies>
-          <build>
-            <plugins>
-              <plugin>
-                <groupId>org.springframework.boot</groupId>
-                <artifactId>spring-boot-maven-plugin</artifactId>
-                <version>${spring.boot.version}</version>
-                <executions>
-                  <execution>
-                    <goals><goal>repackage</goal></goals>
-                  </execution>
-                </executions>
-              </plugin>
-            </plugins>
-          </build>
-          <distributionManagement>
-            <repository>
-              <id>github</id>
-              <url>https://maven.pkg.github.com/${{ github.repository }}</url>
-            </repository>
-          </distributionManagement>
-        </project>
-        EOF
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>com.example</groupId>
+  <artifactId>demo</artifactId>
+  <version>${VERSION}</version>
+  <packaging>jar</packaging>
+  <properties>
+    <java.version>17</java.version>
+    <spring.boot.version>3.2.5</spring.boot.version>
+  </properties>
+  <dependencies>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-web</artifactId>
+      <version>${spring.boot.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-actuator</artifactId>
+      <version>${spring.boot.version}</version>
+    </dependency>
+  </dependencies>
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-maven-plugin</artifactId>
+        <version>${spring.boot.version}</version>
+        <executions>
+          <execution>
+            <goals><goal>repackage</goal></goals>
+          </execution>
+        </executions>
+      </plugin>
+    </plugins>
+  </build>
+  <distributionManagement>
+    <repository>
+      <id>github</id>
+      <url>https://maven.pkg.github.com/${{ github.repository }}</url>
+    </repository>
+  </distributionManagement>
+</project>
+EOF
 
     - name: 🧪 Add Spring Boot App
       run: |
-        echo "package com.example.demo;\nimport org.springframework.boot.*;\nimport org.springframework.boot.autoconfigure.*;\n\n@SpringBootApplication\npublic class DemoApplication {\n  public static void main(String[] args) { SpringApplication.run(DemoApplication.class, args); }\n}" > project/src/main/java/com/example/demo/DemoApplication.java
+        cat > project/src/main/java/com/example/demo/DemoApplication.java << 'EOF'
+package com.example.demo;
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+
+@SpringBootApplication
+public class DemoApplication {
+  public static void main(String[] args) {
+    SpringApplication.run(DemoApplication.class, args);
+  }
+}
+EOF
+
         echo "server.port=8080" > project/src/main/resources/application.properties
         echo "management.endpoints.web.exposure.include=health,info" >> project/src/main/resources/application.properties
 
@@ -113,10 +125,10 @@ jobs:
     - name: 🐳 Generate Dockerfile
       run: |
         cat > project/Dockerfile << 'EOF'
-        FROM eclipse-temurin:17-jdk-alpine
-        COPY target/*.jar app.jar
-        ENTRYPOINT ["java","-jar","/app.jar"]
-        EOF
+FROM eclipse-temurin:17-jdk-alpine
+COPY target/*.jar app.jar
+ENTRYPOINT ["java","-jar","/app.jar"]
+EOF
 
     - name: 🔨 Build Docker Image
       run: docker build -t $IMAGE_NAME ./project
@@ -150,49 +162,49 @@ jobs:
     - name: 🐳 Generate docker-compose.yml
       run: |
         cat > project/docker/docker-compose.yml << EOF
-        version: '3'
-        services:
-          app:
-            image: $IMAGE_NAME
-            ports:
-              - "8080:8080"
-        EOF
+version: '3'
+services:
+  app:
+    image: $IMAGE_NAME
+    ports:
+      - "8080:8080"
+EOF
 
     - name: ☸ Generate K8s Deployment YAML
       run: |
         cat > project/k8s/deployment.yaml << EOF
-        apiVersion: apps/v1
-        kind: Deployment
-        metadata:
-          name: springboot-app
-        spec:
-          replicas: 1
-          selector:
-            matchLabels:
-              app: springboot-app
-          template:
-            metadata:
-              labels:
-                app: springboot-app
-            spec:
-              containers:
-              - name: app
-                image: $IMAGE_NAME
-                ports:
-                - containerPort: 8080
-        ---
-        apiVersion: v1
-        kind: Service
-        metadata:
-          name: springboot-service
-        spec:
-          selector:
-            app: springboot-app
-          ports:
-            - protocol: TCP
-              port: 80
-              targetPort: 8080
-        EOF
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: springboot-app
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: springboot-app
+  template:
+    metadata:
+      labels:
+        app: springboot-app
+    spec:
+      containers:
+      - name: app
+        image: $IMAGE_NAME
+        ports:
+        - containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: springboot-service
+spec:
+  selector:
+    app: springboot-app
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 8080
+EOF
 
   codeql-scan:
     runs-on: ubuntu-latest
@@ -210,7 +222,8 @@ jobs:
         languages: java
 
     - name: Build with Maven
-      run: mvn clean compile --file project/pom.xml
+      working-directory: project
+      run: mvn clean compile
 
     - name: Perform CodeQL Analysis
       uses: github/codeql-action/analyze@v3
