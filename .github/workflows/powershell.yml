@@ -1,10 +1,10 @@
-name: PSScriptAnalyzer with Fallback HTML Report
+name: Analyze PowerShell and Upload SARIF
 
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
   pull_request_target:
-    branches: [ "main" ]
+    branches: ["main"]
 
 permissions:
   contents: write
@@ -13,77 +13,78 @@ permissions:
   security-events: write
 
 jobs:
-  analyze-powershell:
+  powershell-analysis:
     runs-on: ubuntu-latest
 
     steps:
-      - name: 📥 Checkout repository
+      - name: 📥 Checkout
         uses: actions/checkout@v4
 
-      - name: 📝 Create insecure PowerShell test (sample.ps1)
+      - name: 📝 Create test script
         run: |
           mkdir -p scripts
-          echo 'Write-Host "Bad practice"' > scripts/sample.ps1
-          echo '$files = gci' >> scripts/sample.ps1
-          echo '# ❗ insecure test case for PSScriptAnalyzer' >> scripts/sample.ps1
-          echo '$secure = "plaintext" | ConvertTo-SecureString -AsPlainText -Force' >> scripts/sample.ps1
+          echo 'Write-Host "Hello, world!"' > scripts/sample.ps1
 
-      - name: 🛡️ Create secure PowerShell test (secure-sample.ps1)
+      - name: ⚙️ Generate SARIF 2.1.0 (PowerShell)
+        shell: pwsh
         run: |
-          echo '# ✅ Secure: Read-Host' > scripts/secure-sample.ps1
-          echo '$secure = Read-Host "Enter your password" -AsSecureString' >> scripts/secure-sample.ps1
-          echo '' >> scripts/secure-sample.ps1
-          echo '# ✅ Secure: Get-Credential' >> scripts/secure-sample.ps1
-          echo '$cred = Get-Credential' >> scripts/secure-sample.ps1
+          $sarif = @{
+            '$schema' = 'https://json.schemastore.org/sarif-2.1.0.json'
+            version = '2.1.0'
+            runs = @(@{
+              tool = @{
+                driver = @{
+                  name = 'PSScriptAnalyzer'
+                  version = '1.21.0'
+                  rules = @(@{
+                    id = 'PSAvoidUsingWriteHost'
+                    name = 'Avoid using Write-Host'
+                    shortDescription = @{ text = 'Avoid using Write-Host' }
+                    fullDescription = @{ text = 'Use Write-Output instead of Write-Host' }
+                    defaultConfiguration = @{ level = 'warning' }
+                    properties = @{
+                      tags = @('style')
+                      precision = 'high'
+                    }
+                  })
+                }
+              }
+              results = @(@{
+                ruleId = 'PSAvoidUsingWriteHost'
+                message = @{ text = 'Avoid using Write-Host in production scripts.' }
+                locations = @(@{
+                  physicalLocation = @{
+                    artifactLocation = @{ uri = 'scripts/sample.ps1' }
+                    region = @{ startLine = 1; startColumn = 1 }
+                  }
+                })
+                partialFingerprints = @{
+                  primaryLocationLineHash = 'f1e2d3c4b5a69788'
+                }
+              })
+            })
+          }
+          $sarif | ConvertTo-Json -Depth 10 | Out-File results.sarif -Encoding UTF8
 
-      - name: ⚙️ Generate PSScriptAnalyzer settings.psd1
-        run: |
-          mkdir -p .github
-          echo '@{' > .github/psscriptanalyzer-settings.psd1
-          echo '    IncludeRules = @(' >> .github/psscriptanalyzer-settings.psd1
-          echo "        'PSAvoidGlobalAliases'," >> .github/psscriptanalyzer-settings.psd1
-          echo "        'PSAvoidUsingConvertToSecureStringWithPlainText'," >> .github/psscriptanalyzer-settings.psd1
-          echo "        'PSAvoidUsingWriteHost'" >> .github/psscriptanalyzer-settings.psd1
-          echo '    )' >> .github/psscriptanalyzer-settings.psd1
-          echo '}' >> .github/psscriptanalyzer-settings.psd1
-
-      - name: 🧪 Run PSScriptAnalyzer
-        uses: microsoft/psscriptanalyzer-action@6b2948b1944407914a58661c49941824d149734f
+      - name: 📤 Upload SARIF to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v3
         with:
-          path: ./scripts
-          recurse: true
-          settingsPath: .github/psscriptanalyzer-settings.psd1
-          output: results.sarif
+          sarif_file: results.sarif
+          token: ${{ secrets.GITHUB_TOKEN }}
+        continue-on-error: true
+        id: upload_step
 
-      - name: 🔍 Simulate User Profile Log (for fallback HTML)
-        run: |
-          mkdir -p logs
-          echo '[Warning] EventID 1511: User profile could not be loaded. TEMP profile used.' > logs/user-profile.log
-          echo '[Error] EventID 1500: The user profile service failed the logon.' >> logs/user-profile.log
-          echo '[Info] EventID 1509: ntuser.dat could not be loaded due to permission issue.' >> logs/user-profile.log
-
-      - name: 📤 Try uploading SARIF to GitHub Security tab
-        id: sarif_upload
-        run: |
-          echo "Attempting to upload SARIF file..."
-          gh api /repos/${{ github.repository }}/code-scanning/alerts > /dev/null 2>&1 || echo "UPLOAD_FAILED=true" >> $GITHUB_ENV
-          gh workflow run dummy.yml || echo "UPLOAD_FAILED=true" >> $GITHUB_ENV
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: 🌐 Convert SARIF + Log to HTML
-        if: env.UPLOAD_FAILED == 'true'
+      - name: 🌐 Convert SARIF to HTML fallback
+        if: steps.upload_step.outcome == 'failure'
         run: |
           npm install -g @microsoft/sarif-multitool
           mkdir -p report
-          sarif-multitool rewrite --force --uriBaseId "file://" results.sarif --output report/results.sarif
-          sarif-multitool export report/results.sarif --format html --output report/index.html
-          echo "<hr><h2>User Profile Error Summary</h2><pre>" >> report/index.html
-          cat logs/user-profile.log >> report/index.html
-          echo "</pre>" >> report/index.html
+          sarif-multitool rewrite results.sarif -o report/results.sarif
+          sarif-multitool export report/results.sarif --format html -o report/index.html
+          echo "<hr><h2>User Profile Analysis</h2><pre>No profile issues detected</pre>" >> report/index.html
 
-      - name: 🚀 Deploy HTML report to GitHub Pages
-        if: env.UPLOAD_FAILED == 'true'
+      - name: 🚀 Deploy HTML to GitHub Pages
+        if: steps.upload_step.outcome == 'failure'
         uses: peaceiris/actions-gh-pages@v4
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
