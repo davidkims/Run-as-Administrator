@@ -1,49 +1,41 @@
-name: PSScriptAnalyzer with Auto-Generated Script
+name: PSScriptAnalyzer with HTML fallback
 
 on:
   push:
     branches: [ "main" ]
-  pull_request:
+  pull_request_target:
     branches: [ "main" ]
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+  security-events: write
 
 jobs:
   analyze-powershell:
     runs-on: ubuntu-latest
 
     steps:
-      - name: 📥 Checkout code
+      - name: 📥 Checkout
         uses: actions/checkout@v4
 
-      - name: 📝 Generate PowerShell test script
+      - name: 📝 Create test script
         run: |
           mkdir -p scripts
-          echo 'Write-Host "This is a bad practice"' > scripts/sample.ps1
+          echo 'Write-Host "Bad practice"' > scripts/sample.ps1
           echo '$files = gci' >> scripts/sample.ps1
-          echo '$secure = "supersecret" | ConvertTo-SecureString -AsPlainText -Force' >> scripts/sample.ps1
-          echo '$unusedVar = 123' >> scripts/sample.ps1
-          echo 'try {' >> scripts/sample.ps1
-          echo '  1 / 0' >> scripts/sample.ps1
-          echo '} catch {' >> scripts/sample.ps1
-          echo '  # do nothing' >> scripts/sample.ps1
-          echo '}' >> scripts/sample.ps1
-          echo 'function Remove-Something {' >> scripts/sample.ps1
-          echo '  param ($Name)' >> scripts/sample.ps1
-          echo '  Remove-Item -Path $Name -Force' >> scripts/sample.ps1
-          echo '}' >> scripts/sample.ps1
-          echo 'Remove-Something -Name "C:\\Temp\\dummy.txt"' >> scripts/sample.ps1
+          echo '$secure = "secret" | ConvertTo-SecureString -AsPlainText -Force' >> scripts/sample.ps1
 
-      - name: 🛠 Generate .psd1 configuration file
+      - name: ⚙️ Create .psd1 rule config
         run: |
           mkdir -p .github
           echo '@{' > .github/psscriptanalyzer-settings.psd1
-          echo '    IncludeRules = @(' >> .github/psscriptanalyzer-settings.psd1
-          echo "        'PSAvoidGlobalAliases'," >> .github/psscriptanalyzer-settings.psd1
-          echo "        'PSAvoidUsingConvertToSecureStringWithPlainText'," >> .github/psscriptanalyzer-settings.psd1
-          echo "        'PSAvoidUsingWriteHost'," >> .github/psscriptanalyzer-settings.psd1
-          echo "        'PSUseDeclaredVarsMoreThanAssignments'," >> .github/psscriptanalyzer-settings.psd1
-          echo "        'PSAvoidUsingEmptyCatchBlock'," >> .github/psscriptanalyzer-settings.psd1
-          echo "        'PSUseShouldProcessForStateChangingFunctions'" >> .github/psscriptanalyzer-settings.psd1
-          echo '    )' >> .github/psscriptanalyzer-settings.psd1
+          echo 'IncludeRules = @(' >> .github/psscriptanalyzer-settings.psd1
+          echo "'PSAvoidGlobalAliases'," >> .github/psscriptanalyzer-settings.psd1
+          echo "'PSAvoidUsingConvertToSecureStringWithPlainText'," >> .github/psscriptanalyzer-settings.psd1
+          echo "'PSAvoidUsingWriteHost'" >> .github/psscriptanalyzer-settings.psd1
+          echo ')' >> .github/psscriptanalyzer-settings.psd1
           echo '}' >> .github/psscriptanalyzer-settings.psd1
 
       - name: 🧪 Run PSScriptAnalyzer
@@ -54,7 +46,25 @@ jobs:
           settingsPath: .github/psscriptanalyzer-settings.psd1
           output: results.sarif
 
-      - name: 📤 Upload SARIF results
+      - name: 📤 Try uploading SARIF to GitHub Security
+        id: upload
+        continue-on-error: true
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: results.sarif
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 🌐 Convert SARIF to HTML (on failure only)
+        if: steps.upload.outcome == 'failure'
+        run: |
+          npm install -g @microsoft/sarif-multitool
+          mkdir -p report
+          sarif-multitool rewrite --force --uriBaseId "file://" results.sarif --output report/results.sarif
+          sarif-multitool export report/results.sarif --format html --output report/index.html
+
+      - name: 🚀 Deploy report to GitHub Pages
+        if: steps.upload.outcome == 'failure'
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./report
