@@ -27,7 +27,7 @@ jobs:
         sudo chmod 777 /opt/.reserved_space
         echo "✅ Directory and disk space ready"
 
-    - name: 🧩 Install Maven & Java
+    - name: ☕ Install Maven & Set up JDK 17
       uses: actions/setup-java@v4
       with:
         java-version: '17'
@@ -59,7 +59,7 @@ jobs:
                 <dependency>
                     <groupId>org.springframework.boot</groupId>
                     <artifactId>spring-boot-starter-web</artifactId>
-                    <version>\${spring.boot.version}</version>
+                    <version>${spring.boot.version}</version>
                 </dependency>
             </dependencies>
 
@@ -68,7 +68,7 @@ jobs:
                     <plugin>
                         <groupId>org.springframework.boot</groupId>
                         <artifactId>spring-boot-maven-plugin</artifactId>
-                        <version>\${spring.boot.version}</version>
+                        <version>${spring.boot.version}</version>
                     </plugin>
                 </plugins>
             </build>
