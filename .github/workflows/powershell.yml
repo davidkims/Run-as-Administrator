@@ -14,56 +14,24 @@ permissions:
 
 jobs:
   analyze:
-    name: Run PSScriptAnalyzer and Upload SARIF
+    name: Run Full PSScriptAnalyzer and Upload SARIF
     runs-on: ubuntu-latest
 
     steps:
-      - name: 📅 Checkout Repository
+      - name: 📥 Checkout Repository
         uses: actions/checkout@v4
 
-      - name: 📄 Create Sample PowerShell Script
+      - name: 🛠 Create Sample PowerShell Script
         run: |
           mkdir -p scripts
           echo 'Write-Host "Hello, world!"' > scripts/sample.ps1
 
-      - name: 📃 Generate SARIF File (UTF-8, no BOM)
+      - name: 🧪 Run Invoke-ScriptAnalyzer and Generate SARIF
         shell: pwsh
         run: |
-          $sarif = @{
-            '$schema' = 'https://json.schemastore.org/sarif-2.1.0.json'
-            version = '2.1.0'
-            runs = @(@{
-              tool = @{
-                driver = @{
-                  name = 'PSScriptAnalyzer'
-                  version = '1.21.0'
-                  rules = @(@{
-                    id = 'PSAvoidUsingWriteHost'
-                    name = 'Avoid using Write-Host'
-                    shortDescription = @{ text = 'Avoid using Write-Host' }
-                    fullDescription = @{ text = 'Use Write-Output or Write-Verbose instead.' }
-                    defaultConfiguration = @{ level = 'warning' }
-                    properties = @{
-                      tags = @('style')
-                      precision = 'high'
-                    }
-                  })
-                }
-              }
-              results = @(@{
-                ruleId = 'PSAvoidUsingWriteHost'
-                message = @{ text = 'Avoid using Write-Host in production scripts.' }
-                locations = @(@{
-                  physicalLocation = @{
-                    artifactLocation = @{ uri = 'scripts/sample.ps1' }
-                    region = @{ startLine = 1; startColumn = 1 }
-                  }
-                })
-                partialFingerprints = @{ primaryLocationLineHash = '304eec5277011328' }
-              })
-            })
-          }
-          $sarif | ConvertTo-Json -Depth 10 | Out-File results.sarif -Encoding UTF8
+          Install-Module -Name PSScriptAnalyzer -Force -Scope CurrentUser
+          $results = Invoke-ScriptAnalyzer -Path "./scripts" -Recurse -Severity Error,Warning,Information -Format Sarif
+          $results | Out-File results.sarif -Encoding utf8
 
       - name: 📤 Upload SARIF to GitHub Code Scanning
         id: sarif-upload
@@ -76,12 +44,15 @@ jobs:
         if: steps.sarif-upload.outcome == 'failure'
         run: npm install -g @microsoft/sarif-multitool
 
-      - name: 🌐 Generate HTML Report from SARIF
+      - name: 🌐 Generate HTML Report with Summary Table
         if: steps.sarif-upload.outcome == 'failure'
         run: |
           mkdir -p report
           sarif-multitool rewrite results.sarif -o report/results.sarif
-          echo "<html><body><h1>Fallback Report</h1><pre>" > report/index.html
+          echo "<html><body><h1>Fallback SARIF Report</h1>" > report/index.html
+          echo "<table border='1'><tr><th>Rule ID</th><th>Message</th><th>File</th><th>Line</th></tr>" >> report/index.html
+          cat results.sarif | jq -r '.runs[].results[] | "<tr><td>" + .ruleId + "</td><td>" + .message.text + "</td><td>" + .locations[0].physicalLocation.artifactLocation.uri + "</td><td>" + (.locations[0].physicalLocation.region.startLine|tostring) + "</td></tr>"' >> report/index.html
+          echo "</table><hr><pre>" >> report/index.html
           cat results.sarif >> report/index.html
           echo "</pre></body></html>" >> report/index.html
 
