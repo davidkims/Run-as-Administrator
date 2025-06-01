@@ -1,8 +1,8 @@
-name: PSScriptAnalyzer SARIF Scan
+name: PowerShell Analysis
 
 on:
   push:
-    branches: ["main"]
+    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -17,8 +17,10 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup PowerShell
-        uses: PowerShell/setup-powershell@v2
+      - name: Install PowerShell
+        uses: PSModule/install-powershell@v1
+        with:
+          Version: '7.4.1'
 
       - name: Create scripts directory and dummy script
         shell: pwsh
@@ -43,7 +45,7 @@ jobs:
               shortDescription = @{ text = $_.Description }
               fullDescription = @{ text = $_.Description }
               helpUri = "https://github.com/PowerShell/PSScriptAnalyzer/blob/master/README.md"
-              properties = @{ tags = @("$($_.Severity.ToString())") }
+              properties = @{ tags = @($_.Severity.ToString()) }
             }
           }
           $sarif = @{
