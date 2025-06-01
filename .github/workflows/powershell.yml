@@ -18,15 +18,15 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: 📥 Checkout Repository
+      - name: 📅 Checkout Repository
         uses: actions/checkout@v4
 
-      - name: 🛠 Create Sample PowerShell Script
+      - name: 📄 Create Sample PowerShell Script
         run: |
           mkdir -p scripts
           echo 'Write-Host "Hello, world!"' > scripts/sample.ps1
 
-      - name: 📄 Generate SARIF File (UTF-8, no BOM)
+      - name: 📃 Generate SARIF File (UTF-8, no BOM)
         shell: pwsh
         run: |
           $sarif = @{
