@@ -26,19 +26,15 @@ jobs:
           mkdir -p scripts
           echo 'Write-Host "Hello, world!"' > scripts/sample.ps1
 
-      - name: 🥺 Run PSScriptAnalyzer and Build SARIF
+      - name: 🥺 Install or Update PSScriptAnalyzer
         shell: pwsh
         run: |
-          Remove-Module PSScriptAnalyzer -ErrorAction SilentlyContinue
-          Get-Module -ListAvailable PSScriptAnalyzer | ForEach-Object {
-            try {
-              Remove-Item -Path $_.ModuleBase -Recurse -Force -ErrorAction Stop
-            } catch {
-              Write-Warning "Could not remove module: $($_.Exception.Message)"
-            }
-          }
+          Write-Host "🔁 Installing PSScriptAnalyzer to user scope..."
           Install-Module -Name PSScriptAnalyzer -Force -Scope CurrentUser -AllowClobber
 
+      - name: ✅ Run PSScriptAnalyzer and Build SARIF
+        shell: pwsh
+        run: |
           $results = Invoke-ScriptAnalyzer -Path "./scripts" -Recurse -Severity Error,Warning,Information
           $rules = Get-ScriptAnalyzerRule
 
