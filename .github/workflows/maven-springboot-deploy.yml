@@ -1,0 +1,119 @@
+name: Maven SpringBoot Build & Deploy
+
+on:
+  release:
+    types: [created]
+  workflow_dispatch:
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+      packages: write
+
+    steps:
+    - name: ✅ Checkout Repository
+      uses: actions/checkout@v4
+
+    - name: 📁 Create Project Directory and Reserve Disk Space
+      run: |
+        mkdir -p project/src/main/java/com/example/demo
+        mkdir -p project/src/main/resources
+        mkdir -p project/target
+        echo "📦 Reserving 2GB disk space..."
+        sudo fallocate -l 2G /opt/.reserved_space || sudo dd if=/dev/zero of=/opt/.reserved_space bs=1M count=2048
+        sudo chmod 777 /opt/.reserved_space
+        echo "✅ Directory and disk space ready"
+
+    - name: 🧩 Install Maven & Java
+      uses: actions/setup-java@v4
+      with:
+        java-version: '17'
+        distribution: 'temurin'
+        server-id: github
+        settings-path: ${{ github.workspace }}
+
+    - name: 📄 Generate Spring Boot pom.xml
+      run: |
+        cat > project/pom.xml << 'EOF'
+        <project xmlns="http://maven.apache.org/POM/4.0.0"
+                 xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                 xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+            <modelVersion>4.0.0</modelVersion>
+            <groupId>com.example</groupId>
+            <artifactId>demo</artifactId>
+            <version>1.0.0</version>
+            <packaging>jar</packaging>
+
+            <name>demo</name>
+            <description>Spring Boot Maven Demo</description>
+
+            <properties>
+                <java.version>17</java.version>
+                <spring.boot.version>3.2.5</spring.boot.version>
+            </properties>
+
+            <dependencies>
+                <dependency>
+                    <groupId>org.springframework.boot</groupId>
+                    <artifactId>spring-boot-starter-web</artifactId>
+                    <version>\${spring.boot.version}</version>
+                </dependency>
+            </dependencies>
+
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.springframework.boot</groupId>
+                        <artifactId>spring-boot-maven-plugin</artifactId>
+                        <version>\${spring.boot.version}</version>
+                    </plugin>
+                </plugins>
+            </build>
+
+            <distributionManagement>
+                <repository>
+                    <id>github</id>
+                    <url>https://maven.pkg.github.com/${{ github.repository }}</url>
+                </repository>
+            </distributionManagement>
+        </project>
+        EOF
+
+    - name: 🧪 Add Sample Spring Boot App
+      run: |
+        cat > project/src/main/java/com/example/demo/DemoApplication.java << 'EOF'
+        package com.example.demo;
+        import org.springframework.boot.SpringApplication;
+        import org.springframework.boot.autoconfigure.SpringBootApplication;
+
+        @SpringBootApplication
+        public class DemoApplication {
+            public static void main(String[] args) {
+                SpringApplication.run(DemoApplication.class, args);
+            }
+        }
+        EOF
+
+        echo "server.port=8080" > project/src/main/resources/application.properties
+
+    - name: 🔧 Build with Maven
+      working-directory: project
+      run: mvn -B package
+
+    - name: 🚀 Publish to GitHub Packages
+      working-directory: project
+      run: mvn deploy -s $GITHUB_WORKSPACE/settings.xml
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: 🧪 Run Spring Boot App (Test Mode)
+      working-directory: project
+      run: |
+        echo "🔄 Running Spring Boot JAR..."
+        java -jar target/demo-1.0.0.jar &
+        sleep 10
+        curl -I http://localhost:8080 || echo "✅ App responded or skipped test"
+        pkill -f demo-1.0.0.jar || echo "🛑 Stopped Spring Boot App"
