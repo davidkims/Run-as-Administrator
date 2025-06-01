@@ -1,10 +1,10 @@
-name: PSScriptAnalyzer with SARIF
+name: PowerShell PSScriptAnalyzer SARIF CI
 
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
   pull_request:
-    branches: [ "main" ]
+    branches: ["main"]
   workflow_dispatch:
 
 permissions:
@@ -13,13 +13,18 @@ permissions:
 
 jobs:
   analyze:
+    name: Analyze PowerShell Code with PSScriptAnalyzer
     runs-on: ubuntu-latest
-    name: Analyze PowerShell with PSScriptAnalyzer
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install PowerShell and PSScriptAnalyzer
+      - name: Ensure ./scripts directory exists
+        run: |
+          mkdir -p ./scripts
+          echo "Write-Output 'Dummy script'" > ./scripts/dummy.ps1
+
+      - name: Remove and reinstall PSScriptAnalyzer
         shell: pwsh
         run: |
           Remove-Module PSScriptAnalyzer -ErrorAction SilentlyContinue
@@ -57,7 +62,7 @@ jobs:
             })
           }
 
-          foreach ($res in $results | Where-Object { $_.Severity -eq 'Error' }) {
+          foreach ($res in $results) {
             $sarif.runs[0].results += @{
               ruleId = $res.RuleName
               level = $res.Severity.ToString().ToLower()
@@ -73,7 +78,7 @@ jobs:
 
           $sarif | ConvertTo-Json -Depth 10 | Out-File results.sarif -Encoding utf8
 
-      - name: Upload SARIF to GitHub Code Scanning
+      - name: Upload SARIF to GitHub code scanning
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: results.sarif
