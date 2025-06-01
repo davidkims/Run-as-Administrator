@@ -1,42 +1,45 @@
-name: PowerShell SARIF Analysis
+name: PSScriptAnalyzer with SARIF
 
 on:
   push:
-    branches: ["main"]
+    branches: [ "main" ]
   pull_request:
-    branches: ["main"]
+    branches: [ "main" ]
+  workflow_dispatch:
 
 permissions:
-  contents: write
-  pages: write
-  id-token: write
+  contents: read
   security-events: write
 
 jobs:
   analyze:
-    name: Run Full PSScriptAnalyzer and Upload SARIF
     runs-on: ubuntu-latest
-
+    name: Analyze PowerShell with PSScriptAnalyzer
     steps:
-      - name: 📅 Checkout Repository
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: 🛠 Create Sample PowerShell Script
-        run: |
-          mkdir -p scripts
-          echo 'Write-Host "Hello, world!"' > scripts/sample.ps1
-
-      - name: 🥺 Install or Update PSScriptAnalyzer
+      - name: Install PowerShell and PSScriptAnalyzer
         shell: pwsh
         run: |
-          Write-Host "🔁 Installing PSScriptAnalyzer to user scope..."
+          Remove-Module PSScriptAnalyzer -ErrorAction SilentlyContinue
           Install-Module -Name PSScriptAnalyzer -Force -Scope CurrentUser -AllowClobber
 
-      - name: ✅ Run PSScriptAnalyzer and Build SARIF
+      - name: Run PSScriptAnalyzer and generate SARIF
         shell: pwsh
         run: |
           $results = Invoke-ScriptAnalyzer -Path "./scripts" -Recurse -Severity Error,Warning,Information
-          $rules = Get-ScriptAnalyzerRule
+
+          $rules = Get-ScriptAnalyzerRule | ForEach-Object {
+            [PSCustomObject]@{
+              id = $_.RuleName
+              name = $_.RuleName
+              shortDescription = @{ text = $_.Description }
+              fullDescription = @{ text = $_.Description }
+              helpUri = "https://github.com/PowerShell/PSScriptAnalyzer/blob/master/README.md"
+              properties = @{ tags = @($_.Severity) }
+            }
+          }
 
           $sarif = @{
             '$schema' = 'https://json.schemastore.org/sarif-2.1.0.json'
@@ -46,26 +49,18 @@ jobs:
                 driver = @{
                   name = 'PSScriptAnalyzer'
                   version = '1.24.0'
-                  rules = @()
+                  informationUri = 'https://github.com/PowerShell/PSScriptAnalyzer'
+                  rules = $rules
                 }
               }
               results = @()
             })
           }
 
-          foreach ($rule in $rules) {
-            $sarif.runs[0].tool.driver.rules += @{
-              id = $rule.RuleName
-              name = $rule.RuleName
-              shortDescription = @{ text = $rule.CommonName }
-              helpUri = $rule.HelpLink
-            }
-          }
-
           foreach ($res in $results | Where-Object { $_.Severity -eq 'Error' }) {
             $sarif.runs[0].results += @{
               ruleId = $res.RuleName
-              level = $res.Severity.ToString().ToLowerInvariant()
+              level = $res.Severity.ToString().ToLower()
               message = @{ text = $res.Message }
               locations = @(@{
                 physicalLocation = @{
@@ -78,32 +73,7 @@ jobs:
 
           $sarif | ConvertTo-Json -Depth 10 | Out-File results.sarif -Encoding utf8
 
-      - name: 📤 Upload SARIF to GitHub Code Scanning
-        id: sarif-upload
+      - name: Upload SARIF to GitHub Code Scanning
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: results.sarif
-        continue-on-error: true
-
-      - name: ⚠️ Install SARIF Multitool
-        if: steps.sarif-upload.outcome == 'failure'
-        run: npm install -g @microsoft/sarif-multitool
-
-      - name: 🌐 Generate HTML Report with Summary Table and Diff Highlight
-        if: steps.sarif-upload.outcome == 'failure'
-        run: |
-          mkdir -p report
-          sarif-multitool rewrite results.sarif -o report/results.sarif
-          echo "<html><head><style>table { border-collapse: collapse; } th, td { padding: 6px; border: 1px solid black; } .error { background-color: #ffd6d6; }</style></head><body><h1>Fallback SARIF Report</h1>" > report/index.html
-          echo "<table><tr><th>Rule ID</th><th>Message</th><th>File</th><th>Line</th></tr>" >> report/index.html
-          cat results.sarif | jq -r '.runs[].results[] | "<tr class=\"error\"><td>" + .ruleId + "</td><td>" + .message.text + "</td><td>" + .locations[0].physicalLocation.artifactLocation.uri + "</td><td>" + (.locations[0].physicalLocation.region.startLine|tostring) + "</td></tr>"' >> report/index.html
-          echo "</table><hr><pre>" >> report/index.html
-          cat results.sarif >> report/index.html
-          echo "</pre></body></html>" >> report/index.html
-
-      - name: 🚀 Deploy to GitHub Pages (Fallback)
-        if: steps.sarif-upload.outcome == 'failure'
-        uses: peaceiris/actions-gh-pages@v4
-        with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_dir: ./report
