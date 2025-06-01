@@ -1,4 +1,4 @@
-name: PSScriptAnalyzer
+name: PSScriptAnalyzer with Auto-Generated Settings
 
 on:
   push:
@@ -13,7 +13,7 @@ permissions:
 
 jobs:
   analyze-powershell:
-    name: Run PSScriptAnalyzer and upload SARIF
+    name: Analyze PowerShell Code
     runs-on: ubuntu-latest
 
     permissions:
@@ -22,29 +22,36 @@ jobs:
       actions: read
 
     steps:
-      - name: 📥 Checkout source code
+      - name: 📥 Checkout code
         uses: actions/checkout@v4
+
+      - name: 🛠 Generate .psd1 configuration file
+        run: |
+          mkdir -p .github
+          cat << 'EOF' > .github/psscriptanalyzer-settings.psd1
+@{
+    IncludeRules = @(
+        'PSAvoidGlobalAliases',
+        'PSAvoidUsingConvertToSecureStringWithPlainText',
+        'PSAvoidUsingWriteHost'
+    )
+    Rules = @{
+        PSAvoidUsingWriteHost = @{
+            Severity = 'Warning'
+        }
+    }
+}
+EOF
 
       - name: 🧪 Run PSScriptAnalyzer
         uses: microsoft/psscriptanalyzer-action@6b2948b1944407914a58661c49941824d149734f
         with:
           path: ./
           recurse: true
-          includeRule: '["PSAvoidGlobalAliases", "PSAvoidUsingConvertToSecureStringWithPlainText"]'
+          settingsPath: .github/psscriptanalyzer-settings.psd1
           output: results.sarif
 
-      - name: 📤 Upload SARIF results to GitHub Security tab
+      - name: 📤 Upload SARIF results
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: results.sarif
-
-      - name: 🧾 Show findings summary
-        if: success()
-        run: |
-          echo "✅ Static analysis complete."
-          if [ -f results.sarif ]; then
-            echo "🔍 Results file located at results.sarif"
-            echo "📊 Use GitHub Security tab to review detected PowerShell code issues."
-          else
-            echo "⚠️ No SARIF file found. PSScriptAnalyzer might have failed or found no issues."
-          fi
