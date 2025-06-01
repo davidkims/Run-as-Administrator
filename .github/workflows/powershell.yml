@@ -29,6 +29,14 @@ jobs:
       - name: 🥺 Run PSScriptAnalyzer and Build SARIF
         shell: pwsh
         run: |
+          Remove-Module PSScriptAnalyzer -ErrorAction SilentlyContinue
+          Get-Module -ListAvailable PSScriptAnalyzer | ForEach-Object {
+            try {
+              Remove-Item -Path $_.ModuleBase -Recurse -Force -ErrorAction Stop
+            } catch {
+              Write-Warning "Could not remove module: $($_.Exception.Message)"
+            }
+          }
           Install-Module -Name PSScriptAnalyzer -Force -Scope CurrentUser -AllowClobber
 
           $results = Invoke-ScriptAnalyzer -Path "./scripts" -Recurse -Severity Error,Warning,Information
