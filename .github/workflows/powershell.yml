@@ -1,4 +1,4 @@
-ame: PSScriptAnalyzer SARIF Scan
+name: PSScriptAnalyzer SARIF Scan
 
 on:
   push:
