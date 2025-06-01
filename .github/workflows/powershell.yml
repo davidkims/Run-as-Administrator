@@ -1,4 +1,4 @@
-name: PSScriptAnalyzer with HTML fallback
+name: PSScriptAnalyzer with Secure + Insecure Sample
 
 on:
   push:
@@ -17,25 +17,34 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: 📥 Checkout
+      - name: 📥 Checkout repository
         uses: actions/checkout@v4
 
-      - name: 📝 Create test script
+      - name: 📝 Create insecure sample.ps1 (violates rules)
         run: |
           mkdir -p scripts
           echo 'Write-Host "Bad practice"' > scripts/sample.ps1
           echo '$files = gci' >> scripts/sample.ps1
-          echo '$secure = "secret" | ConvertTo-SecureString -AsPlainText -Force' >> scripts/sample.ps1
+          echo '# ❗ This is insecure. Do NOT use in real scripts.' >> scripts/sample.ps1
+          echo '$secure = "plaintext" | ConvertTo-SecureString -AsPlainText -Force' >> scripts/sample.ps1
 
-      - name: ⚙️ Create .psd1 rule config
+      - name: 🛡️ Create secure secure-sample.ps1 (compliant)
+        run: |
+          echo '# ✅ Secure method using Read-Host' > scripts/secure-sample.ps1
+          echo '$secure = Read-Host "Enter your password" -AsSecureString' >> scripts/secure-sample.ps1
+          echo '' >> scripts/secure-sample.ps1
+          echo '# ✅ Preferred way using Get-Credential' >> scripts/secure-sample.ps1
+          echo '$cred = Get-Credential' >> scripts/secure-sample.ps1
+
+      - name: ⚙️ Generate .psd1 PSScriptAnalyzer config
         run: |
           mkdir -p .github
           echo '@{' > .github/psscriptanalyzer-settings.psd1
-          echo 'IncludeRules = @(' >> .github/psscriptanalyzer-settings.psd1
-          echo "'PSAvoidGlobalAliases'," >> .github/psscriptanalyzer-settings.psd1
-          echo "'PSAvoidUsingConvertToSecureStringWithPlainText'," >> .github/psscriptanalyzer-settings.psd1
-          echo "'PSAvoidUsingWriteHost'" >> .github/psscriptanalyzer-settings.psd1
-          echo ')' >> .github/psscriptanalyzer-settings.psd1
+          echo '    IncludeRules = @(' >> .github/psscriptanalyzer-settings.psd1
+          echo "        'PSAvoidGlobalAliases'," >> .github/psscriptanalyzer-settings.psd1
+          echo "        'PSAvoidUsingConvertToSecureStringWithPlainText'," >> .github/psscriptanalyzer-settings.psd1
+          echo "        'PSAvoidUsingWriteHost'" >> .github/psscriptanalyzer-settings.psd1
+          echo '    )' >> .github/psscriptanalyzer-settings.psd1
           echo '}' >> .github/psscriptanalyzer-settings.psd1
 
       - name: 🧪 Run PSScriptAnalyzer
@@ -46,7 +55,7 @@ jobs:
           settingsPath: .github/psscriptanalyzer-settings.psd1
           output: results.sarif
 
-      - name: 📤 Try uploading SARIF to GitHub Security
+      - name: 📤 Upload SARIF to GitHub Security
         id: upload
         continue-on-error: true
         uses: github/codeql-action/upload-sarif@v3
@@ -54,7 +63,7 @@ jobs:
           sarif_file: results.sarif
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: 🌐 Convert SARIF to HTML (on failure only)
+      - name: 🌐 Convert SARIF to HTML report (fallback)
         if: steps.upload.outcome == 'failure'
         run: |
           npm install -g @microsoft/sarif-multitool
@@ -62,7 +71,7 @@ jobs:
           sarif-multitool rewrite --force --uriBaseId "file://" results.sarif --output report/results.sarif
           sarif-multitool export report/results.sarif --format html --output report/index.html
 
-      - name: 🚀 Deploy report to GitHub Pages
+      - name: 🚀 Deploy HTML to GitHub Pages
         if: steps.upload.outcome == 'failure'
         uses: peaceiris/actions-gh-pages@v4
         with:
