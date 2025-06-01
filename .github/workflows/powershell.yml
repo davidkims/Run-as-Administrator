@@ -1,38 +1,32 @@
-name: PowerShell PSScriptAnalyzer SARIF CI
+name: PSScriptAnalyzer SARIF Upload
 
 on:
   push:
-    branches: ["main"]
-  pull_request:
-    branches: ["main"]
+    paths:
+      - 'scripts/**/*.ps1'
   workflow_dispatch:
 
 permissions:
-  contents: read
   security-events: write
+  contents: read
 
 jobs:
   analyze:
-    name: Analyze PowerShell Code with PSScriptAnalyzer
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Ensure ./scripts directory exists
-        run: |
-          mkdir -p ./scripts
-          echo "Write-Output 'Dummy script'" > ./scripts/dummy.ps1
-
-      - name: Remove and reinstall PSScriptAnalyzer
-        shell: pwsh
-        run: |
-          Remove-Module PSScriptAnalyzer -ErrorAction SilentlyContinue
-          Install-Module -Name PSScriptAnalyzer -Force -Scope CurrentUser -AllowClobber
+      - name: Setup PowerShell
+        uses: actions/setup-powershell@v2
 
       - name: Run PSScriptAnalyzer and generate SARIF
         shell: pwsh
         run: |
+          Remove-Module PSScriptAnalyzer -ErrorAction SilentlyContinue
+          Install-Module -Name PSScriptAnalyzer -Force -Scope CurrentUser -AllowClobber
+          mkdir -Force ./scripts | Out-Null
+          'Write-Host "Dummy Script"' | Set-Content "./scripts/dummy.ps1"
+
           $results = Invoke-ScriptAnalyzer -Path "./scripts" -Recurse -Severity Error,Warning,Information
 
           $rules = Get-ScriptAnalyzerRule | ForEach-Object {
@@ -42,7 +36,7 @@ jobs:
               shortDescription = @{ text = $_.Description }
               fullDescription = @{ text = $_.Description }
               helpUri = "https://github.com/PowerShell/PSScriptAnalyzer/blob/master/README.md"
-              properties = @{ tags = @($_.Severity) }
+              properties = @{ tags = @("$($_.Severity)") }
             }
           }
 
@@ -62,7 +56,7 @@ jobs:
             })
           }
 
-          foreach ($res in $results) {
+          foreach ($res in $results | Where-Object { $_.Severity -eq 'Error' }) {
             $sarif.runs[0].results += @{
               ruleId = $res.RuleName
               level = $res.Severity.ToString().ToLower()
@@ -78,7 +72,8 @@ jobs:
 
           $sarif | ConvertTo-Json -Depth 10 | Out-File results.sarif -Encoding utf8
 
-      - name: Upload SARIF to GitHub code scanning
+      - name: Upload SARIF to GitHub
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: results.sarif
+          checkout_path: ${{ github.workspace }}
