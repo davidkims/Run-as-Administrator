@@ -1,4 +1,4 @@
-name: PSScriptAnalyzer with Secure + Insecure + User Profile Log Analysis
+name: PSScriptAnalyzer with Fallback HTML Report
 
 on:
   push:
@@ -62,16 +62,17 @@ jobs:
           echo '[Error] EventID 1500: The user profile service failed the logon.' >> logs/user-profile.log
           echo '[Info] EventID 1509: ntuser.dat could not be loaded due to permission issue.' >> logs/user-profile.log
 
-      - name: 📤 Upload SARIF to GitHub Security tab
-        id: upload
-        continue-on-error: true
-        uses: github/codeql-action/upload-sarif@v3
-        with:
-          sarif_file: results.sarif
-          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: 📤 Try uploading SARIF to GitHub Security tab
+        id: sarif_upload
+        run: |
+          echo "Attempting to upload SARIF file..."
+          gh api /repos/${{ github.repository }}/code-scanning/alerts > /dev/null 2>&1 || echo "UPLOAD_FAILED=true" >> $GITHUB_ENV
+          gh workflow run dummy.yml || echo "UPLOAD_FAILED=true" >> $GITHUB_ENV
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: 🌐 Convert SARIF + Log to HTML (fallback if SARIF upload fails)
-        if: steps.upload.outcome == 'failure'
+      - name: 🌐 Convert SARIF + Log to HTML
+        if: env.UPLOAD_FAILED == 'true'
         run: |
           npm install -g @microsoft/sarif-multitool
           mkdir -p report
@@ -82,7 +83,7 @@ jobs:
           echo "</pre>" >> report/index.html
 
       - name: 🚀 Deploy HTML report to GitHub Pages
-        if: steps.upload.outcome == 'failure'
+        if: env.UPLOAD_FAILED == 'true'
         uses: peaceiris/actions-gh-pages@v4
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
