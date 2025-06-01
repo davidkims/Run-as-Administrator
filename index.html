@@ -1,0 +1,581 @@
+<html><head><style>table { border-collapse: collapse; } th, td { padding: 6px; border: 1px solid black; } .error { background-color: #ffd6d6; }</style></head><body><h1>Fallback SARIF Report</h1>
+<table><tr><th>Rule ID</th><th>Message</th><th>File</th><th>Line</th></tr>
+</table><hr><pre>
+{
+  "runs": [
+    {
+      "tool": {
+        "driver": {
+          "name": "PSScriptAnalyzer",
+          "rules": [
+            {
+              "name": "PSAlignAssignmentStatement",
+              "helpUri": null,
+              "id": "PSAlignAssignmentStatement",
+              "shortDescription": {
+                "text": "Align assignment statement"
+              }
+            },
+            {
+              "name": "PSAvoidUsingCmdletAliases",
+              "helpUri": null,
+              "id": "PSAvoidUsingCmdletAliases",
+              "shortDescription": {
+                "text": "Avoid Using Cmdlet Aliases or omitting the 'Get-' prefix."
+              }
+            },
+            {
+              "name": "PSAvoidAssignmentToAutomaticVariable",
+              "helpUri": null,
+              "id": "PSAvoidAssignmentToAutomaticVariable",
+              "shortDescription": {
+                "text": "Changing automtic variables might have undesired side effects"
+              }
+            },
+            {
+              "name": "PSAvoidDefaultValueSwitchParameter",
+              "helpUri": null,
+              "id": "PSAvoidDefaultValueSwitchParameter",
+              "shortDescription": {
+                "text": "Switch Parameters Should Not Default To True"
+              }
+            },
+            {
+              "name": "PSAvoidDefaultValueForMandatoryParameter",
+              "helpUri": null,
+              "id": "PSAvoidDefaultValueForMandatoryParameter",
+              "shortDescription": {
+                "text": "Avoid Default Value For Mandatory Parameter"
+              }
+            },
+            {
+              "name": "PSAvoidUsingEmptyCatchBlock",
+              "helpUri": null,
+              "id": "PSAvoidUsingEmptyCatchBlock",
+              "shortDescription": {
+                "text": "Avoid Using Empty Catch Block"
+              }
+            },
+            {
+              "name": "PSAvoidExclaimOperator",
+              "helpUri": null,
+              "id": "PSAvoidExclaimOperator",
+              "shortDescription": {
+                "text": "Avoid exclaim operator"
+              }
+            },
+            {
+              "name": "PSAvoidGlobalAliases",
+              "helpUri": null,
+              "id": "PSAvoidGlobalAliases",
+              "shortDescription": {
+                "text": "Avoid global aliases."
+              }
+            },
+            {
+              "name": "PSAvoidGlobalFunctions",
+              "helpUri": null,
+              "id": "PSAvoidGlobalFunctions",
+              "shortDescription": {
+                "text": "Avoid global functiosn and aliases"
+              }
+            },
+            {
+              "name": "PSAvoidGlobalVars",
+              "helpUri": null,
+              "id": "PSAvoidGlobalVars",
+              "shortDescription": {
+                "text": "No Global Variables"
+              }
+            },
+            {
+              "name": "PSAvoidInvokingEmptyMembers",
+              "helpUri": null,
+              "id": "PSAvoidInvokingEmptyMembers",
+              "shortDescription": {
+                "text": "Avoid Invoking Empty Members"
+              }
+            },
+            {
+              "name": "PSAvoidLongLines",
+              "helpUri": null,
+              "id": "PSAvoidLongLines",
+              "shortDescription": {
+                "text": "Avoid long lines"
+              }
+            },
+            {
+              "name": "PSAvoidMultipleTypeAttributes",
+              "helpUri": null,
+              "id": "PSAvoidMultipleTypeAttributes",
+              "shortDescription": {
+                "text": "Avoid multiple type specifiers on parameters"
+              }
+            },
+            {
+              "name": "PSAvoidNullOrEmptyHelpMessageAttribute",
+              "helpUri": null,
+              "id": "PSAvoidNullOrEmptyHelpMessageAttribute",
+              "shortDescription": {
+                "text": "Avoid using null or empty HelpMessage parameter attribute."
+              }
+            },
+            {
+              "name": "PSAvoidOverwritingBuiltInCmdlets",
+              "helpUri": null,
+              "id": "PSAvoidOverwritingBuiltInCmdlets",
+              "shortDescription": {
+                "text": "Avoid overwriting built in cmdlets"
+              }
+            },
+            {
+              "name": "PSAvoidUsingPositionalParameters",
+              "helpUri": null,
+              "id": "PSAvoidUsingPositionalParameters",
+              "shortDescription": {
+                "text": "Avoid Using Positional Parameters"
+              }
+            },
+            {
+              "name": "PSReservedCmdletChar",
+              "helpUri": null,
+              "id": "PSReservedCmdletChar",
+              "shortDescription": {
+                "text": "Reserved Cmdlet Chars"
+              }
+            },
+            {
+              "name": "PSReservedParams",
+              "helpUri": null,
+              "id": "PSReservedParams",
+              "shortDescription": {
+                "text": "Reserved Parameters"
+              }
+            },
+            {
+              "name": "PSAvoidSemicolonsAsLineTerminators",
+              "helpUri": null,
+              "id": "PSAvoidSemicolonsAsLineTerminators",
+              "shortDescription": {
+                "text": "Avoid semicolons as line terminators"
+              }
+            },
+            {
+              "name": "PSAvoidShouldContinueWithoutForce",
+              "helpUri": null,
+              "id": "PSAvoidShouldContinueWithoutForce",
+              "shortDescription": {
+                "text": "Avoid Using ShouldContinue Without Boolean Force Parameter"
+              }
+            },
+            {
+              "name": "PSAvoidTrailingWhitespace",
+              "helpUri": null,
+              "id": "PSAvoidTrailingWhitespace",
+              "shortDescription": {
+                "text": "Avoid trailing whitespace"
+              }
+            },
+            {
+              "name": "PSAvoidUsingUsernameAndPasswordParams",
+              "helpUri": null,
+              "id": "PSAvoidUsingUsernameAndPasswordParams",
+              "shortDescription": {
+                "text": "Avoid Using Username and Password Parameters"
+              }
+            },
+            {
+              "name": "PSAvoidUsingAllowUnencryptedAuthentication",
+              "helpUri": null,
+              "id": "PSAvoidUsingAllowUnencryptedAuthentication",
+              "shortDescription": {
+                "text": "Avoid AllowUnencryptedAuthentication Switch"
+              }
+            },
+            {
+              "name": "PSAvoidUsingBrokenHashAlgorithms",
+              "helpUri": null,
+              "id": "PSAvoidUsingBrokenHashAlgorithms",
+              "shortDescription": {
+                "text": "Avoid Using Broken Hash Algorithms"
+              }
+            },
+            {
+              "name": "PSAvoidUsingComputerNameHardcoded",
+              "helpUri": null,
+              "id": "PSAvoidUsingComputerNameHardcoded",
+              "shortDescription": {
+                "text": "Avoid Using ComputerName Hardcoded"
+              }
+            },
+            {
+              "name": "PSAvoidUsingConvertToSecureStringWithPlainText",
+              "helpUri": null,
+              "id": "PSAvoidUsingConvertToSecureStringWithPlainText",
+              "shortDescription": {
+                "text": "Avoid Using SecureString With Plain Text"
+              }
+            },
+            {
+              "name": "PSAvoidUsingDeprecatedManifestFields",
+              "helpUri": null,
+              "id": "PSAvoidUsingDeprecatedManifestFields",
+              "shortDescription": {
+                "text": "Avoid Using Deprecated Manifest Fields"
+              }
+            },
+            {
+              "name": "PSAvoidUsingDoubleQuotesForConstantString",
+              "helpUri": null,
+              "id": "PSAvoidUsingDoubleQuotesForConstantString",
+              "shortDescription": {
+                "text": "Avoid using double quotes if the string is constant."
+              }
+            },
+            {
+              "name": "PSAvoidUsingInvokeExpression",
+              "helpUri": null,
+              "id": "PSAvoidUsingInvokeExpression",
+              "shortDescription": {
+                "text": "Avoid Using Invoke-Expression"
+              }
+            },
+            {
+              "name": "PSAvoidUsingPlainTextForPassword",
+              "helpUri": null,
+              "id": "PSAvoidUsingPlainTextForPassword",
+              "shortDescription": {
+                "text": "Avoid Using Plain Text For Password Parameter"
+              }
+            },
+            {
+              "name": "PSAvoidUsingWMICmdlet",
+              "helpUri": null,
+              "id": "PSAvoidUsingWMICmdlet",
+              "shortDescription": {
+                "text": "Avoid Using Get-WMIObject, Remove-WMIObject, Invoke-WmiMethod, Register-WmiEvent, Set-WmiInstance"
+              }
+            },
+            {
+              "name": "PSAvoidUsingWriteHost",
+              "helpUri": null,
+              "id": "PSAvoidUsingWriteHost",
+              "shortDescription": {
+                "text": "Avoid Using Write-Host"
+              }
+            },
+            {
+              "name": "PSUseCompatibleCommands",
+              "helpUri": null,
+              "id": "PSUseCompatibleCommands",
+              "shortDescription": {
+                "text": "Use compatible commands"
+              }
+            },
+            {
+              "name": "PSUseCompatibleSyntax",
+              "helpUri": null,
+              "id": "PSUseCompatibleSyntax",
+              "shortDescription": {
+                "text": "Use compatible syntax"
+              }
+            },
+            {
+              "name": "PSUseCompatibleTypes",
+              "helpUri": null,
+              "id": "PSUseCompatibleTypes",
+              "shortDescription": {
+                "text": "Use compatible types"
+              }
+            },
+            {
+              "name": "PSMisleadingBacktick",
+              "helpUri": null,
+              "id": "PSMisleadingBacktick",
+              "shortDescription": {
+                "text": "Misleading Backtick"
+              }
+            },
+            {
+              "name": "PSMissingModuleManifestField",
+              "helpUri": null,
+              "id": "PSMissingModuleManifestField",
+              "shortDescription": {
+                "text": "Module Manifest Fields"
+              }
+            },
+            {
+              "name": "PSPlaceCloseBrace",
+              "helpUri": null,
+              "id": "PSPlaceCloseBrace",
+              "shortDescription": {
+                "text": "Place close braces"
+              }
+            },
+            {
+              "name": "PSPlaceOpenBrace",
+              "helpUri": null,
+              "id": "PSPlaceOpenBrace",
+              "shortDescription": {
+                "text": "Place open braces consistently"
+              }
+            },
+            {
+              "name": "PSPossibleIncorrectComparisonWithNull",
+              "helpUri": null,
+              "id": "PSPossibleIncorrectComparisonWithNull",
+              "shortDescription": {
+                "text": "Null Comparison"
+              }
+            },
+            {
+              "name": "PSPossibleIncorrectUsageOfAssignmentOperator",
+              "helpUri": null,
+              "id": "PSPossibleIncorrectUsageOfAssignmentOperator",
+              "shortDescription": {
+                "text": "'=' is not an assignment operator. Did you mean the equality operator '-eq'?"
+              }
+            },
+            {
+              "name": "PSPossibleIncorrectUsageOfRedirectionOperator",
+              "helpUri": null,
+              "id": "PSPossibleIncorrectUsageOfRedirectionOperator",
+              "shortDescription": {
+                "text": "'>' is not a comparison operator. Use  '-gt' (greater than) or '-ge' (greater or equal)."
+              }
+            },
+            {
+              "name": "PSProvideCommentHelp",
+              "helpUri": null,
+              "id": "PSProvideCommentHelp",
+              "shortDescription": {
+                "text": "Basic Comment Help"
+              }
+            },
+            {
+              "name": "PSReviewUnusedParameter",
+              "helpUri": null,
+              "id": "PSReviewUnusedParameter",
+              "shortDescription": {
+                "text": "ReviewUnusedParameter"
+              }
+            },
+            {
+              "name": "PSUseApprovedVerbs",
+              "helpUri": null,
+              "id": "PSUseApprovedVerbs",
+              "shortDescription": {
+                "text": "Cmdlet Verbs"
+              }
+            },
+            {
+              "name": "PSUseBOMForUnicodeEncodedFile",
+              "helpUri": null,
+              "id": "PSUseBOMForUnicodeEncodedFile",
+              "shortDescription": {
+                "text": "Use BOM encoding for non-ASCII files"
+              }
+            },
+            {
+              "name": "PSUseCmdletCorrectly",
+              "helpUri": null,
+              "id": "PSUseCmdletCorrectly",
+              "shortDescription": {
+                "text": "Use Cmdlet Correctly"
+              }
+            },
+            {
+              "name": "PSUseCompatibleCmdlets",
+              "helpUri": null,
+              "id": "PSUseCompatibleCmdlets",
+              "shortDescription": {
+                "text": "Use compatible cmdlets"
+              }
+            },
+            {
+              "name": "PSUseConsistentIndentation",
+              "helpUri": null,
+              "id": "PSUseConsistentIndentation",
+              "shortDescription": {
+                "text": "Use consistent indentation"
+              }
+            },
+            {
+              "name": "PSUseConsistentWhitespace",
+              "helpUri": null,
+              "id": "PSUseConsistentWhitespace",
+              "shortDescription": {
+                "text": "Use whitespaces"
+              }
+            },
+            {
+              "name": "PSUseCorrectCasing",
+              "helpUri": null,
+              "id": "PSUseCorrectCasing",
+              "shortDescription": {
+                "text": "Use exact casing of cmdlet/function/parameter name."
+              }
+            },
+            {
+              "name": "PSUseDeclaredVarsMoreThanAssignments",
+              "helpUri": null,
+              "id": "PSUseDeclaredVarsMoreThanAssignments",
+              "shortDescription": {
+                "text": "Extra Variables"
+              }
+            },
+            {
+              "name": "PSUseLiteralInitializerForHashtable",
+              "helpUri": null,
+              "id": "PSUseLiteralInitializerForHashtable",
+              "shortDescription": {
+                "text": "Create hashtables with literal initializers"
+              }
+            },
+            {
+              "name": "PSUseOutputTypeCorrectly",
+              "helpUri": null,
+              "id": "PSUseOutputTypeCorrectly",
+              "shortDescription": {
+                "text": "Use OutputType Correctly"
+              }
+            },
+            {
+              "name": "PSUseProcessBlockForPipelineCommand",
+              "helpUri": null,
+              "id": "PSUseProcessBlockForPipelineCommand",
+              "shortDescription": {
+                "text": "Use process block for command that accepts input from pipeline."
+              }
+            },
+            {
+              "name": "PSUsePSCredentialType",
+              "helpUri": null,
+              "id": "PSUsePSCredentialType",
+              "shortDescription": {
+                "text": "Use PSCredential type."
+              }
+            },
+            {
+              "name": "PSShouldProcess",
+              "helpUri": null,
+              "id": "PSShouldProcess",
+              "shortDescription": {
+                "text": "Should Process"
+              }
+            },
+            {
+              "name": "PSUseShouldProcessForStateChangingFunctions",
+              "helpUri": null,
+              "id": "PSUseShouldProcessForStateChangingFunctions",
+              "shortDescription": {
+                "text": "Use ShouldProcess For State Changing Functions"
+              }
+            },
+            {
+              "name": "PSUseSingularNouns",
+              "helpUri": null,
+              "id": "PSUseSingularNouns",
+              "shortDescription": {
+                "text": "Cmdlet Singular Noun"
+              }
+            },
+            {
+              "name": "PSUseSupportsShouldProcess",
+              "helpUri": null,
+              "id": "PSUseSupportsShouldProcess",
+              "shortDescription": {
+                "text": "Use SupportsShouldProcess"
+              }
+            },
+            {
+              "name": "PSUseToExportFieldsInManifest",
+              "helpUri": null,
+              "id": "PSUseToExportFieldsInManifest",
+              "shortDescription": {
+                "text": "Use the *ToExport module manifest fields."
+              }
+            },
+            {
+              "name": "PSUseUsingScopeModifierInNewRunspaces",
+              "helpUri": null,
+              "id": "PSUseUsingScopeModifierInNewRunspaces",
+              "shortDescription": {
+                "text": "Use 'Using:' scope modifier in RunSpace ScriptBlocks"
+              }
+            },
+            {
+              "name": "PSUseUTF8EncodingForHelpFile",
+              "helpUri": null,
+              "id": "PSUseUTF8EncodingForHelpFile",
+              "shortDescription": {
+                "text": "Use UTF8 Encoding For Help File"
+              }
+            },
+            {
+              "name": "PSDSCDscExamplesPresent",
+              "helpUri": null,
+              "id": "PSDSCDscExamplesPresent",
+              "shortDescription": {
+                "text": "DSC examples are present"
+              }
+            },
+            {
+              "name": "PSDSCDscTestsPresent",
+              "helpUri": null,
+              "id": "PSDSCDscTestsPresent",
+              "shortDescription": {
+                "text": "Dsc tests are present"
+              }
+            },
+            {
+              "name": "PSDSCReturnCorrectTypesForDSCFunctions",
+              "helpUri": null,
+              "id": "PSDSCReturnCorrectTypesForDSCFunctions",
+              "shortDescription": {
+                "text": "Return Correct Types For DSC Functions"
+              }
+            },
+            {
+              "name": "PSDSCUseIdenticalMandatoryParametersForDSC",
+              "helpUri": null,
+              "id": "PSDSCUseIdenticalMandatoryParametersForDSC",
+              "shortDescription": {
+                "text": "Use identical mandatory parameters for DSC Get/Test/Set TargetResource functions"
+              }
+            },
+            {
+              "name": "PSDSCUseIdenticalParametersForDSC",
+              "helpUri": null,
+              "id": "PSDSCUseIdenticalParametersForDSC",
+              "shortDescription": {
+                "text": "Use Identical Parameters For DSC Test and Set Functions"
+              }
+            },
+            {
+              "name": "PSDSCStandardDSCFunctionsInResource",
+              "helpUri": null,
+              "id": "PSDSCStandardDSCFunctionsInResource",
+              "shortDescription": {
+                "text": "Use Standard Get/Set/Test TargetResource functions in DSC Resource"
+              }
+            },
+            {
+              "name": "PSDSCUseVerboseMessageInDSCResource",
+              "helpUri": null,
+              "id": "PSDSCUseVerboseMessageInDSCResource",
+              "shortDescription": {
+                "text": "Use verbose message in DSC resource"
+              }
+            }
+          ],
+          "version": "1.24.0"
+        }
+      },
+      "results": []
+    }
+  ],
+  "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+  "version": "2.1.0"
+}
+</pre></body></html>

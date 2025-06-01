@@ -1,0 +1,508 @@
+{
+  "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+  "version": "2.1.0",
+  "runs": [
+    {
+      "tool": {
+        "driver": {
+          "name": "PSScriptAnalyzer",
+          "version": "1.24.0",
+          "rules": [
+            {
+              "id": "PSAlignAssignmentStatement",
+              "name": "PSAlignAssignmentStatement",
+              "shortDescription": {
+                "text": "Align assignment statement"
+              }
+            },
+            {
+              "id": "PSAvoidUsingCmdletAliases",
+              "name": "PSAvoidUsingCmdletAliases",
+              "shortDescription": {
+                "text": "Avoid Using Cmdlet Aliases or omitting the 'Get-' prefix."
+              }
+            },
+            {
+              "id": "PSAvoidAssignmentToAutomaticVariable",
+              "name": "PSAvoidAssignmentToAutomaticVariable",
+              "shortDescription": {
+                "text": "Changing automtic variables might have undesired side effects"
+              }
+            },
+            {
+              "id": "PSAvoidDefaultValueSwitchParameter",
+              "name": "PSAvoidDefaultValueSwitchParameter",
+              "shortDescription": {
+                "text": "Switch Parameters Should Not Default To True"
+              }
+            },
+            {
+              "id": "PSAvoidDefaultValueForMandatoryParameter",
+              "name": "PSAvoidDefaultValueForMandatoryParameter",
+              "shortDescription": {
+                "text": "Avoid Default Value For Mandatory Parameter"
+              }
+            },
+            {
+              "id": "PSAvoidUsingEmptyCatchBlock",
+              "name": "PSAvoidUsingEmptyCatchBlock",
+              "shortDescription": {
+                "text": "Avoid Using Empty Catch Block"
+              }
+            },
+            {
+              "id": "PSAvoidExclaimOperator",
+              "name": "PSAvoidExclaimOperator",
+              "shortDescription": {
+                "text": "Avoid exclaim operator"
+              }
+            },
+            {
+              "id": "PSAvoidGlobalAliases",
+              "name": "PSAvoidGlobalAliases",
+              "shortDescription": {
+                "text": "Avoid global aliases."
+              }
+            },
+            {
+              "id": "PSAvoidGlobalFunctions",
+              "name": "PSAvoidGlobalFunctions",
+              "shortDescription": {
+                "text": "Avoid global functiosn and aliases"
+              }
+            },
+            {
+              "id": "PSAvoidGlobalVars",
+              "name": "PSAvoidGlobalVars",
+              "shortDescription": {
+                "text": "No Global Variables"
+              }
+            },
+            {
+              "id": "PSAvoidInvokingEmptyMembers",
+              "name": "PSAvoidInvokingEmptyMembers",
+              "shortDescription": {
+                "text": "Avoid Invoking Empty Members"
+              }
+            },
+            {
+              "id": "PSAvoidLongLines",
+              "name": "PSAvoidLongLines",
+              "shortDescription": {
+                "text": "Avoid long lines"
+              }
+            },
+            {
+              "id": "PSAvoidMultipleTypeAttributes",
+              "name": "PSAvoidMultipleTypeAttributes",
+              "shortDescription": {
+                "text": "Avoid multiple type specifiers on parameters"
+              }
+            },
+            {
+              "id": "PSAvoidNullOrEmptyHelpMessageAttribute",
+              "name": "PSAvoidNullOrEmptyHelpMessageAttribute",
+              "shortDescription": {
+                "text": "Avoid using null or empty HelpMessage parameter attribute."
+              }
+            },
+            {
+              "id": "PSAvoidOverwritingBuiltInCmdlets",
+              "name": "PSAvoidOverwritingBuiltInCmdlets",
+              "shortDescription": {
+                "text": "Avoid overwriting built in cmdlets"
+              }
+            },
+            {
+              "id": "PSAvoidUsingPositionalParameters",
+              "name": "PSAvoidUsingPositionalParameters",
+              "shortDescription": {
+                "text": "Avoid Using Positional Parameters"
+              }
+            },
+            {
+              "id": "PSReservedCmdletChar",
+              "name": "PSReservedCmdletChar",
+              "shortDescription": {
+                "text": "Reserved Cmdlet Chars"
+              }
+            },
+            {
+              "id": "PSReservedParams",
+              "name": "PSReservedParams",
+              "shortDescription": {
+                "text": "Reserved Parameters"
+              }
+            },
+            {
+              "id": "PSAvoidSemicolonsAsLineTerminators",
+              "name": "PSAvoidSemicolonsAsLineTerminators",
+              "shortDescription": {
+                "text": "Avoid semicolons as line terminators"
+              }
+            },
+            {
+              "id": "PSAvoidShouldContinueWithoutForce",
+              "name": "PSAvoidShouldContinueWithoutForce",
+              "shortDescription": {
+                "text": "Avoid Using ShouldContinue Without Boolean Force Parameter"
+              }
+            },
+            {
+              "id": "PSAvoidTrailingWhitespace",
+              "name": "PSAvoidTrailingWhitespace",
+              "shortDescription": {
+                "text": "Avoid trailing whitespace"
+              }
+            },
+            {
+              "id": "PSAvoidUsingUsernameAndPasswordParams",
+              "name": "PSAvoidUsingUsernameAndPasswordParams",
+              "shortDescription": {
+                "text": "Avoid Using Username and Password Parameters"
+              }
+            },
+            {
+              "id": "PSAvoidUsingAllowUnencryptedAuthentication",
+              "name": "PSAvoidUsingAllowUnencryptedAuthentication",
+              "shortDescription": {
+                "text": "Avoid AllowUnencryptedAuthentication Switch"
+              }
+            },
+            {
+              "id": "PSAvoidUsingBrokenHashAlgorithms",
+              "name": "PSAvoidUsingBrokenHashAlgorithms",
+              "shortDescription": {
+                "text": "Avoid Using Broken Hash Algorithms"
+              }
+            },
+            {
+              "id": "PSAvoidUsingComputerNameHardcoded",
+              "name": "PSAvoidUsingComputerNameHardcoded",
+              "shortDescription": {
+                "text": "Avoid Using ComputerName Hardcoded"
+              }
+            },
+            {
+              "id": "PSAvoidUsingConvertToSecureStringWithPlainText",
+              "name": "PSAvoidUsingConvertToSecureStringWithPlainText",
+              "shortDescription": {
+                "text": "Avoid Using SecureString With Plain Text"
+              }
+            },
+            {
+              "id": "PSAvoidUsingDeprecatedManifestFields",
+              "name": "PSAvoidUsingDeprecatedManifestFields",
+              "shortDescription": {
+                "text": "Avoid Using Deprecated Manifest Fields"
+              }
+            },
+            {
+              "id": "PSAvoidUsingDoubleQuotesForConstantString",
+              "name": "PSAvoidUsingDoubleQuotesForConstantString",
+              "shortDescription": {
+                "text": "Avoid using double quotes if the string is constant."
+              }
+            },
+            {
+              "id": "PSAvoidUsingInvokeExpression",
+              "name": "PSAvoidUsingInvokeExpression",
+              "shortDescription": {
+                "text": "Avoid Using Invoke-Expression"
+              }
+            },
+            {
+              "id": "PSAvoidUsingPlainTextForPassword",
+              "name": "PSAvoidUsingPlainTextForPassword",
+              "shortDescription": {
+                "text": "Avoid Using Plain Text For Password Parameter"
+              }
+            },
+            {
+              "id": "PSAvoidUsingWMICmdlet",
+              "name": "PSAvoidUsingWMICmdlet",
+              "shortDescription": {
+                "text": "Avoid Using Get-WMIObject, Remove-WMIObject, Invoke-WmiMethod, Register-WmiEvent, Set-WmiInstance"
+              }
+            },
+            {
+              "id": "PSAvoidUsingWriteHost",
+              "name": "PSAvoidUsingWriteHost",
+              "shortDescription": {
+                "text": "Avoid Using Write-Host"
+              }
+            },
+            {
+              "id": "PSUseCompatibleCommands",
+              "name": "PSUseCompatibleCommands",
+              "shortDescription": {
+                "text": "Use compatible commands"
+              }
+            },
+            {
+              "id": "PSUseCompatibleSyntax",
+              "name": "PSUseCompatibleSyntax",
+              "shortDescription": {
+                "text": "Use compatible syntax"
+              }
+            },
+            {
+              "id": "PSUseCompatibleTypes",
+              "name": "PSUseCompatibleTypes",
+              "shortDescription": {
+                "text": "Use compatible types"
+              }
+            },
+            {
+              "id": "PSMisleadingBacktick",
+              "name": "PSMisleadingBacktick",
+              "shortDescription": {
+                "text": "Misleading Backtick"
+              }
+            },
+            {
+              "id": "PSMissingModuleManifestField",
+              "name": "PSMissingModuleManifestField",
+              "shortDescription": {
+                "text": "Module Manifest Fields"
+              }
+            },
+            {
+              "id": "PSPlaceCloseBrace",
+              "name": "PSPlaceCloseBrace",
+              "shortDescription": {
+                "text": "Place close braces"
+              }
+            },
+            {
+              "id": "PSPlaceOpenBrace",
+              "name": "PSPlaceOpenBrace",
+              "shortDescription": {
+                "text": "Place open braces consistently"
+              }
+            },
+            {
+              "id": "PSPossibleIncorrectComparisonWithNull",
+              "name": "PSPossibleIncorrectComparisonWithNull",
+              "shortDescription": {
+                "text": "Null Comparison"
+              }
+            },
+            {
+              "id": "PSPossibleIncorrectUsageOfAssignmentOperator",
+              "name": "PSPossibleIncorrectUsageOfAssignmentOperator",
+              "shortDescription": {
+                "text": "'=' is not an assignment operator. Did you mean the equality operator '-eq'?"
+              }
+            },
+            {
+              "id": "PSPossibleIncorrectUsageOfRedirectionOperator",
+              "name": "PSPossibleIncorrectUsageOfRedirectionOperator",
+              "shortDescription": {
+                "text": "'>' is not a comparison operator. Use  '-gt' (greater than) or '-ge' (greater or equal)."
+              }
+            },
+            {
+              "id": "PSProvideCommentHelp",
+              "name": "PSProvideCommentHelp",
+              "shortDescription": {
+                "text": "Basic Comment Help"
+              }
+            },
+            {
+              "id": "PSReviewUnusedParameter",
+              "name": "PSReviewUnusedParameter",
+              "shortDescription": {
+                "text": "ReviewUnusedParameter"
+              }
+            },
+            {
+              "id": "PSUseApprovedVerbs",
+              "name": "PSUseApprovedVerbs",
+              "shortDescription": {
+                "text": "Cmdlet Verbs"
+              }
+            },
+            {
+              "id": "PSUseBOMForUnicodeEncodedFile",
+              "name": "PSUseBOMForUnicodeEncodedFile",
+              "shortDescription": {
+                "text": "Use BOM encoding for non-ASCII files"
+              }
+            },
+            {
+              "id": "PSUseCmdletCorrectly",
+              "name": "PSUseCmdletCorrectly",
+              "shortDescription": {
+                "text": "Use Cmdlet Correctly"
+              }
+            },
+            {
+              "id": "PSUseCompatibleCmdlets",
+              "name": "PSUseCompatibleCmdlets",
+              "shortDescription": {
+                "text": "Use compatible cmdlets"
+              }
+            },
+            {
+              "id": "PSUseConsistentIndentation",
+              "name": "PSUseConsistentIndentation",
+              "shortDescription": {
+                "text": "Use consistent indentation"
+              }
+            },
+            {
+              "id": "PSUseConsistentWhitespace",
+              "name": "PSUseConsistentWhitespace",
+              "shortDescription": {
+                "text": "Use whitespaces"
+              }
+            },
+            {
+              "id": "PSUseCorrectCasing",
+              "name": "PSUseCorrectCasing",
+              "shortDescription": {
+                "text": "Use exact casing of cmdlet/function/parameter name."
+              }
+            },
+            {
+              "id": "PSUseDeclaredVarsMoreThanAssignments",
+              "name": "PSUseDeclaredVarsMoreThanAssignments",
+              "shortDescription": {
+                "text": "Extra Variables"
+              }
+            },
+            {
+              "id": "PSUseLiteralInitializerForHashtable",
+              "name": "PSUseLiteralInitializerForHashtable",
+              "shortDescription": {
+                "text": "Create hashtables with literal initializers"
+              }
+            },
+            {
+              "id": "PSUseOutputTypeCorrectly",
+              "name": "PSUseOutputTypeCorrectly",
+              "shortDescription": {
+                "text": "Use OutputType Correctly"
+              }
+            },
+            {
+              "id": "PSUseProcessBlockForPipelineCommand",
+              "name": "PSUseProcessBlockForPipelineCommand",
+              "shortDescription": {
+                "text": "Use process block for command that accepts input from pipeline."
+              }
+            },
+            {
+              "id": "PSUsePSCredentialType",
+              "name": "PSUsePSCredentialType",
+              "shortDescription": {
+                "text": "Use PSCredential type."
+              }
+            },
+            {
+              "id": "PSShouldProcess",
+              "name": "PSShouldProcess",
+              "shortDescription": {
+                "text": "Should Process"
+              }
+            },
+            {
+              "id": "PSUseShouldProcessForStateChangingFunctions",
+              "name": "PSUseShouldProcessForStateChangingFunctions",
+              "shortDescription": {
+                "text": "Use ShouldProcess For State Changing Functions"
+              }
+            },
+            {
+              "id": "PSUseSingularNouns",
+              "name": "PSUseSingularNouns",
+              "shortDescription": {
+                "text": "Cmdlet Singular Noun"
+              }
+            },
+            {
+              "id": "PSUseSupportsShouldProcess",
+              "name": "PSUseSupportsShouldProcess",
+              "shortDescription": {
+                "text": "Use SupportsShouldProcess"
+              }
+            },
+            {
+              "id": "PSUseToExportFieldsInManifest",
+              "name": "PSUseToExportFieldsInManifest",
+              "shortDescription": {
+                "text": "Use the *ToExport module manifest fields."
+              }
+            },
+            {
+              "id": "PSUseUsingScopeModifierInNewRunspaces",
+              "name": "PSUseUsingScopeModifierInNewRunspaces",
+              "shortDescription": {
+                "text": "Use 'Using:' scope modifier in RunSpace ScriptBlocks"
+              }
+            },
+            {
+              "id": "PSUseUTF8EncodingForHelpFile",
+              "name": "PSUseUTF8EncodingForHelpFile",
+              "shortDescription": {
+                "text": "Use UTF8 Encoding For Help File"
+              }
+            },
+            {
+              "id": "PSDSCDscExamplesPresent",
+              "name": "PSDSCDscExamplesPresent",
+              "shortDescription": {
+                "text": "DSC examples are present"
+              }
+            },
+            {
+              "id": "PSDSCDscTestsPresent",
+              "name": "PSDSCDscTestsPresent",
+              "shortDescription": {
+                "text": "Dsc tests are present"
+              }
+            },
+            {
+              "id": "PSDSCReturnCorrectTypesForDSCFunctions",
+              "name": "PSDSCReturnCorrectTypesForDSCFunctions",
+              "shortDescription": {
+                "text": "Return Correct Types For DSC Functions"
+              }
+            },
+            {
+              "id": "PSDSCUseIdenticalMandatoryParametersForDSC",
+              "name": "PSDSCUseIdenticalMandatoryParametersForDSC",
+              "shortDescription": {
+                "text": "Use identical mandatory parameters for DSC Get/Test/Set TargetResource functions"
+              }
+            },
+            {
+              "id": "PSDSCUseIdenticalParametersForDSC",
+              "name": "PSDSCUseIdenticalParametersForDSC",
+              "shortDescription": {
+                "text": "Use Identical Parameters For DSC Test and Set Functions"
+              }
+            },
+            {
+              "id": "PSDSCStandardDSCFunctionsInResource",
+              "name": "PSDSCStandardDSCFunctionsInResource",
+              "shortDescription": {
+                "text": "Use Standard Get/Set/Test TargetResource functions in DSC Resource"
+              }
+            },
+            {
+              "id": "PSDSCUseVerboseMessageInDSCResource",
+              "name": "PSDSCUseVerboseMessageInDSCResource",
+              "shortDescription": {
+                "text": "Use verbose message in DSC resource"
+              }
+            }
+          ]
+        }
+      },
+      "results": [],
+      "columnKind": "utf16CodeUnits"
+    }
+  ]
+}
