@@ -14,11 +14,23 @@ permissions:
 jobs:
   analyze:
     name: PowerShell Static Analysis (SARIF)
-    runs-on: windows-latest
+    runs-on: macos-latest
 
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
+
+      - name: Install Homebrew (if missing)
+        shell: bash
+        run: |
+          if ! command -v brew &> /dev/null; then
+            echo "🍺 Installing Homebrew..."
+            /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+            echo 'eval "$(/opt/homebrew/bin/brew shellenv)"' >> "$HOME/.zprofile"
+            eval "$(/opt/homebrew/bin/brew shellenv)"
+          else
+            echo "✅ Homebrew already installed"
+          fi
 
       - name: Ensure scripts folder exists
         shell: pwsh
