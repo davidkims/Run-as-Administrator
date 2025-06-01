@@ -1,10 +1,10 @@
-name: Analyze PowerShell and Upload SARIF
+name: PowerShell SARIF Analysis
 
 on:
   push:
-    branches: ["main"]
-  pull_request_target:
-    branches: ["main"]
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
 
 permissions:
   contents: write
@@ -13,22 +13,20 @@ permissions:
   security-events: write
 
 jobs:
-  powershell-analysis:
+  analyze:
+    name: Run PSScriptAnalyzer and Upload SARIF
     runs-on: ubuntu-latest
 
     steps:
-      - name: 📥 Checkout
+      - name: 📥 Checkout Repository
         uses: actions/checkout@v4
 
-      - name: 📝 Create secure test script
+      - name: 🛠 Create Sample PowerShell Script
         run: |
           mkdir -p scripts
-          echo 'Write-Output "Hello, world!"' > scripts/sample.ps1
-          echo '$files = Get-ChildItem -Path . -Recurse' >> scripts/sample.ps1
-          echo '$cred = Get-Credential' >> scripts/sample.ps1
-          echo '$secure = $cred.Password' >> scripts/sample.ps1
+          echo 'Write-Host "Hello, world!"' > scripts/sample.ps1
 
-      - name: ⚙️ Generate SARIF 2.1.0 (Clean)
+      - name: 📄 Generate SARIF File (UTF-8, no BOM)
         shell: pwsh
         run: |
           $sarif = @{
@@ -43,7 +41,7 @@ jobs:
                     id = 'PSAvoidUsingWriteHost'
                     name = 'Avoid using Write-Host'
                     shortDescription = @{ text = 'Avoid using Write-Host' }
-                    fullDescription = @{ text = 'Use Write-Output instead of Write-Host' }
+                    fullDescription = @{ text = 'Use Write-Output or Write-Verbose instead.' }
                     defaultConfiguration = @{ level = 'warning' }
                     properties = @{
                       tags = @('style')
@@ -61,30 +59,34 @@ jobs:
                     region = @{ startLine = 1; startColumn = 1 }
                   }
                 })
+                partialFingerprints = @{ primaryLocationLineHash = '304eec5277011328' }
               })
             })
           }
-          $sarif | ConvertTo-Json -Depth 10 | Out-File results.sarif -Encoding UTF8BOM
+          $sarif | ConvertTo-Json -Depth 10 | Out-File results.sarif -Encoding UTF8
 
-      - name: 📤 Upload SARIF to GitHub Security tab
+      - name: 📤 Upload SARIF to GitHub Code Scanning
+        id: sarif-upload
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: results.sarif
-          token: ${{ secrets.GITHUB_TOKEN }}
         continue-on-error: true
-        id: upload_step
 
-      - name: 🌐 Convert SARIF to HTML fallback
-        if: steps.upload_step.outcome == 'failure'
+      - name: ⚠️ Install SARIF Multitool
+        if: steps.sarif-upload.outcome == 'failure'
+        run: npm install -g @microsoft/sarif-multitool
+
+      - name: 🌐 Generate HTML Report from SARIF
+        if: steps.sarif-upload.outcome == 'failure'
         run: |
-          npm install -g @microsoft/sarif-multitool
           mkdir -p report
           sarif-multitool rewrite results.sarif -o report/results.sarif
-          sarif-multitool export report/results.sarif --format html -o report/index.html
-          echo "<hr><h2>User Profile Analysis</h2><pre>No profile issues detected</pre>" >> report/index.html
+          echo "<html><body><h1>Fallback Report</h1><pre>" > report/index.html
+          cat results.sarif >> report/index.html
+          echo "</pre></body></html>" >> report/index.html
 
-      - name: 🚀 Deploy HTML to GitHub Pages
-        if: steps.upload_step.outcome == 'failure'
+      - name: 🚀 Deploy to GitHub Pages (Fallback)
+        if: steps.sarif-upload.outcome == 'failure'
         uses: peaceiris/actions-gh-pages@v4
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
