@@ -1,0 +1,35 @@
+name: Disable All Workflows
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  disable-workflows:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: ✅ Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: 🛠️ Comment out `on:` in all workflow files
+        run: |
+          find .github/workflows -name "*.yml" -o -name "*.yaml" | while read file; do
+            echo "🔧 Disabling workflow in $file"
+            sed -i 's/^on:/# on:/g' "$file"
+          done
+
+      - name: 🔐 Set up Git and push with PAT
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          
+          git remote set-url origin https://x-access-token:${GH_PAT}@github.com/${{ github.repository }}
+          
+          git add .github/workflows
+          git commit -m "🚫 Disable all workflows by commenting out on: triggers" || echo "No changes to commit"
+          git push
