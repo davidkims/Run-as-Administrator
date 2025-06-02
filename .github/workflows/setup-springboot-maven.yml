@@ -1,0 +1,66 @@
+name: Setup SpringBoot and Maven Project
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 🛒 Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: 🧱 Create Project Directories and Dummy Files
+        run: |
+          mkdir -p /opt/project/springboot/{src,logs,temp}
+          mkdir -p /opt/project/maven/{src,target,logs}
+          mkdir -p .github/workflows
+          mkdir -p /opt/disks/springboot /opt/disks/maven
+
+          echo "Spring Boot Server Log" > /opt/project/springboot/logs/server.log
+          echo "Maven Project Placeholder" > /opt/project/maven/src/Main.java
+          echo "✅ 디렉토리 및 파일 생성 완료"
+
+      - name: 💽 Reserve Max Disk Space in .github/workflows
+        run: |
+          echo "📦 디스크 예약 공간 확보 중..."
+          if sudo fallocate -l 100G .github/workflows/.reserve_space; then
+            echo "✅ fallocate 사용 성공"
+          else
+            echo "⚠️ fallocate 실패: dd 방식으로 대체합니다"
+            sudo dd if=/dev/zero of=.github/workflows/.reserve_space bs=1M count=102400 || echo "❌ dd 실패: 디스크 용량 부족으로 예약 공간 확보 실패"
+          fi
+          sudo chmod 777 .github/workflows/.reserve_space
+          df -h
+
+      - name: ☕ Install Maven
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y maven
+          mvn -v
+
+      - name: 🧪 Test Maven Build Directory
+        run: |
+          cd /opt/project/maven
+          mvn archetype:generate -DgroupId=com.example -DartifactId=test-app -DarchetypeArtifactId=maven-archetype-quickstart -DinteractiveMode=false
+          echo "✅ Maven 프로젝트 생성 완료"
+
+      - name: 🚀 Simulate Spring Boot Server Setup
+        run: |
+          echo "🛠️ Spring Boot 서버 설치 중..."
+          mkdir -p /opt/project/springboot/server
+          touch /opt/project/springboot/server/app.jar
+          echo "Simulated Spring Boot JAR" > /opt/project/springboot/server/app.jar
+          echo "✅ Spring Boot 서버 설치 및 JAR 생성 완료"
+
+      - name: 🧾 Summary Report
+        run: |
+          echo "📄 실행 완료 요약:"
+          echo "- Spring Boot 경로: /opt/project/springboot"
+          echo "- Maven 경로: /opt/project/maven"
+          echo "- 디스크 용량 파일: .github/workflows/.reserve_space"
+          echo "- JAR 파일: /opt/project/springboot/server/app.jar"
