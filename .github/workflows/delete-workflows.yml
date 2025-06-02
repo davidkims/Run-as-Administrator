@@ -1,0 +1,27 @@
+name: Delete All Workflows
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  delete-workflows:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Delete all workflow files
+        run: |
+          rm -rf .github/workflows/*.yml
+          rm -rf .github/workflows/*.yaml
+
+      - name: Commit deletion
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add .github/workflows
+          git commit -m "🗑️ Delete all workflow files"
+          git push
