@@ -58,7 +58,7 @@ jobs:
         continue-on-error: true
 
       # Echo(환경/도커)
-      - name: 🔎 Echo: runner/env/docker
+      - name: 🔎 Echo:runner/env/docker
         run: |
           set -o pipefail
           echo "== Runner =="; uname -a || true
