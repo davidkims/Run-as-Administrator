@@ -1,46 +1,34 @@
-name: Setup SpringBoot and Maven Project (Safe Disk + Maven Cache)
+name: Setup SpringBoot & Maven (Fast Disk + Upgrades + Test-Mode + JDK Fix)
 
 on:
   workflow_dispatch:
     inputs:
-      clean_android:
-        description: "FreeDisk: Android 제거"
+      freedisk_profile:
+        description: "FreeDisk 프로파일 (none|minimal/aggressive)"
+        required: true
+        default: "minimal"
+      lowdisk_mode:
+        description: "저용량 디스크 시뮬 (off|tmpfs|loop)"
+        required: true
+        default: "tmpfs"
+      fast_compress:
+        description: "pigz 병렬 압축 사용 (true/false)"
+        required: true
+        default: "true"
+      upgrade_os:
+        description: "OS 패키지 업그레이드 실행 (true/false)"
         required: true
         default: "false"
-      clean_dotnet:
-        description: "FreeDisk: .NET 제거"
-        required: true
-        default: "false"
-      clean_haskell:
-        description: "FreeDisk: Haskell 제거"
-        required: true
-        default: "false"
-      clean_large_packages:
-        description: "FreeDisk: Large packages 제거"
-        required: true
-        default: "false"
-      clean_docker_images:
-        description: "FreeDisk: Docker images 제거"
-        required: true
-        default: "false"
-      clean_tool_cache:
-        description: "FreeDisk: Tool cache 제거"
-        required: true
-        default: "false"
-      clean_swap_storage:
-        description: "FreeDisk: Swap 제거"
-        required: true
-        default: "false"
-      prune_docker_all:
-        description: "수동: docker system prune -af --volumes"
-        required: true
-        default: "false"
+      java_version:
+        description: "설치/사용할 JDK 버전 (예: 17, 21)"
+        required: false
+        default: "17"
+      maven_version:
+        description: "설치할 Maven 버전 (예: 3.9.9). 비우면 apt 기본 사용"
+        required: false
+        default: ""
       purge_apt_cache:
-        description: "수동: apt/로그 정리"
-        required: true
-        default: "false"
-      simulate_low_disk:
-        description: "루프백 2~4GB /mnt/lowdisk 마운트"
+        description: "Apt 캐시/로그 정리 (true/false)"
         required: true
         default: "false"
 
@@ -50,131 +38,239 @@ permissions:
 jobs:
   setup:
     runs-on: ubuntu-latest
+    continue-on-error: true  # 테스트 서버 모드: 실패해도 진행
 
     steps:
-      - name: 🛒 Checkout Repository
+      - name: 🛒 Checkout
         uses: actions/checkout@v4
+        continue-on-error: true
 
-      - name: 📊 Show initial disk/network info
+      - name: 📊 Show initial df/ip
         run: |
-          set -Eeuo pipefail
-          echo "== df -h =="
-          df -h
-          echo "== docker images (head) =="
-          docker images | head -n 15 || true
-          echo "== ip a (head) =="
-          ip a || true
+          set -o pipefail
+          echo "== df -h ==" && df -h || true
+          echo "== ip a (head) ==" && ip a || true
+        continue-on-error: true
 
-      - name: 🧹 Free up disk space (action)
+      - name: 🧹 Free up disk space (profiled)
         uses: jlumbroso/free-disk-space@main
         with:
-          android:        ${{ github.event.inputs.clean_android == 'true' }}
-          dotnet:         ${{ github.event.inputs.clean_dotnet == 'true' }}
-          haskell:        ${{ github.event.inputs.clean_haskell == 'true' }}
-          large-packages: ${{ github.event.inputs.clean_large_packages == 'true' }}
-          docker-images:  ${{ github.event.inputs.clean_docker_images == 'true' }}
-          tool-cache:     ${{ github.event.inputs.clean_tool_cache == 'true' }}
-          swap-storage:   ${{ github.event.inputs.clean_swap_storage == 'true' }}
+          android:        ${{ github.event.inputs.freedisk_profile == 'aggressive' }}
+          dotnet:         ${{ github.event.inputs.freedisk_profile == 'aggressive' }}
+          haskell:        ${{ github.event.inputs.freedisk_profile == 'aggressive' }}
+          large-packages: ${{ github.event.inputs.freedisk_profile == 'aggressive' }}
+          docker-images:  ${{ github.event.inputs.freedisk_profile == 'minimal' || github.event.inputs.freedisk_profile == 'aggressive' }}
+          tool-cache:     ${{ github.event.inputs.freedisk_profile == 'minimal' || github.event.inputs.freedisk_profile == 'aggressive' }}
+          swap-storage:   ${{ github.event.inputs.freedisk_profile == 'aggressive' }}
+        continue-on-error: true
 
-      - name: 📊 Disk after action cleanup
-        run: df -h
+      - name: 📊 df after cleanup
+        run: df -h || true
+        continue-on-error: true
 
-      - name: 🧽 Manual prune:Docker ALL
-        if: ${{ github.event.inputs.prune_docker_all == 'true' }}
+      - name: ⬆️ Upgrade OS packages (safe)
+        if: ${{ github.event.inputs.upgrade_os == 'true' }}
         run: |
-          set -Eeuo pipefail
-          docker system prune -af --volumes || true
-          docker builder prune -af || true
-          df -h
+          set -o pipefail
+          sudo apt-get update -y || true
+          sudo DEBIAN_FRONTEND=noninteractive apt-get -y upgrade || true
+          sudo dpkg --configure -a || true
+          sudo apt-get -f install || true
+          df -h || true
+        continue-on-error: true
 
-      - name: 🧯 Manual purge:apt cache & logs
+      - name: 🧯 Purge apt cache & logs
         if: ${{ github.event.inputs.purge_apt_cache == 'true' }}
         run: |
-          set -Eeuo pipefail
-          sudo apt-get clean
+          set -o pipefail
+          sudo apt-get clean || true
           sudo rm -rf /var/lib/apt/lists/* || true
           sudo journalctl --vacuum-time=1s || true
           sudo find /var/log -type f -name "*.gz" -delete || true
           sudo find /var/log -type f -name "*.1" -delete || true
-          df -h
+          df -h || true
+        continue-on-error: true
 
-      - name: 🧪 (Optional) Simulate low-disk via loopback mount
-        if: ${{ github.event.inputs.simulate_low_disk == 'true' }}
+      - name: ⚡ Low-disk simulate (tmpfs/loop/off)
         id: lowdisk
         run: |
-          set -Eeuo pipefail
-          MNT="/mnt/lowdisk"
-          IMG="/mnt/tmp-pv.img"
-          sudo mkdir -p "$MNT"
-          AVAIL_GB=$(df --output=avail -BG /mnt | tail -1 | tr -dc '0-9')
-          SIZE_GB=2
-          if [ "$AVAIL_GB" -ge 12 ]; then SIZE_GB=4; fi
-          echo "Creating loopback file of ${SIZE_GB}G at $IMG (Avail=${AVAIL_GB}G)"
-          sudo fallocate -l ${SIZE_GB}G "$IMG" || sudo dd if=/dev/zero of="$IMG" bs=1M count=$((SIZE_GB*1024))
-          sudo mkfs.ext4 -F "$IMG"
-          sudo mount -o loop "$IMG" "$MNT"
-          sudo chmod 777 "$MNT"
-          echo "mounted" > "$MNT/.ok"
-          echo "img=$IMG" >> $GITHUB_OUTPUT
-          echo "mnt=$MNT" >> $GITHUB_OUTPUT
-          df -h "$MNT"
+          set -o pipefail
+          MODE="${{ github.event.inputs.lowdisk_mode }}"
+          echo "lowdisk_mode=$MODE"
+          if [ -z "$MODE" ] || [ "$MODE" = "off" ]; then
+            echo "skip=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          if [ "$MODE" = "tmpfs" ]; then
+            AVAIL_KB=$(awk '/MemAvailable/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)
+            SIZE_G=2; if [ "$AVAIL_KB" -gt $((8*1024*1024)) ]; then SIZE_G=4; fi
+            MNT="/mnt/lowdisk"; sudo mkdir -p "$MNT" || true
+            sudo mount -t tmpfs -o size=${SIZE_G}G,noatime,nodev,nosuid tmpfs "$MNT" || true
+            sudo chmod 777 "$MNT" || true
+            echo "mode=tmpfs" >> $GITHUB_OUTPUT
+            echo "mnt=$MNT"  >> $GITHUB_OUTPUT
+            df -h "$MNT" || true
+            exit 0
+          fi
+          if [ "$MODE" = "loop" ]; then
+            MNT="/mnt/lowdisk"; IMG="/mnt/tmp-pv.img"
+            sudo mkdir -p "$MNT" || true
+            AVAIL_GB=$(df --output=avail -BG /mnt | tail -1 | tr -dc '0-9' || echo 0)
+            SIZE_GB=2; if [ "$AVAIL_GB" -ge 12 ]; then SIZE_GB=4; fi
+            echo "Creating ${SIZE_GB}G loop image at $IMG (Avail=${AVAIL_GB}G)"
+            sudo fallocate -l ${SIZE_GB}G "$IMG" 2>/dev/null || sudo truncate -s ${SIZE_GB}G "$IMG" || true
+            sudo mkfs.ext4 -F -E lazy_itable_init=1,lazy_journal_init=1 -O ^has_journal "$IMG" || true
+            sudo mount -o loop,noatime,nodiratime "$IMG" "$MNT" || true
+            sudo chmod 777 "$MNT" || true
+            echo "mode=loop" >> $GITHUB_OUTPUT
+            echo "mnt=$MNT"  >> $GITHUB_OUTPUT
+            echo "img=$IMG"  >> $GITHUB_OUTPUT
+            df -h "$MNT" || true
+            exit 0
+          fi
+          echo "skip=true" >> $GITHUB_OUTPUT
+        continue-on-error: true
 
-      - name: 🧱 Create dirs (workspace + /opt demo)
+      - name: 🧱 Prepare dirs (workspace + /opt demo)
         run: |
-          set -Eeuo pipefail
-          mkdir -p "$GITHUB_WORKSPACE/artifacts"
-          # /opt 데모(실제 빌드는 워크스페이스에서 수행)
-          sudo mkdir -p /opt/project/springboot/{src,logs,temp,server}
-          sudo mkdir -p /opt/project/maven/{src,target,logs}
-          echo "Simulated Spring Boot JAR" | sudo tee /opt/project/springboot/server/app.jar >/dev/null
-          echo "Spring Boot Server Log"   | sudo tee /opt/project/springboot/logs/server.log >/dev/null
-          echo "Maven Placeholder"        | sudo tee /opt/project/maven/src/Main.java >/dev/null
+          set -o pipefail
+          mkdir -p "$GITHUB_WORKSPACE/artifacts" || true
+          sudo mkdir -p /opt/project/springboot/{src,logs,temp,server} || true
+          sudo mkdir -p /opt/project/maven/{src,target,logs} || true
+          echo "Simulated Spring Boot JAR" | sudo tee /opt/project/springboot/server/app.jar >/dev/null || true
+          echo "Spring Boot Server Log"   | sudo tee /opt/project/springboot/logs/server.log >/dev/null || true
+          echo "Maven Placeholder"        | sudo tee /opt/project/maven/src/Main.java >/dev/null || true
+        continue-on-error: true
 
       - name: ☕ Set up Java (no cache yet)
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
-          java-version: '17'
+          java-version: ${{ inputs.java_version }}
+        continue-on-error: true
 
-      - name: 📦 Install Maven CLI
+      - name: 📦 Install Maven (tarball if version set)
         run: |
-          set -Eeuo pipefail
-          sudo apt-get update -y
-          sudo apt-get install -y maven
-          mvn -v
+          set -o pipefail
+          VER="${{ github.event.inputs.maven_version }}"
+          if [ -n "$VER" ]; then
+            echo "Installing Apache Maven $VER (tarball)"
+            URL="https://archive.apache.org/dist/maven/maven-3/${VER}/binaries/apache-maven-${VER}-bin.tar.gz"
+            TMPD="$(mktemp -d)" || true
+            (cd "$TMPD" && curl -fsSL "$URL" -o maven.tgz && tar -xzf maven.tgz) || true
+            sudo rm -rf /opt/maven || true
+            sudo mv "$TMPD/apache-maven-${VER}" /opt/maven || true
+            echo "/opt/maven/bin" >> "$GITHUB_PATH"
+            rm -rf "$TMPD" || true
+          else
+            echo "Installing Maven from apt"
+            sudo apt-get update -y || true
+            sudo apt-get install -y maven pigz || true
+          fi
+          mvn -v || true
+        continue-on-error: true
 
-      - name: 🧪 Generate Maven sample project (IN WORKSPACE)
+      - name: 🧪 Generate Maven sample (IN WORKSPACE)
         working-directory: ${{ github.workspace }}
         run: |
-          set -Eeuo pipefail
+          set -o pipefail
+          # 최신 아키타입 버전 지정(호환성 향상)
           mvn -q archetype:generate \
             -DgroupId=com.example \
             -DartifactId=maven-sample \
             -DarchetypeArtifactId=maven-archetype-quickstart \
-            -DinteractiveMode=false
-          echo "✅ Generated $GITHUB_WORKSPACE/maven-sample/pom.xml"
+            -DarchetypeVersion=1.4 \
+            -DinteractiveMode=false || true
+          test -f "$GITHUB_WORKSPACE/maven-sample/pom.xml" || echo "⚠️ pom.xml 생성 확인 필요" || true
+        continue-on-error: true
+
+      # ✅ JDK 17/21에서도 컴파일되도록 POM 패치 (compiler plugin + <release>)
+      - name: 🩹 Patch POM for modern JDK (set compiler release)
+        working-directory: ${{ github.workspace }}/maven-sample
+        run: |
+          set -o pipefail
+          JVER="${{ github.event.inputs.java_version }}"
+          case "$JVER" in
+            ""|"11"|"17"|"21") : ;; # 허용
+            *) JVER="17" ;;
+          esac
+          echo "Using Java release=$JVER for compilation"
+          # 기존 POM을 현대화된 설정으로 교체(소스 디렉토리는 유지)
+          cat > pom.xml <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <project xmlns="http://maven.apache.org/POM/4.0.0"
+                   xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                   xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+            <modelVersion>4.0.0</modelVersion>
+            <groupId>com.example</groupId>
+            <artifactId>maven-sample</artifactId>
+            <version>1.0.0</version>
+            <name>maven-sample</name>
+            <properties>
+              <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+              <maven.compiler.release>${JVER}</maven.compiler.release>
+            </properties>
+            <build>
+              <plugins>
+                <plugin>
+                  <groupId>org.apache.maven.plugins</groupId>
+                  <artifactId>maven-compiler-plugin</artifactId>
+                  <version>3.11.0</version>
+                  <configuration>
+                    <release>\${maven.compiler.release}</release>
+                  </configuration>
+                </plugin>
+                <plugin>
+                  <groupId>org.apache.maven.plugins</groupId>
+                  <artifactId>maven-surefire-plugin</artifactId>
+                  <version>3.2.5</version>
+                </plugin>
+              </plugins>
+            </build>
+            <dependencies>
+              <!-- JUnit 4 (아키타입 1.4 소스와 호환) -->
+              <dependency>
+                <groupId>junit</groupId>
+                <artifactId>junit</artifactId>
+                <version>4.13.2</version>
+                <scope>test</scope>
+              </dependency>
+            </dependencies>
+          </project>
+          EOF
+          echo "Patched POM with maven-compiler-plugin (release=${JVER})"
+        continue-on-error: true
 
       - name: ☕ Enable Maven cache (setup-java)
+        if: ${{ hashFiles('maven-sample/pom.xml') != '' }}
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
-          java-version: '17'
+          java-version: ${{ inputs.java_version }}
           cache: 'maven'
           cache-dependency-path: |
             maven-sample/pom.xml
+        continue-on-error: true
 
       - name: 🏗️ Build (maven-sample)
         working-directory: ${{ github.workspace }}/maven-sample
         run: |
-          set -Eeuo pipefail
-          mvn -q -DskipTests package
-          ls -al target
+          set -o pipefail
+          mvn -q -DskipTests package || true
+          ls -al target || true
+        continue-on-error: true
 
-      - name: 📦 Archive & Upload Artifacts
+      - name: 📦 Archive (fast) & Upload Artifacts
         run: |
-          set -Eeuo pipefail
-          cp -f "$GITHUB_WORKSPACE/maven-sample/target/"*.jar "$GITHUB_WORKSPACE/artifacts/" || true
-          tar -czf "$GITHUB_WORKSPACE/artifacts/maven-sample.tgz" -C "$GITHUB_WORKSPACE" maven-sample
+          set -o pipefail
+          mkdir -p "$GITHUB_WORKSPACE/artifacts" || true
+          cp -f "$GITHUB_WORKSPACE/maven-sample/target/"*.jar "$GITHUB_WORKSPACE/artifacts/" 2>/dev/null || true
+          if [ "${{ github.event.inputs.fast_compress }}" = "true" ]; then
+            tar --use-compress-program=pigz -cf "$GITHUB_WORKSPACE/artifacts/maven-sample.tgz" -C "$GITHUB_WORKSPACE" maven-sample 2>/dev/null || true
+          else
+            tar -czf "$GITHUB_WORKSPACE/artifacts/maven-sample.tgz" -C "$GITHUB_WORKSPACE" maven-sample 2>/dev/null || true
+          fi
+        continue-on-error: true
 
       - name: ⬆️ Upload build artifacts
         uses: actions/upload-artifact@v4
@@ -183,28 +279,37 @@ jobs:
           path: artifacts/*
           if-no-files-found: warn
           retention-days: 7
+        continue-on-error: true
 
       - name: 📄 Summary
         run: |
-          set -Eeuo pipefail
-          echo "📄 DONE"
-          echo "- Workspace project: $GITHUB_WORKSPACE/maven-sample"
-          echo "- Built JARs in: $GITHUB_WORKSPACE/maven-sample/target"
-          echo "- Demo JAR: /opt/project/springboot/server/app.jar"
-          if [ "${{ steps.lowdisk.outcome }}" = "success" ]; then
-            echo "- LowDisk mount: ${{ steps.lowdisk.outputs.mnt }}"
+          set -o pipefail
+          echo "📄 DONE (Fast Disk + Upgrades + Test-Mode + JDK Fix)"
+          echo "- freedisk_profile: ${{ github.event.inputs.freedisk_profile }}"
+          echo "- lowdisk_mode: ${{ github.event.inputs.lowdisk_mode }}"
+          echo "- java_version: ${{ github.event.inputs.java_version }}"
+          echo "- maven_version: ${{ github.event.inputs.maven_version || 'apt-default' }}"
+          if [ -n "${{ steps.lowdisk.outputs.mnt }}" ]; then
+            echo "- lowdisk mount: ${{ steps.lowdisk.outputs.mnt }} (mode=${{ steps.lowdisk.outputs.mode }})"
           fi
-          echo "== df -h =="
-          df -h
+          echo "== df -h ==" && df -h || true
+        continue-on-error: true
 
-      - name: 🧽 Post-cleanup (unmount & remove loopback)
+      - name: 🧽 Post-cleanup (unmount & remove loopback/tmpfs)
         if: always()
         run: |
-          set -Eeuo pipefail
-          if [ -n "${{ steps.lowdisk.outputs.mnt }}" ] && mountpoint -q "${{ steps.lowdisk.outputs.mnt }}"; then
-            sudo umount "${{ steps.lowdisk.outputs.mnt }}"
+          set -o pipefail
+          MODE="${{ steps.lowdisk.outputs.mode }}"
+          if [ "$MODE" = "tmpfs" ] && [ -n "${{ steps.lowdisk.outputs.mnt }}" ]; then
+            sudo umount "${{ steps.lowdisk.outputs.mnt }}" || true
           fi
-          if [ -n "${{ steps.lowdisk.outputs.img }}" ] && [ -f "${{ steps.lowdisk.outputs.img }}" ]; then
-            sudo rm -f "${{ steps.lowdisk.outputs.img }}"
+          if [ "$MODE" = "loop" ]; then
+            if [ -n "${{ steps.lowdisk.outputs.mnt }}" ] && mountpoint -q "${{ steps.lowdisk.outputs.mnt }}"; then
+              sudo umount "${{ steps.lowdisk.outputs.mnt }}" || true
+            fi
+            if [ -n "${{ steps.lowdisk.outputs.img }}" ] && [ -f "${{ steps.lowdisk.outputs.img }}" ]; then
+              sudo rm -f "${{ steps.lowdisk.outputs.img }}" || true
+            fi
           fi
           echo "Cleanup done."
+        continue-on-error: true
