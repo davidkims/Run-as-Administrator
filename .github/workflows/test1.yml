@@ -1,4 +1,4 @@
-name: Test-Server Setup (Fast Disk, Upgrades, Error-Tolerant)
+name: Test-Server Setup + Spring Boot Initializr (Error-Tolerant)
 
 on:
   workflow_dispatch:
@@ -31,6 +31,18 @@ on:
         description: "Apt 캐시/로그 정리 (true/false)"
         required: true
         default: "false"
+      boot_group:
+        description: "Spring Boot groupId (예: com.example)"
+        required: false
+        default: "com.example"
+      boot_artifact:
+        description: "Spring Boot artifactId (예: demo-app)"
+        required: false
+        default: "demo-app"
+      boot_dependencies:
+        description: "Spring Boot dependencies CSV (예: web,actuator)"
+        required: false
+        default: "web,actuator"
 
 permissions:
   contents: write
@@ -38,7 +50,7 @@ permissions:
 jobs:
   setup:
     runs-on: ubuntu-latest
-    continue-on-error: true  # ✅ 테스트 서버 감성: 실패해도 다음 단계 진행
+    continue-on-error: true  # ✅ 에러 내성
 
     steps:
       - name: 🛒 Checkout
@@ -52,7 +64,7 @@ jobs:
           echo "== ip a (head) ==" && ip a || true
         continue-on-error: true
 
-      # ✅ jlumbroso/free-disk-space: 지원 입력만 사용 (codeql 없음)
+      # 디스크 공간 확보(허용 입력만 사용; codeql 없음)
       - name: 🧹 Free up disk space (profiled)
         uses: jlumbroso/free-disk-space@main
         with:
@@ -69,7 +81,7 @@ jobs:
         run: df -h || true
         continue-on-error: true
 
-      # 선택: OS 업그레이드 (안전 모드)
+      # 선택: OS 업그레이드
       - name: ⬆️ Upgrade OS packages (safe)
         if: ${{ inputs.upgrade_os == 'true' }}
         run: |
@@ -94,7 +106,7 @@ jobs:
           df -h || true
         continue-on-error: true
 
-      # ⚡ 저용량 디스크 시뮬 (고속: tmpfs 기본 / loop 옵션)
+      # ⚡ 저용량 디스크 시뮬 (tmpfs 기본 / loop 옵션)
       - name: ⚡ Low-disk simulate (tmpfs/loop/off)
         id: lowdisk
         run: |
@@ -135,7 +147,7 @@ jobs:
           echo "skip=true" >> $GITHUB_OUTPUT
         continue-on-error: true
 
-      # (선택) CodeQL 수동 정리 가이드 스텝 — ⚠️ 실제 삭제는 주석 해제 시에만 수행
+      # (선택) CodeQL 수동 정리 가이드 스텝 — 실제 삭제는 주석 해제 시에만
       - name: 🧼 Manual purge:CodeQL caches & DB (optional)
         run: |
           set -o pipefail
@@ -144,7 +156,7 @@ jobs:
           echo "CodeQL manual purge step (no action by default)."
         continue-on-error: true
 
-      # 데모 디렉토리
+      # 데모 디렉토리 및 /opt 샘플
       - name: 🧱 Prepare dirs (workspace + /opt demo)
         run: |
           set -o pipefail
@@ -164,7 +176,7 @@ jobs:
           java-version: ${{ inputs.java_version }}
         continue-on-error: true
 
-      # 메이븐 설치 (지정 버전 tarball or apt)
+      # Maven 설치 (지정 버전 tarball or apt)
       - name: 📦 Install Maven (tarball if version set)
         run: |
           set -o pipefail
@@ -181,12 +193,14 @@ jobs:
           else
             echo "Installing Maven from apt"
             sudo apt-get update -y || true
-            sudo apt-get install -y maven pigz || true
+            sudo apt-get install -y maven pigz unzip || true
           fi
           mvn -v || true
         continue-on-error: true
 
-      # 워크스페이스 내 Maven 샘플 생성
+      # ─────────────────────────────────────────────────────────────
+      # 1) Maven Quickstart 샘플 생성/빌드 (+ JDK 호환 POM 패치)
+      # ─────────────────────────────────────────────────────────────
       - name: 🧪 Generate Maven sample (IN WORKSPACE)
         working-directory: ${{ github.workspace }}
         run: |
@@ -200,16 +214,12 @@ jobs:
           test -f "$GITHUB_WORKSPACE/maven-sample/pom.xml" || echo "⚠️ pom.xml 생성 확인 필요" || true
         continue-on-error: true
 
-      # JDK 17/21 호환 POM 패치 (release 지정 + 최신 플러그인)
-      - name: 🩹 Patch POM for modern JDK (set compiler release)
+      - name: 🩹 Patch POM for modern JDK (maven-sample)
         working-directory: ${{ github.workspace }}/maven-sample
         run: |
           set -o pipefail
           JVER="${{ inputs.java_version }}"
-          case "$JVER" in
-            ""|"11"|"17"|"21") : ;;
-            *) JVER="17" ;;
-          esac
+          case "$JVER" in ""|"11"|"17"|"21") : ;; *) JVER="17" ;; esac
           cat > pom.xml <<'EOF'
           <?xml version="1.0" encoding="UTF-8"?>
           <project xmlns="http://maven.apache.org/POM/4.0.0"
@@ -255,7 +265,7 @@ jobs:
           echo "Patched POM with maven-compiler-plugin (release=${JVER})"
         continue-on-error: true
 
-      # Maven 캐시 활성화(이제 워크스페이스에 pom.xml 존재)
+      # 캐시 활성화(워크스페이스에 pom.xml 존재)
       - name: ☕ Enable Maven cache (setup-java)
         if: ${{ hashFiles('maven-sample/pom.xml') != '' }}
         uses: actions/setup-java@v4
@@ -265,6 +275,7 @@ jobs:
           cache: 'maven'
           cache-dependency-path: |
             maven-sample/pom.xml
+            boot-app/pom.xml
         continue-on-error: true
 
       - name: 🏗️ Build (maven-sample)
@@ -275,41 +286,121 @@ jobs:
           ls -al target || true
         continue-on-error: true
 
+      - name: 👀 Echo important files (maven-sample)
+        working-directory: ${{ github.workspace }}/maven-sample
+        run: |
+          set -o pipefail
+          echo "----- pom.xml (top) -----"; sed -n '1,120p' pom.xml || true
+          echo "----- src tree -----"; find src -maxdepth 3 -type f | sort || true
+        continue-on-error: true
+
+      # ─────────────────────────────────────────────────────────────
+      # 2) Spring Boot Initializr 프로젝트 생성/빌드 + 에코
+      # ─────────────────────────────────────────────────────────────
+      - name: 🌱 Generate Spring Boot project (Initializr)
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -o pipefail
+          G="${{ inputs.boot_group }}"
+          A="${{ inputs.boot_artifact }}"
+          D="${{ inputs.boot_dependencies }}"
+          J="${{ inputs.java_version }}"
+          [ -z "$J" ] && J="17"
+          PKG="${G}.${A//-/.}"
+          mkdir -p boot-app || true
+          # Spring Initializr ZIP 다운로드 (Maven/Java 프로젝트, 최신 Boot)
+          curl -fsSL -G https://start.spring.io/starter.zip \
+            --data-urlencode "type=maven-project" \
+            --data-urlencode "language=java" \
+            --data-urlencode "groupId=$G" \
+            --data-urlencode "artifactId=$A" \
+            --data-urlencode "name=$A" \
+            --data-urlencode "packageName=$PKG" \
+            --data-urlencode "dependencies=$D" \
+            --data-urlencode "javaVersion=$J" \
+            --data-urlencode "packaging=jar" \
+            -o boot-app.zip || true
+          unzip -q -o boot-app.zip -d boot-app || true
+          echo "Initializr project generated at: $GITHUB_WORKSPACE/boot-app"
+        continue-on-error: true
+
+      - name: 👀 Echo important files (boot-app)
+        working-directory: ${{ github.workspace }}/boot-app
+        run: |
+          set -o pipefail
+          echo "----- pom.xml (top) -----"; sed -n '1,120p' pom.xml || true
+          echo "----- Main Application (top) -----"
+          APPFILE=$(grep -Rsl "SpringApplication.run" src/main/java || true)
+          if [ -n "$APPFILE" ]; then sed -n '1,120p' "$APPFILE" || true; else echo "(not found)"; fi
+          echo "----- application.properties/yaml (if any) -----"
+          test -f src/main/resources/application.properties && sed -n '1,120p' src/main/resources/application.properties || true
+          test -f src/main/resources/application.yml && sed -n '1,120p' src/main/resources/application.yml || true
+          echo "----- src tree -----"; find src -maxdepth 4 -type f | sort || true
+        continue-on-error: true
+
+      - name: 🏗️ Build Spring Boot (boot-app)
+        working-directory: ${{ github.workspace }}/boot-app
+        run: |
+          set -o pipefail
+          # wrapper가 있으면 wrapper, 없으면 시스템 mvn 사용
+          if [ -x "./mvnw" ]; then
+            ./mvnw -q -DskipTests package || true
+          else
+            mvn -q -DskipTests package || true
+          fi
+          echo "Build done; listing target:"
+          ls -al target || true
+        continue-on-error: true
+
+      # ─────────────────────────────────────────────────────────────
+      # 아티팩트 압축/업로드 (pigz 옵션)
+      # ─────────────────────────────────────────────────────────────
       - name: 📦 Archive (fast) & Upload Artifacts
         run: |
           set -o pipefail
           mkdir -p "$GITHUB_WORKSPACE/artifacts" || true
+          # Quickstart JAR
           cp -f "$GITHUB_WORKSPACE/maven-sample/target/"*.jar "$GITHUB_WORKSPACE/artifacts/" 2>/dev/null || true
+          # Boot JAR
+          cp -f "$GITHUB_WORKSPACE/boot-app/target/"*.jar "$GITHUB_WORKSPACE/artifacts/" 2>/dev/null || true
+          # 프로젝트 전체 압축
           if [ "${{ inputs.fast_compress }}" = "true" ]; then
+            command -v pigz >/dev/null 2>&1 || sudo apt-get install -y pigz || true
+            tar --use-compress-program=pigz -cf "$GITHUB_WORKSPACE/artifacts/boot-app.tgz" -C "$GITHUB_WORKSPACE" boot-app 2>/dev/null || true
             tar --use-compress-program=pigz -cf "$GITHUB_WORKSPACE/artifacts/maven-sample.tgz" -C "$GITHUB_WORKSPACE" maven-sample 2>/dev/null || true
           else
+            tar -czf "$GITHUB_WORKSPACE/artifacts/boot-app.tgz" -C "$GITHUB_WORKSPACE" boot-app 2>/dev/null || true
             tar -czf "$GITHUB_WORKSPACE/artifacts/maven-sample.tgz" -C "$GITHUB_WORKSPACE" maven-sample 2>/dev/null || true
           fi
         continue-on-error: true
 
-      - name: ⬆️ Upload build artifacts
+      - name: ⬆️ Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: maven-sample-build
+          name: test-server-bundles
           path: artifacts/*
           if-no-files-found: warn
           retention-days: 7
         continue-on-error: true
 
+      # 요약 출력
       - name: 📄 Summary
         run: |
           set -o pipefail
-          echo "📄 DONE (Test-Server Mode)"
+          echo "📄 DONE (Test-Server Mode + Spring Boot Initializr)"
           echo "- freedisk_profile: ${{ inputs.freedisk_profile }}"
           echo "- lowdisk_mode: ${{ inputs.lowdisk_mode }}"
           echo "- java_version: ${{ inputs.java_version }}"
           echo "- maven_version: ${{ inputs.maven_version || 'apt-default' }}"
+          echo "- Boot group/artifact: ${{ inputs.boot_group }} / ${{ inputs.boot_artifact }}"
+          echo "- Boot dependencies: ${{ inputs.boot_dependencies }}"
           if [ -n "${{ steps.lowdisk.outputs.mnt }}" ]; then
             echo "- lowdisk mount: ${{ steps.lowdisk.outputs.mnt }} (mode=${{ steps.lowdisk.outputs.mode }})"
           fi
           echo "== df -h ==" && df -h || true
         continue-on-error: true
 
+      # 마운트 정리
       - name: 🧽 Post-cleanup (unmount & remove loopback/tmpfs)
         if: always()
         run: |
