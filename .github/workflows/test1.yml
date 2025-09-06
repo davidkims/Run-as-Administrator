@@ -31,10 +31,6 @@ on:
         description: "Apt 캐시/로그 정리 (true/false)"
         required: true
         default: "false"
-      boot_group:
-        description: "Spring Boot groupId"
-        required: false
-        default: "com.example"
       boot_artifact:
         description: "Spring Boot artifactId"
         required: false
@@ -43,12 +39,8 @@ on:
         description: "Spring Boot dependencies CSV (예: web,actuator)"
         required: false
         default: "web,actuator"
-      image_tag:
-        description: "Docker 이미지 태그 (예: demo-app:local)"
-        required: false
-        default: "demo-app:local"
       container_port_host:
-        description: "호스트 포트 (컨테이너 8080과 매핑)"
+        description: "호스트 포트 (컨테이너 8080 매핑)"
         required: false
         default: "18080"
 
@@ -58,15 +50,15 @@ permissions:
 jobs:
   setup:
     runs-on: ubuntu-latest
-    continue-on-error: true  # ✅ 에러 나도 다음 단계 진행 (테스트 서버 모드)
+    continue-on-error: true
 
     steps:
       - name: 🛒 Checkout
         uses: actions/checkout@v4
         continue-on-error: true
 
-      # ── Echo: 환경/버전/네트워크/Docker ─────────────────────────────
-      - name: 🔎 Echo:runner/env/docker
+      # Echo(환경/도커)
+      - name: 🔎 Echo: runner/env/docker
         run: |
           set -o pipefail
           echo "== Runner =="; uname -a || true
@@ -76,32 +68,23 @@ jobs:
           echo "== Docker info =="; docker info || true
         continue-on-error: true
 
-      # ── numfmt Shim: 외부 스크립트의 비표준 -4 옵션 무시 ─────────────
-      - name: 🛠️ numfmt 호환 shim 설치 (-4 옵션 무시)
+      # numfmt shim (비표준 -4 옵션 무시)
+      - name: 🛠️ numfmt shim 설치 (-4 옵션 무시)
         run: |
           set -o pipefail
-          SYS_NUMFMT="$(command -v numfmt || true)"
-          if [ -z "$SYS_NUMFMT" ]; then
-            sudo apt-get update -y || true
-            sudo apt-get install -y coreutils || true
-          fi
+          command -v numfmt >/dev/null 2>&1 || { sudo apt-get update -y || true; sudo apt-get install -y coreutils || true; }
           sudo mkdir -p /usr/local/bin
           sudo tee /usr/local/bin/numfmt >/dev/null <<'SH'
           #!/usr/bin/env bash
           TARGET="$(command -v -a numfmt | grep -v '/usr/local/bin/numfmt' | head -n1)"
-          args=()
-          for a in "$@"; do
-            [ "$a" = "-4" ] && continue
-            args+=("$a")
-          done
+          args=(); for a in "$@"; do [ "$a" = "-4" ] && continue; args+=("$a"); done
           exec "$TARGET" "${args[@]}"
           SH
           sudo chmod +x /usr/local/bin/numfmt
-          echo "[shim] numfmt installed at /usr/local/bin/numfmt"
           /usr/local/bin/numfmt -4 --to=iec 1024 || true
         continue-on-error: true
 
-      # ── 디스크 최적화 (허용 입력만; codeql 없음) ─────────────────────
+      # 디스크 최적화 (지원 입력만; codeql 없음)
       - name: 🧹 Free up disk space (profiled)
         uses: jlumbroso/free-disk-space@main
         with:
@@ -118,7 +101,7 @@ jobs:
         run: df -h || true
         continue-on-error: true
 
-      # ── 선택: OS 업그레이드/apt 정리 ────────────────────────────────
+      # 선택: OS 업그레이드 / apt 로그 정리
       - name: ⬆️ Upgrade OS packages (safe)
         if: ${{ inputs.upgrade_os == 'true' }}
         run: |
@@ -141,48 +124,38 @@ jobs:
           df -h || true
         continue-on-error: true
 
-      # ── 고속 저용량 디스크 시뮬 (tmpfs 기본 / loop 옵션) ────────────
+      # 고속 저용량 디스크 시뮬
       - name: ⚡ Low-disk simulate (tmpfs/loop/off)
         id: lowdisk
         run: |
           set -o pipefail
           MODE="${{ inputs.lowdisk_mode }}"
           echo "[echo] lowdisk_mode=$MODE"
-          if [ -z "$MODE" ] || [ "$MODE" = "off" ]; then
-            echo "skip=true" >> $GITHUB_OUTPUT
-            exit 0
-          fi
+          if [ -z "$MODE" ] || [ "$MODE" = "off" ]; then echo "skip=true" >> $GITHUB_OUTPUT; exit 0; fi
           if [ "$MODE" = "tmpfs" ]; then
             AVAIL_KB=$(awk '/MemAvailable/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)
             SIZE_G=2; [ "$AVAIL_KB" -gt $((8*1024*1024)) ] && SIZE_G=4
             MNT="/mnt/lowdisk"; sudo mkdir -p "$MNT" || true
             sudo mount -t tmpfs -o size=${SIZE_G}G,noatime,nodev,nosuid tmpfs "$MNT" || true
             sudo chmod 777 "$MNT" || true
-            echo "mode=tmpfs" >> $GITHUB_OUTPUT
-            echo "mnt=$MNT"  >> $GITHUB_OUTPUT
-            df -h "$MNT" || true
-            exit 0
+            echo "mode=tmpfs" >> $GITHUB_OUTPUT; echo "mnt=$MNT"  >> $GITHUB_OUTPUT
+            df -h "$MNT" || true; exit 0
           fi
           if [ "$MODE" = "loop" ]; then
-            MNT="/mnt/lowdisk"; IMG="/mnt/tmp-pv.img"
-            sudo mkdir -p "$MNT" || true
+            MNT="/mnt/lowdisk"; IMG="/mnt/tmp-pv.img"; sudo mkdir -p "$MNT" || true
             AVAIL_GB=$(df --output=avail -BG /mnt | tail -1 | tr -dc '0-9' || echo 0)
             SIZE_GB=2; [ "$AVAIL_GB" -ge 12 ] && SIZE_GB=4
-            echo "[echo] create loop image ${SIZE_GB}G at $IMG (Avail=${AVAIL_GB}G)"
             sudo fallocate -l ${SIZE_GB}G "$IMG" 2>/dev/null || sudo truncate -s ${SIZE_GB}G "$IMG" || true
             sudo mkfs.ext4 -F -E lazy_itable_init=1,lazy_journal_init=1 -O ^has_journal "$IMG" || true
             sudo mount -o loop,noatime,nodiratime "$IMG" "$MNT" || true
             sudo chmod 777 "$MNT" || true
-            echo "mode=loop" >> $GITHUB_OUTPUT
-            echo "mnt=$MNT"  >> $GITHUB_OUTPUT
-            echo "img=$IMG"  >> $GITHUB_OUTPUT
-            df -h "$MNT" || true
-            exit 0
+            echo "mode=loop" >> $GITHUB_OUTPUT; echo "mnt=$MNT"  >> $GITHUB_OUTPUT; echo "img=$IMG"  >> $GITHUB_OUTPUT
+            df -h "$MNT" || true; exit 0
           fi
           echo "skip=true" >> $GITHUB_OUTPUT
         continue-on-error: true
 
-      # ── Java & Maven 설치 ────────────────────────────────────────────
+      # Java & Maven
       - name: ☕ Set up Java (no cache yet)
         uses: actions/setup-java@v4
         with:
@@ -199,10 +172,8 @@ jobs:
             URL="https://archive.apache.org/dist/maven/maven-3/${VER}/binaries/apache-maven-${VER}-bin.tar.gz"
             TMPD="$(mktemp -d)" || true
             (cd "$TMPD" && curl -fsSL "$URL" -o maven.tgz && tar -xzf maven.tgz) || true
-            sudo rm -rf /opt/maven || true
-            sudo mv "$TMPD/apache-maven-${VER}" /opt/maven || true
-            echo "/opt/maven/bin" >> "$GITHUB_PATH"
-            rm -rf "$TMPD" || true
+            sudo rm -rf /opt/maven || true; sudo mv "$TMPD/apache-maven-${VER}" /opt/maven || true
+            echo "/opt/maven/bin" >> "$GITHUB_PATH"; rm -rf "$TMPD" || true
           else
             sudo apt-get update -y || true
             sudo apt-get install -y maven pigz unzip || true
@@ -210,29 +181,23 @@ jobs:
           echo "== mvn -v =="; mvn -v || true
         continue-on-error: true
 
-      # ── Quickstart 샘플 생성/패치/빌드 + Echo ───────────────────────
+      # Maven Quickstart 생성/패치/빌드 + 에코
       - name: 🧪 Generate Maven sample (IN WORKSPACE)
         working-directory: ${{ github.workspace }}
         run: |
           set -o pipefail
-          mvn -q archetype:generate \
-            -DgroupId=com.example \
-            -DartifactId=maven-sample \
-            -DarchetypeArtifactId=maven-archetype-quickstart \
-            -DarchetypeVersion=1.4 \
-            -DinteractiveMode=false || true
+          mvn -q archetype:generate -DgroupId=com.example -DartifactId=maven-sample \
+            -DarchetypeArtifactId=maven-archetype-quickstart -DarchetypeVersion=1.4 -DinteractiveMode=false || true
         continue-on-error: true
 
       - name: 🩹 Patch POM for modern JDK (maven-sample)
         working-directory: ${{ github.workspace }}/maven-sample
         run: |
           set -o pipefail
-          JVER="${{ inputs.java_version }}"
-          case "$JVER" in ""|"11"|"17"|"21") : ;; *) JVER="17" ;; esac
+          JVER="${{ inputs.java_version }}"; case "$JVER" in ""|"11"|"17"|"21") : ;; *) JVER="17" ;; esac
           cat > pom.xml <<'EOF'
           <?xml version="1.0" encoding="UTF-8"?>
-          <project xmlns="http://maven.apache.org/POM/4.0.0"
-                   xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          <project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
                    xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
             <modelVersion>4.0.0</modelVersion>
             <groupId>com.example</groupId>
@@ -249,9 +214,7 @@ jobs:
                   <groupId>org.apache.maven.plugins</groupId>
                   <artifactId>maven-compiler-plugin</artifactId>
                   <version>3.11.0</version>
-                  <configuration>
-                    <release>${maven.compiler.release}</release>
-                  </configuration>
+                  <configuration><release>${maven.compiler.release}</release></configuration>
                 </plugin>
                 <plugin>
                   <groupId>org.apache.maven.plugins</groupId>
@@ -295,12 +258,14 @@ jobs:
           echo "== target =="; ls -al target || true
         continue-on-error: true
 
-      # ── Spring Boot Initializr 생성/빌드 + Echo ─────────────────────
+      # Spring Boot Initializr 생성/빌드 + 에코
       - name: 🌱 Generate Spring Boot project (Initializr)
         working-directory: ${{ github.workspace }}
+        env:
+          BOOT_GROUP: com.example
         run: |
           set -o pipefail
-          G="${{ inputs.boot_group }}"
+          G="${BOOT_GROUP}"
           A="${{ inputs.boot_artifact }}"
           D="${{ inputs.boot_dependencies }}"
           J="${{ inputs.java_version }}"; [ -z "$J" ] && J="17"
@@ -345,7 +310,7 @@ jobs:
           echo "== target =="; ls -al target || true
         continue-on-error: true
 
-      # ── Docker: 에코 → 생성(Dockerfile/.dockerignore) → 빌드 → 기동 ──
+      # Docker: 에코 → Dockerfile 생성 → 빌드 → 기동 (stop/remove 미포함)
       - name: 🐳 Echo Docker pre-check
         run: |
           set -o pipefail
@@ -357,10 +322,8 @@ jobs:
         working-directory: ${{ github.workspace }}/boot-app
         run: |
           set -o pipefail
-          # JAR 경로 탐색
           JAR="$(ls -1 target/*.jar 2>/dev/null | head -n1 || true)"
           echo "[echo] detected JAR: ${JAR:-'(not found yet)'}"
-          # Dockerfile 생성 (JRE 기반, 비루트 실행)
           cat > Dockerfile <<'DOCKER'
           FROM eclipse-temurin:17-jre
           WORKDIR /app
@@ -370,7 +333,6 @@ jobs:
           USER 1000
           ENTRYPOINT ["java","-jar","/app/app.jar"]
           DOCKER
-          # .dockerignore (빌드 가속)
           cat > .dockerignore <<'IGNORE'
           target/
           .git/
@@ -387,7 +349,7 @@ jobs:
         id: docker_build
         working-directory: ${{ github.workspace }}/boot-app
         env:
-          IMAGE_TAG: ${{ inputs.image_tag }}
+          IMAGE_TAG: ${{ inputs.boot_artifact }}:local
         run: |
           set -o pipefail
           echo "[echo] building image: ${IMAGE_TAG}"
@@ -410,19 +372,16 @@ jobs:
           echo "container_id=${CID}" >> $GITHUB_OUTPUT
           echo "container_name=${NAME}" >> $GITHUB_OUTPUT
           echo "== docker ps (after run) =="; docker ps -a || true
-          # 간단 헬스 체크(기동 대기) — 실패해도 계속
           for i in $(seq 1 15); do
             sleep 2
             curl -fsS "http://localhost:${HOST_PORT}/actuator/health" && break || true
             curl -fsS "http://localhost:${HOST_PORT}/" >/dev/null && break || true
             echo "[echo] waiting app... (${i})"
           done
-          # 로그 일부 에코
-          echo "== docker logs (tail) =="
-          docker logs --tail 120 "${NAME}" 2>/dev/null || true
+          echo "== docker logs (tail) =="; docker logs --tail 120 "${NAME}" 2>/dev/null || true
         continue-on-error: true
 
-      # ── 아티팩트(프로젝트/빌드물/도커파일) 압축 & 업로드 ──────────────
+      # 아티팩트 압축/업로드
       - name: 📦 Archive (fast) & Upload Artifacts
         run: |
           set -o pipefail
@@ -450,7 +409,7 @@ jobs:
           retention-days: 7
         continue-on-error: true
 
-      # ── 요약 Echo ───────────────────────────────────────────────────
+      # 요약
       - name: 📄 Summary
         run: |
           set -o pipefail
@@ -459,31 +418,25 @@ jobs:
           echo "- lowdisk_mode: ${{ inputs.lowdisk_mode }}"
           echo "- java_version: ${{ inputs.java_version }}"
           echo "- maven_version: ${{ inputs.maven_version || 'apt-default' }}"
-          echo "- Boot group/artifact: ${{ inputs.boot_group }} / ${{ inputs.boot_artifact }}"
+          echo "- Boot artifact: ${{ inputs.boot_artifact }}"
           echo "- Boot dependencies: ${{ inputs.boot_dependencies }}"
-          echo "- Docker image tag: ${{ steps.docker_build.outputs.image || inputs.image_tag }}"
+          echo "- Docker image tag: ${{ steps.docker_build.outputs.image }}"
           echo "- Container(host:container): ${{ inputs.container_port_host }}:8080"
           echo "- Container ID: ${{ steps.docker_run.outputs.container_id }}"
           echo "- Container Name: ${{ steps.docker_run.outputs.container_name }}"
           echo "== df -h =="; df -h || true
         continue-on-error: true
 
-      # ── 마운트 정리(중지 기능은 요청대로 '삭제') ─────────────────────
+      # 마운트만 정리(컨테이너 중지/삭제 없음)
       - name: 🧽 Post-cleanup (unmount only; no stop/remove)
         if: always()
         run: |
           set -o pipefail
           MODE="${{ steps.lowdisk.outputs.mode }}"
-          if [ "$MODE" = "tmpfs" ] && [ -n "${{ steps.lowdisk.outputs.mnt }}" ]; then
-            sudo umount "${{ steps.lowdisk.outputs.mnt }}" || true
-          fi
+          if [ "$MODE" = "tmpfs" ] && [ -n "${{ steps.lowdisk.outputs.mnt }}" ]; then sudo umount "${{ steps.lowdisk.outputs.mnt }}" || true; fi
           if [ "$MODE" = "loop" ]; then
-            if [ -n "${{ steps.lowdisk.outputs.mnt }}" ] && mountpoint -q "${{ steps.lowdisk.outputs.mnt }}"; then
-              sudo umount "${{ steps.lowdisk.outputs.mnt }}" || true
-            fi
-            if [ -n "${{ steps.lowdisk.outputs.img }}" ] && [ -f "${{ steps.lowdisk.outputs.img }}" ]; then
-              sudo rm -f "${{ steps.lowdisk.outputs.img }}" || true
-            fi
+            if [ -n "${{ steps.lowdisk.outputs.mnt }}" ] && mountpoint -q "${{ steps.lowdisk.outputs.mnt }}"; then sudo umount "${{ steps.lowdisk.outputs.mnt }}" || true; fi
+            if [ -n "${{ steps.lowdisk.outputs.img }}" ] && [ -f "${{ steps.lowdisk.outputs.img }}" ]; then sudo rm -f "${{ steps.lowdisk.outputs.img }}" || true; fi
           fi
-          echo "[echo] cleanup (mount) done. (컨테이너 중지/삭제는 요청에 따라 수행하지 않음)"
+          echo "[echo] cleanup (mount) done. (컨테이너 중지/삭제는 포함하지 않음)"
         continue-on-error: true
