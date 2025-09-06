@@ -1,4 +1,4 @@
-name: Test-Server Setup + Spring Boot Initializr (Error-Tolerant)
+name: Test-Server + Spring Boot + Docker (Echo→Create→Build→Run, No-Stop)
 
 on:
   workflow_dispatch:
@@ -32,17 +32,25 @@ on:
         required: true
         default: "false"
       boot_group:
-        description: "Spring Boot groupId (예: com.example)"
+        description: "Spring Boot groupId"
         required: false
         default: "com.example"
       boot_artifact:
-        description: "Spring Boot artifactId (예: demo-app)"
+        description: "Spring Boot artifactId"
         required: false
         default: "demo-app"
       boot_dependencies:
         description: "Spring Boot dependencies CSV (예: web,actuator)"
         required: false
         default: "web,actuator"
+      image_tag:
+        description: "Docker 이미지 태그 (예: demo-app:local)"
+        required: false
+        default: "demo-app:local"
+      container_port_host:
+        description: "호스트 포트 (컨테이너 8080과 매핑)"
+        required: false
+        default: "18080"
 
 permissions:
   contents: write
@@ -50,21 +58,50 @@ permissions:
 jobs:
   setup:
     runs-on: ubuntu-latest
-    continue-on-error: true  # ✅ 에러 내성
+    continue-on-error: true  # ✅ 에러 나도 다음 단계 진행 (테스트 서버 모드)
 
     steps:
       - name: 🛒 Checkout
         uses: actions/checkout@v4
         continue-on-error: true
 
-      - name: 📊 Show initial df/ip
+      # ── Echo: 환경/버전/네트워크/Docker ─────────────────────────────
+      - name: 🔎 Echo:runner/env/docker
         run: |
           set -o pipefail
-          echo "== df -h ==" && df -h || true
-          echo "== ip a (head) ==" && ip a || true
+          echo "== Runner =="; uname -a || true
+          echo "== df -h =="; df -h || true
+          echo "== Network (ip a) =="; ip a || true
+          echo "== Docker version =="; docker version || true
+          echo "== Docker info =="; docker info || true
         continue-on-error: true
 
-      # 디스크 공간 확보(허용 입력만 사용; codeql 없음)
+      # ── numfmt Shim: 외부 스크립트의 비표준 -4 옵션 무시 ─────────────
+      - name: 🛠️ numfmt 호환 shim 설치 (-4 옵션 무시)
+        run: |
+          set -o pipefail
+          SYS_NUMFMT="$(command -v numfmt || true)"
+          if [ -z "$SYS_NUMFMT" ]; then
+            sudo apt-get update -y || true
+            sudo apt-get install -y coreutils || true
+          fi
+          sudo mkdir -p /usr/local/bin
+          sudo tee /usr/local/bin/numfmt >/dev/null <<'SH'
+          #!/usr/bin/env bash
+          TARGET="$(command -v -a numfmt | grep -v '/usr/local/bin/numfmt' | head -n1)"
+          args=()
+          for a in "$@"; do
+            [ "$a" = "-4" ] && continue
+            args+=("$a")
+          done
+          exec "$TARGET" "${args[@]}"
+          SH
+          sudo chmod +x /usr/local/bin/numfmt
+          echo "[shim] numfmt installed at /usr/local/bin/numfmt"
+          /usr/local/bin/numfmt -4 --to=iec 1024 || true
+        continue-on-error: true
+
+      # ── 디스크 최적화 (허용 입력만; codeql 없음) ─────────────────────
       - name: 🧹 Free up disk space (profiled)
         uses: jlumbroso/free-disk-space@main
         with:
@@ -81,7 +118,7 @@ jobs:
         run: df -h || true
         continue-on-error: true
 
-      # 선택: OS 업그레이드
+      # ── 선택: OS 업그레이드/apt 정리 ────────────────────────────────
       - name: ⬆️ Upgrade OS packages (safe)
         if: ${{ inputs.upgrade_os == 'true' }}
         run: |
@@ -90,10 +127,8 @@ jobs:
           sudo DEBIAN_FRONTEND=noninteractive apt-get -y upgrade || true
           sudo dpkg --configure -a || true
           sudo apt-get -f install || true
-          df -h || true
         continue-on-error: true
 
-      # 선택: apt 캐시/로그 정리
       - name: 🧯 Purge apt cache & logs
         if: ${{ inputs.purge_apt_cache == 'true' }}
         run: |
@@ -106,20 +141,20 @@ jobs:
           df -h || true
         continue-on-error: true
 
-      # ⚡ 저용량 디스크 시뮬 (tmpfs 기본 / loop 옵션)
+      # ── 고속 저용량 디스크 시뮬 (tmpfs 기본 / loop 옵션) ────────────
       - name: ⚡ Low-disk simulate (tmpfs/loop/off)
         id: lowdisk
         run: |
           set -o pipefail
           MODE="${{ inputs.lowdisk_mode }}"
-          echo "lowdisk_mode=$MODE"
+          echo "[echo] lowdisk_mode=$MODE"
           if [ -z "$MODE" ] || [ "$MODE" = "off" ]; then
             echo "skip=true" >> $GITHUB_OUTPUT
             exit 0
           fi
           if [ "$MODE" = "tmpfs" ]; then
             AVAIL_KB=$(awk '/MemAvailable/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)
-            SIZE_G=2; if [ "$AVAIL_KB" -gt $((8*1024*1024)) ]; then SIZE_G=4; fi
+            SIZE_G=2; [ "$AVAIL_KB" -gt $((8*1024*1024)) ] && SIZE_G=4
             MNT="/mnt/lowdisk"; sudo mkdir -p "$MNT" || true
             sudo mount -t tmpfs -o size=${SIZE_G}G,noatime,nodev,nosuid tmpfs "$MNT" || true
             sudo chmod 777 "$MNT" || true
@@ -132,8 +167,8 @@ jobs:
             MNT="/mnt/lowdisk"; IMG="/mnt/tmp-pv.img"
             sudo mkdir -p "$MNT" || true
             AVAIL_GB=$(df --output=avail -BG /mnt | tail -1 | tr -dc '0-9' || echo 0)
-            SIZE_GB=2; if [ "$AVAIL_GB" -ge 12 ]; then SIZE_GB=4; fi
-            echo "Creating ${SIZE_GB}G loop image at $IMG (Avail=${AVAIL_GB}G)"
+            SIZE_GB=2; [ "$AVAIL_GB" -ge 12 ] && SIZE_GB=4
+            echo "[echo] create loop image ${SIZE_GB}G at $IMG (Avail=${AVAIL_GB}G)"
             sudo fallocate -l ${SIZE_GB}G "$IMG" 2>/dev/null || sudo truncate -s ${SIZE_GB}G "$IMG" || true
             sudo mkfs.ext4 -F -E lazy_itable_init=1,lazy_journal_init=1 -O ^has_journal "$IMG" || true
             sudo mount -o loop,noatime,nodiratime "$IMG" "$MNT" || true
@@ -147,28 +182,7 @@ jobs:
           echo "skip=true" >> $GITHUB_OUTPUT
         continue-on-error: true
 
-      # (선택) CodeQL 수동 정리 가이드 스텝 — 실제 삭제는 주석 해제 시에만
-      - name: 🧼 Manual purge:CodeQL caches & DB (optional)
-        run: |
-          set -o pipefail
-          # 필요 시 아래 줄 주석 해제
-          # sudo rm -rf /opt/hostedtoolcache/codeql "$RUNNER_TEMP"/codeql* "$RUNNER_TEMP"/_github_home/codeql* ./.codeql ./codeql-db || true
-          echo "CodeQL manual purge step (no action by default)."
-        continue-on-error: true
-
-      # 데모 디렉토리 및 /opt 샘플
-      - name: 🧱 Prepare dirs (workspace + /opt demo)
-        run: |
-          set -o pipefail
-          mkdir -p "$GITHUB_WORKSPACE/artifacts" || true
-          sudo mkdir -p /opt/project/springboot/{src,logs,temp,server} || true
-          sudo mkdir -p /opt/project/maven/{src,target,logs} || true
-          echo "Simulated Spring Boot JAR" | sudo tee /opt/project/springboot/server/app.jar >/dev/null || true
-          echo "Spring Boot Server Log"   | sudo tee /opt/project/springboot/logs/server.log >/dev/null || true
-          echo "Maven Placeholder"        | sudo tee /opt/project/maven/src/Main.java >/dev/null || true
-        continue-on-error: true
-
-      # 자바 설치 (요청 버전)
+      # ── Java & Maven 설치 ────────────────────────────────────────────
       - name: ☕ Set up Java (no cache yet)
         uses: actions/setup-java@v4
         with:
@@ -176,13 +190,12 @@ jobs:
           java-version: ${{ inputs.java_version }}
         continue-on-error: true
 
-      # Maven 설치 (지정 버전 tarball or apt)
       - name: 📦 Install Maven (tarball if version set)
         run: |
           set -o pipefail
           VER="${{ inputs.maven_version }}"
           if [ -n "$VER" ]; then
-            echo "Installing Apache Maven $VER (tarball)"
+            echo "[echo] Install Maven $VER (tarball)"
             URL="https://archive.apache.org/dist/maven/maven-3/${VER}/binaries/apache-maven-${VER}-bin.tar.gz"
             TMPD="$(mktemp -d)" || true
             (cd "$TMPD" && curl -fsSL "$URL" -o maven.tgz && tar -xzf maven.tgz) || true
@@ -191,16 +204,13 @@ jobs:
             echo "/opt/maven/bin" >> "$GITHUB_PATH"
             rm -rf "$TMPD" || true
           else
-            echo "Installing Maven from apt"
             sudo apt-get update -y || true
             sudo apt-get install -y maven pigz unzip || true
           fi
-          mvn -v || true
+          echo "== mvn -v =="; mvn -v || true
         continue-on-error: true
 
-      # ─────────────────────────────────────────────────────────────
-      # 1) Maven Quickstart 샘플 생성/빌드 (+ JDK 호환 POM 패치)
-      # ─────────────────────────────────────────────────────────────
+      # ── Quickstart 샘플 생성/패치/빌드 + Echo ───────────────────────
       - name: 🧪 Generate Maven sample (IN WORKSPACE)
         working-directory: ${{ github.workspace }}
         run: |
@@ -211,7 +221,6 @@ jobs:
             -DarchetypeArtifactId=maven-archetype-quickstart \
             -DarchetypeVersion=1.4 \
             -DinteractiveMode=false || true
-          test -f "$GITHUB_WORKSPACE/maven-sample/pom.xml" || echo "⚠️ pom.xml 생성 확인 필요" || true
         continue-on-error: true
 
       - name: 🩹 Patch POM for modern JDK (maven-sample)
@@ -262,10 +271,10 @@ jobs:
           </project>
           EOF
           sed -i "s/__REPLACE_JAVA_RELEASE__/${JVER}/g" pom.xml || true
-          echo "Patched POM with maven-compiler-plugin (release=${JVER})"
+          echo "----- pom.xml (top) -----"; sed -n '1,120p' pom.xml || true
+          echo "----- src files -----"; find src -maxdepth 3 -type f | sort || true
         continue-on-error: true
 
-      # 캐시 활성화(워크스페이스에 pom.xml 존재)
       - name: ☕ Enable Maven cache (setup-java)
         if: ${{ hashFiles('maven-sample/pom.xml') != '' }}
         uses: actions/setup-java@v4
@@ -283,20 +292,10 @@ jobs:
         run: |
           set -o pipefail
           mvn -q -DskipTests package || true
-          ls -al target || true
+          echo "== target =="; ls -al target || true
         continue-on-error: true
 
-      - name: 👀 Echo important files (maven-sample)
-        working-directory: ${{ github.workspace }}/maven-sample
-        run: |
-          set -o pipefail
-          echo "----- pom.xml (top) -----"; sed -n '1,120p' pom.xml || true
-          echo "----- src tree -----"; find src -maxdepth 3 -type f | sort || true
-        continue-on-error: true
-
-      # ─────────────────────────────────────────────────────────────
-      # 2) Spring Boot Initializr 프로젝트 생성/빌드 + 에코
-      # ─────────────────────────────────────────────────────────────
+      # ── Spring Boot Initializr 생성/빌드 + Echo ─────────────────────
       - name: 🌱 Generate Spring Boot project (Initializr)
         working-directory: ${{ github.workspace }}
         run: |
@@ -304,11 +303,9 @@ jobs:
           G="${{ inputs.boot_group }}"
           A="${{ inputs.boot_artifact }}"
           D="${{ inputs.boot_dependencies }}"
-          J="${{ inputs.java_version }}"
-          [ -z "$J" ] && J="17"
+          J="${{ inputs.java_version }}"; [ -z "$J" ] && J="17"
           PKG="${G}.${A//-/.}"
           mkdir -p boot-app || true
-          # Spring Initializr ZIP 다운로드 (Maven/Java 프로젝트, 최신 Boot)
           curl -fsSL -G https://start.spring.io/starter.zip \
             --data-urlencode "type=maven-project" \
             --data-urlencode "language=java" \
@@ -321,7 +318,7 @@ jobs:
             --data-urlencode "packaging=jar" \
             -o boot-app.zip || true
           unzip -q -o boot-app.zip -d boot-app || true
-          echo "Initializr project generated at: $GITHUB_WORKSPACE/boot-app"
+          echo "[echo] Initializr project at: $GITHUB_WORKSPACE/boot-app"
         continue-on-error: true
 
       - name: 👀 Echo important files (boot-app)
@@ -332,7 +329,7 @@ jobs:
           echo "----- Main Application (top) -----"
           APPFILE=$(grep -Rsl "SpringApplication.run" src/main/java || true)
           if [ -n "$APPFILE" ]; then sed -n '1,120p' "$APPFILE" || true; else echo "(not found)"; fi
-          echo "----- application.properties/yaml (if any) -----"
+          echo "----- resources -----"
           test -f src/main/resources/application.properties && sed -n '1,120p' src/main/resources/application.properties || true
           test -f src/main/resources/application.yml && sed -n '1,120p' src/main/resources/application.yml || true
           echo "----- src tree -----"; find src -maxdepth 4 -type f | sort || true
@@ -342,28 +339,98 @@ jobs:
         working-directory: ${{ github.workspace }}/boot-app
         run: |
           set -o pipefail
-          # wrapper가 있으면 wrapper, 없으면 시스템 mvn 사용
-          if [ -x "./mvnw" ]; then
-            ./mvnw -q -DskipTests package || true
-          else
-            mvn -q -DskipTests package || true
+          if [ -x "./mvnw" ]; then ./mvnw -q -DskipTests package || true
+          else mvn -q -DskipTests package || true
           fi
-          echo "Build done; listing target:"
-          ls -al target || true
+          echo "== target =="; ls -al target || true
         continue-on-error: true
 
-      # ─────────────────────────────────────────────────────────────
-      # 아티팩트 압축/업로드 (pigz 옵션)
-      # ─────────────────────────────────────────────────────────────
+      # ── Docker: 에코 → 생성(Dockerfile/.dockerignore) → 빌드 → 기동 ──
+      - name: 🐳 Echo Docker pre-check
+        run: |
+          set -o pipefail
+          echo "== docker images (head) =="; docker images | head -n 20 || true
+          echo "== docker ps (before) =="; docker ps -a || true
+        continue-on-error: true
+
+      - name: 🐳 Create Dockerfile & .dockerignore (boot-app)
+        working-directory: ${{ github.workspace }}/boot-app
+        run: |
+          set -o pipefail
+          # JAR 경로 탐색
+          JAR="$(ls -1 target/*.jar 2>/dev/null | head -n1 || true)"
+          echo "[echo] detected JAR: ${JAR:-'(not found yet)'}"
+          # Dockerfile 생성 (JRE 기반, 비루트 실행)
+          cat > Dockerfile <<'DOCKER'
+          FROM eclipse-temurin:17-jre
+          WORKDIR /app
+          ARG JAR_FILE=target/*.jar
+          COPY ${JAR_FILE} app.jar
+          EXPOSE 8080
+          USER 1000
+          ENTRYPOINT ["java","-jar","/app/app.jar"]
+          DOCKER
+          # .dockerignore (빌드 가속)
+          cat > .dockerignore <<'IGNORE'
+          target/
+          .git/
+          .github/
+          **/*.iml
+          **/.DS_Store
+          *.log
+          IGNORE
+          echo "----- Dockerfile -----"; sed -n '1,200p' Dockerfile || true
+          echo "----- .dockerignore -----"; sed -n '1,200p' .dockerignore || true
+        continue-on-error: true
+
+      - name: 🐳 Build Docker image (boot-app)
+        id: docker_build
+        working-directory: ${{ github.workspace }}/boot-app
+        env:
+          IMAGE_TAG: ${{ inputs.image_tag }}
+        run: |
+          set -o pipefail
+          echo "[echo] building image: ${IMAGE_TAG}"
+          docker build -t "${IMAGE_TAG}" . || true
+          echo "image=${IMAGE_TAG}" >> $GITHUB_OUTPUT
+          echo "== docker images (after build head) =="; docker images | head -n 20 || true
+        continue-on-error: true
+
+      - name: 🐳 Run container (boot-app, no stop/remove)
+        id: docker_run
+        env:
+          IMAGE_TAG: ${{ steps.docker_build.outputs.image }}
+          HOST_PORT: ${{ inputs.container_port_host }}
+          APP_PORT: "8080"
+        run: |
+          set -o pipefail
+          NAME="boot-app-${GITHUB_RUN_ID}"
+          echo "[echo] docker run --name ${NAME} -p ${HOST_PORT}:${APP_PORT} ${IMAGE_TAG}"
+          CID=$(docker run -d --name "${NAME}" -p "${HOST_PORT}:${APP_PORT}" "${IMAGE_TAG}" 2>/dev/null || true)
+          echo "container_id=${CID}" >> $GITHUB_OUTPUT
+          echo "container_name=${NAME}" >> $GITHUB_OUTPUT
+          echo "== docker ps (after run) =="; docker ps -a || true
+          # 간단 헬스 체크(기동 대기) — 실패해도 계속
+          for i in $(seq 1 15); do
+            sleep 2
+            curl -fsS "http://localhost:${HOST_PORT}/actuator/health" && break || true
+            curl -fsS "http://localhost:${HOST_PORT}/" >/dev/null && break || true
+            echo "[echo] waiting app... (${i})"
+          done
+          # 로그 일부 에코
+          echo "== docker logs (tail) =="
+          docker logs --tail 120 "${NAME}" 2>/dev/null || true
+        continue-on-error: true
+
+      # ── 아티팩트(프로젝트/빌드물/도커파일) 압축 & 업로드 ──────────────
       - name: 📦 Archive (fast) & Upload Artifacts
         run: |
           set -o pipefail
           mkdir -p "$GITHUB_WORKSPACE/artifacts" || true
-          # Quickstart JAR
           cp -f "$GITHUB_WORKSPACE/maven-sample/target/"*.jar "$GITHUB_WORKSPACE/artifacts/" 2>/dev/null || true
-          # Boot JAR
           cp -f "$GITHUB_WORKSPACE/boot-app/target/"*.jar "$GITHUB_WORKSPACE/artifacts/" 2>/dev/null || true
-          # 프로젝트 전체 압축
+          cp -f "$GITHUB_WORKSPACE/boot-app/Dockerfile" "$GITHUB_WORKSPACE/artifacts/" 2>/dev/null || true
+          cp -f "$GITHUB_WORKSPACE/boot-app/.dockerignore" "$GITHUB_WORKSPACE/artifacts/" 2>/dev/null || true
           if [ "${{ inputs.fast_compress }}" = "true" ]; then
             command -v pigz >/dev/null 2>&1 || sudo apt-get install -y pigz || true
             tar --use-compress-program=pigz -cf "$GITHUB_WORKSPACE/artifacts/boot-app.tgz" -C "$GITHUB_WORKSPACE" boot-app 2>/dev/null || true
@@ -383,25 +450,26 @@ jobs:
           retention-days: 7
         continue-on-error: true
 
-      # 요약 출력
+      # ── 요약 Echo ───────────────────────────────────────────────────
       - name: 📄 Summary
         run: |
           set -o pipefail
-          echo "📄 DONE (Test-Server Mode + Spring Boot Initializr)"
+          echo "📄 DONE (Echo→Create→Build→Run, No-Stop)"
           echo "- freedisk_profile: ${{ inputs.freedisk_profile }}"
           echo "- lowdisk_mode: ${{ inputs.lowdisk_mode }}"
           echo "- java_version: ${{ inputs.java_version }}"
           echo "- maven_version: ${{ inputs.maven_version || 'apt-default' }}"
           echo "- Boot group/artifact: ${{ inputs.boot_group }} / ${{ inputs.boot_artifact }}"
           echo "- Boot dependencies: ${{ inputs.boot_dependencies }}"
-          if [ -n "${{ steps.lowdisk.outputs.mnt }}" ]; then
-            echo "- lowdisk mount: ${{ steps.lowdisk.outputs.mnt }} (mode=${{ steps.lowdisk.outputs.mode }})"
-          fi
-          echo "== df -h ==" && df -h || true
+          echo "- Docker image tag: ${{ steps.docker_build.outputs.image || inputs.image_tag }}"
+          echo "- Container(host:container): ${{ inputs.container_port_host }}:8080"
+          echo "- Container ID: ${{ steps.docker_run.outputs.container_id }}"
+          echo "- Container Name: ${{ steps.docker_run.outputs.container_name }}"
+          echo "== df -h =="; df -h || true
         continue-on-error: true
 
-      # 마운트 정리
-      - name: 🧽 Post-cleanup (unmount & remove loopback/tmpfs)
+      # ── 마운트 정리(중지 기능은 요청대로 '삭제') ─────────────────────
+      - name: 🧽 Post-cleanup (unmount only; no stop/remove)
         if: always()
         run: |
           set -o pipefail
@@ -417,5 +485,5 @@ jobs:
               sudo rm -f "${{ steps.lowdisk.outputs.img }}" || true
             fi
           fi
-          echo "Cleanup done."
+          echo "[echo] cleanup (mount) done. (컨테이너 중지/삭제는 요청에 따라 수행하지 않음)"
         continue-on-error: true
