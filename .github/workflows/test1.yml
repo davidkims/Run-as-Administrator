@@ -1,6 +1,8 @@
-name: Test-Server + Spring Boot + Docker (Echo→Create→Build→Run, No-Stop, Final-Fix)
+name: Test-Server + Spring Boot + Docker (Ultra-Expanded:Maven+Gradle, JDK17/21, Scheduled, Release)
 
 on:
+  schedule:
+    - cron: "*/10 * * * *"   # ✅ 10분 주기 자동 실행
   workflow_dispatch:
     inputs:
       freedisk_profile:
@@ -20,11 +22,11 @@ on:
         required: true
         default: "false"
       java_version:
-        description: "설치/사용할 JDK 버전 (예: 17, 21)"
+        description: "기본 JDK 버전(수동 실행용; 매트릭스는 17/21 고정)"
         required: false
         default: "17"
       maven_version:
-        description: "설치할 Maven 버전 (예: 3.9.9). 비우면 apt 기본 사용"
+        description: "Maven 버전(예: 3.9.9). 비우면 apt 기본"
         required: false
         default: ""
       purge_apt_cache:
@@ -36,11 +38,11 @@ on:
         required: false
         default: "demo-app"
       boot_dependencies:
-        description: "Spring Boot dependencies CSV (예: web,actuator)"
+        description: "Boot deps CSV (예: web,actuator)"
         required: false
         default: "web,actuator"
       container_port_host:
-        description: "호스트 포트 (컨테이너 8080 매핑)"
+        description: "호스트 포트(기본 18080; JDK21은 +1)"
         required: false
         default: "18080"
 
@@ -48,42 +50,51 @@ permissions:
   contents: write
 
 jobs:
-  setup:
+  # ─────────────────────────────────────────────────────────────────────
+  # 0) 공통 준비(디스크/에코/numfmt shim 등) — 한 번만 실행
+  # ─────────────────────────────────────────────────────────────────────
+  setup_base:
     runs-on: ubuntu-latest
     continue-on-error: true
-    env:
-      BOOT_GROUP: com.example
-
+    outputs:
+      artifact: ${{ steps.cfg.outputs.artifact }}
+      deps: ${{ steps.cfg.outputs.deps }}
+      base_port: ${{ steps.cfg.outputs.base_port }}
     steps:
       - name: 🛒 Checkout
         uses: actions/checkout@v4
         continue-on-error: true
 
-      - name: 🔎 Echo:runner/env/docker/resources
+      - name: 🔧 Config echo
+        id: cfg
+        run: |
+          echo "artifact=${{ inputs.boot_artifact || 'demo-app' }}" >> $GITHUB_OUTPUT
+          echo "deps=${{ inputs.boot_dependencies || 'web,actuator' }}" >> $GITHUB_OUTPUT
+          echo "base_port=${{ inputs.container_port_host || '18080' }}" >> $GITHUB_OUTPUT
+
+      - name: 🔎 Echo: runner/env/docker/resources
         run: |
           set -o pipefail
-          echo "== Runner =="; uname -a || true
-          echo "== CPU =="; nproc || true
-          echo "== Mem =="; free -h || true
-          echo "== df -h =="; df -h || true
-          echo "== Network (ip a) =="; ip a || true
-          echo "== Docker version =="; docker version || true
-          echo "== Docker info =="; docker info || true
+          uname -a || true
+          nproc || true
+          free -h || true
+          df -h || true
+          ip a || true
+          docker version || true
+          docker info || true
         continue-on-error: true
 
-      - name: 📦 Reserve fast disk space (fallocate 5G)
+      - name: 📦 Reserve fast disk (5G) + df
         run: |
-          set -o pipefail
           mkdir -p .github/workflows || true
           sudo fallocate -l 5G .github/workflows/.reserve_space || true
           sudo chmod 666 .github/workflows/.reserve_space || true
-          echo "[echo] reserved: $(du -h .github/workflows/.reserve_space || true)"
+          du -h .github/workflows/.reserve_space || true
           df -h || true
         continue-on-error: true
 
-      - name: 🛠️ numfmt shim 설치 (-4 옵션 무시)
+      - name: 🛠️ numfmt shim (-4 옵션 무시)
         run: |
-          set -o pipefail
           command -v numfmt >/dev/null 2>&1 || { sudo apt-get update -y || true; sudo apt-get install -y coreutils || true; }
           sudo mkdir -p /usr/local/bin
           sudo tee /usr/local/bin/numfmt >/dev/null <<'SH'
@@ -96,7 +107,7 @@ jobs:
           /usr/local/bin/numfmt -4 --to=iec 1024 || true
         continue-on-error: true
 
-      - name: 🧹 Free up disk space (profiled)
+      - name: 🧹 Free up disk (profiled)
         uses: jlumbroso/free-disk-space@main
         with:
           android:        ${{ inputs.freedisk_profile == 'aggressive' }}
@@ -108,24 +119,18 @@ jobs:
           swap-storage:   ${{ inputs.freedisk_profile == 'aggressive' }}
         continue-on-error: true
 
-      - name: 📊 df after cleanup
-        run: df -h || true
-        continue-on-error: true
-
-      - name: ⬆️ Upgrade OS packages (safe)
+      - name: ⬆️ Upgrade OS (opt)
         if: ${{ inputs.upgrade_os == 'true' }}
         run: |
-          set -o pipefail
           sudo apt-get update -y || true
           sudo DEBIAN_FRONTEND=noninteractive apt-get -y upgrade || true
           sudo dpkg --configure -a || true
           sudo apt-get -f install || true
         continue-on-error: true
 
-      - name: 🧯 Purge apt cache & logs
+      - name: 🧯 Purge apt cache&logs (opt)
         if: ${{ inputs.purge_apt_cache == 'true' }}
         run: |
-          set -o pipefail
           sudo apt-get clean || true
           sudo rm -rf /var/lib/apt/lists/* || true
           sudo journalctl --vacuum-time=1s || true
@@ -134,41 +139,34 @@ jobs:
           df -h || true
         continue-on-error: true
 
-      - name: ⚡ Low-disk simulate (tmpfs/loop/off)
-        id: lowdisk
-        run: |
-          set -o pipefail
-          MODE="${{ inputs.lowdisk_mode }}"
-          echo "[echo] lowdisk_mode=$MODE"
-          if [ -z "$MODE" ] || [ "$MODE" = "off" ]; then echo "skip=true" >> $GITHUB_OUTPUT; exit 0; fi
-          if [ "$MODE" = "tmpfs" ]; then
-            AVAIL_KB=$(awk '/MemAvailable/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)
-            SIZE_G=2; [ "$AVAIL_KB" -gt $((8*1024*1024)) ] && SIZE_G=4
-            MNT="/mnt/lowdisk"; sudo mkdir -p "$MNT" || true
-            sudo mount -t tmpfs -o size=${SIZE_G}G,noatime,nodev,nosuid tmpfs "$MNT" || true
-            sudo chmod 777 "$MNT" || true
-            echo "mode=tmpfs" >> $GITHUB_OUTPUT; echo "mnt=$MNT"  >> $GITHUB_OUTPUT
-            df -h "$MNT" || true; exit 0
-          fi
-          if [ "$MODE" = "loop" ]; then
-            MNT="/mnt/lowdisk"; IMG="/mnt/tmp-pv.img"; sudo mkdir -p "$MNT" || true
-            AVAIL_GB=$(df --output=avail -BG /mnt | tail -1 | tr -dc '0-9' || echo 0)
-            SIZE_GB=2; [ "$AVAIL_GB" -ge 12 ] && SIZE_GB=4
-            sudo fallocate -l ${SIZE_GB}G "$IMG" 2>/dev/null || sudo truncate -s ${SIZE_GB}G "$IMG" || true
-            sudo mkfs.ext4 -F -E lazy_itable_init=1,lazy_journal_init=1 -O ^has_journal "$IMG" || true
-            sudo mount -o loop,noatime,nodiratime "$IMG" "$MNT" || true
-            sudo chmod 777 "$MNT" || true
-            echo "mode=loop" >> $GITHUB_OUTPUT; echo "mnt=$MNT"  >> $GITHUB_OUTPUT; echo "img=$IMG"  >> $GITHUB_OUTPUT
-            df -h "$MNT" || true; exit 0
-          fi
-          echo "skip=true" >> $GITHUB_OUTPUT
+  # ─────────────────────────────────────────────────────────────────────
+  # 1) 매트릭스 빌드/이미지 (JDK 17/21) — Maven + Gradle 동시 생성/빌드
+  # ─────────────────────────────────────────────────────────────────────
+  build_matrix:
+    needs: setup_base
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        java: [ '17', '21' ]
+    env:
+      BOOT_GROUP: com.example
+      BOOT_ARTIFACT: ${{ needs.setup_base.outputs.artifact }}
+      BOOT_DEPS: ${{ needs.setup_base.outputs.deps }}
+      BASE_PORT: ${{ needs.setup_base.outputs.base_port }}
+
+    steps:
+      - name: 🛒 Checkout
+        uses: actions/checkout@v4
         continue-on-error: true
 
-      - name: ☕ Set up Java (no cache yet)
+      - name: ☕ Setup Java (matrix)
         uses: actions/setup-java@v4
         with:
-          distribution: 'temurin'
-          java-version: ${{ inputs.java_version }}
+          distribution: temurin
+          java-version: ${{ matrix.java }}
+          cache: 'maven'
         continue-on-error: true
 
       - name: 📦 Install Maven (tarball if version set)
@@ -176,7 +174,6 @@ jobs:
           set -o pipefail
           VER="${{ inputs.maven_version }}"
           if [ -n "$VER" ]; then
-            echo "[echo] Install Maven $VER (tarball)"
             URL="https://archive.apache.org/dist/maven/maven-3/${VER}/binaries/apache-maven-${VER}-bin.tar.gz"
             TMPD="$(mktemp -d)" || true
             (cd "$TMPD" && curl -fsSL "$URL" -o maven.tgz && tar -xzf maven.tgz) || true
@@ -184,27 +181,20 @@ jobs:
             echo "/opt/maven/bin" >> "$GITHUB_PATH"; rm -rf "$TMPD" || true
           else
             sudo apt-get update -y || true
-            sudo apt-get install -y maven pigz unzip || true
+            sudo apt-get install -y maven unzip pigz || true
           fi
-          echo "== mvn -v =="; mvn -v || true
+          mvn -v || true
         continue-on-error: true
 
-      - name: 🧪 Generate Maven sample (IN WORKSPACE)
-        working-directory: ${{ github.workspace }}
+      # ── Maven 샘플(컴파일러 release=matrix.java) ──
+      - name: 🧪 Generate Maven sample + patch (JDK=${{ matrix.java }})
         run: |
           set -o pipefail
           mvn -q -T 1C archetype:generate \
             -DgroupId=com.example -DartifactId=maven-sample \
             -DarchetypeArtifactId=maven-archetype-quickstart \
             -DarchetypeVersion=1.4 -DinteractiveMode=false || true
-        continue-on-error: true
-
-      - name: 🩹 Patch POM for modern JDK (maven-sample)
-        working-directory: ${{ github.workspace }}/maven-sample
-        run: |
-          set -o pipefail
-          JVER="${{ inputs.java_version }}"; case "$JVER" in ""|"11"|"17"|"21") : ;; *) JVER="17" ;; esac
-          cat > pom.xml <<'EOF'
+          cat > maven-sample/pom.xml <<'EOF'
           <?xml version="1.0" encoding="UTF-8"?>
           <project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
                    xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
@@ -212,10 +202,9 @@ jobs:
             <groupId>com.example</groupId>
             <artifactId>maven-sample</artifactId>
             <version>1.0.0</version>
-            <name>maven-sample</name>
             <properties>
               <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-              <maven.compiler.release>__REPLACE_JAVA_RELEASE__</maven.compiler.release>
+              <maven.compiler.release>__REL__</maven.compiler.release>
             </properties>
             <build>
               <plugins>
@@ -242,39 +231,19 @@ jobs:
             </dependencies>
           </project>
           EOF
-          sed -i "s/__REPLACE_JAVA_RELEASE__/${JVER}/g" pom.xml || true
-          echo "----- pom.xml (top) -----"; sed -n '1,120p' pom.xml || true
-          echo "----- src files -----"; find src -maxdepth 3 -type f | sort || true
+          sed -i "s/__REL__/${{ matrix.java }}/g" maven-sample/pom.xml || true
+          (cd maven-sample && mvn -q -T 1C -DskipTests package) || true
+          ls -al maven-sample/target || true
         continue-on-error: true
 
-      - name: ☕ Enable Maven cache (setup-java)
-        if: ${{ hashFiles('maven-sample/pom.xml') != '' }}
-        uses: actions/setup-java@v4
-        with:
-          distribution: 'temurin'
-          java-version: ${{ inputs.java_version }}
-          cache: 'maven'
-          cache-dependency-path: |
-            maven-sample/pom.xml
-            boot-app/pom.xml
-        continue-on-error: true
-
-      - name: 🏗️ Build (maven-sample)
-        working-directory: ${{ github.workspace }}/maven-sample
-        run: |
-          set -o pipefail
-          mvn -q -T 1C -DskipTests package || true
-          echo "== target =="; ls -al target || true
-        continue-on-error: true
-
-      - name: 🌱 Generate Spring Boot project (Initializr + HelloController)
-        working-directory: ${{ github.workspace }}
+      # ── Spring Boot (Maven) 생성 + HelloController + Testcontainers 스텁 ──
+      - name: 🌱 Generate Boot(Maven) + Hello + IT stub
         run: |
           set -o pipefail
           G="${BOOT_GROUP}"
-          A="${{ inputs.boot_artifact }}"
-          D="${{ inputs.boot_dependencies }}"
-          J="${{ inputs.java_version }}"; [ -z "$J" ] && J="17"
+          A="${BOOT_ARTIFACT}"
+          D="${BOOT_DEPS}"
+          J="${{ matrix.java }}"
           PKG="${G}.${A//-/.}"
           mkdir -p boot-app || true
           curl -fsSL -G https://start.spring.io/starter.zip \
@@ -289,72 +258,130 @@ jobs:
             --data-urlencode "packaging=jar" \
             -o boot-app.zip || true
           unzip -q -o boot-app.zip -d boot-app || true
-          mkdir -p "boot-app/src/main/java/${PKG//.//}/controller" || true
+          # HelloController
+          mkdir -p "boot-app/src/main/java/${PKG//.//}/controller"
           cat > "boot-app/src/main/java/${PKG//.//}/controller/HelloController.java" <<EOF
           package ${PKG}.controller;
           import org.springframework.web.bind.annotation.GetMapping;
           import org.springframework.web.bind.annotation.RestController;
           @RestController
           public class HelloController {
-              @GetMapping("/hello") public String hello() { return "hello"; }
+            @GetMapping("/hello") public String hello(){ return "hello"; }
           }
           EOF
-          mkdir -p boot-app/src/main/resources || true
+          # Testcontainers 통합테스트 스텁 (기본 Disabled)
+          mkdir -p "boot-app/src/test/java/${PKG//.//}/it"
+          cat > "boot-app/src/test/java/${PKG//.//}/it/DemoIT.java" <<EOF
+          package ${PKG}.it;
+          import org.junit.jupiter.api.Disabled;
+          import org.junit.jupiter.api.Test;
+          import org.testcontainers.containers.GenericContainer;
+          import org.testcontainers.junit.jupiter.Testcontainers;
+
+          @Testcontainers
+          @Disabled("RUN_IT=true 환경변수로 활성화")
+          public class DemoIT {
+            @Test
+            void smoke() {
+              try (GenericContainer<?> c = new GenericContainer<>("alpine:3.19").withCommand("sleep","1")) {
+                c.start();
+              }
+            }
+          }
+          EOF
+          # pom.xml에 junit-jupiter & testcontainers 추가(있으면 덮어씀)
+          sed -i 's#</dependencies>#  <dependency>\n    <groupId>org.junit.jupiter</groupId>\n    <artifactId>junit-jupiter</artifactId>\n    <version>5.10.2</version>\n    <scope>test</scope>\n  </dependency>\n  <dependency>\n    <groupId>org.testcontainers</groupId>\n    <artifactId>junit-jupiter</artifactId>\n    <version>1.19.7</version>\n    <scope>test</scope>\n  </dependency>\n  <dependency>\n    <groupId>org.testcontainers</groupId>\n    <artifactId>testcontainers</artifactId>\n    <version>1.19.7</version>\n    <scope>test</scope>\n  </dependency>\n</dependencies>#' boot-app/pom.xml || true
+          # application.properties
+          mkdir -p boot-app/src/main/resources
           {
             echo "server.port=8080"
             echo "management.endpoints.web.exposure.include=*"
-            echo "management.endpoint.health.probes.enabled=true"
           } >> boot-app/src/main/resources/application.properties
-          echo "[echo] boot-app content:"; ls -la boot-app || true
         continue-on-error: true
 
-      - name: 👀 Echo important files (boot-app)
-        working-directory: ${{ github.workspace }}/boot-app
-        run: |
-          set -o pipefail
-          echo "----- pom.xml (top) -----"; sed -n '1,120p' pom.xml || true
-          echo "----- Main Application (top) -----"
-          APPFILE=$(grep -Rsl "SpringApplication.run" src/main/java || true)
-          if [ -n "$APPFILE" ]; then sed -n '1,120p' "$APPFILE" || true; else echo "(not found)"; fi
-          echo "----- HelloController -----"
-          HC=$(grep -Rsl "class HelloController" src/main/java || true)
-          if [ -n "$HC" ]; then sed -n '1,120p' "$HC" || true; else echo "(not found)"; fi
-          echo "----- application.properties -----"; sed -n '1,200p' src/main/resources/application.properties || true
-          echo "----- src tree -----"; find src -maxdepth 4 -type f | sort || true
-        continue-on-error: true
-
-      - name: 🏗️ Build Spring Boot (boot-app)
-        working-directory: ${{ github.workspace }}/boot-app
+      - name: 🏗️ Build Boot(Maven)
+        working-directory: boot-app
         run: |
           set -o pipefail
           if [ -x "./mvnw" ]; then ./mvnw -q -T 1C -DskipTests package || true
           else mvn -q -T 1C -DskipTests package || true
           fi
-          echo "== target =="; ls -al target || true
+          ls -al target || true
         continue-on-error: true
 
-      # ========== 멀티스테이지 Dockerfile 강제 적용(이전 Dockerfile 제거) ==========
-      - name: 🐳 Setup Docker Buildx
-        uses: docker/setup-buildx-action@v3
+      # ── Spring Boot (Gradle) 동시 생성(샘플 비교) ──
+      - name: 🌱 Generate Boot(Gradle) project
+        run: |
+          set -o pipefail
+          G="${BOOT_GROUP}"
+          A="${BOOT_ARTIFACT}-gradle"
+          D="${BOOT_DEPS}"
+          J="${{ matrix.java }}"
+          PKG="${G}.${A//-/.}"
+          mkdir -p boot-app-gradle || true
+          curl -fsSL -G https://start.spring.io/starter.zip \
+            --data-urlencode "type=gradle-project" \
+            --data-urlencode "language=java" \
+            --data-urlencode "groupId=$G" \
+            --data-urlencode "artifactId=$A" \
+            --data-urlencode "name=$A" \
+            --data-urlencode "packageName=$PKG" \
+            --data-urlencode "dependencies=$D" \
+            --data-urlencode "javaVersion=$J" \
+            --data-urlencode "packaging=jar" \
+            -o boot-app-gradle.zip || true
+          unzip -q -o boot-app-gradle.zip -d boot-app-gradle || true
+          # 동일 HelloController
+          mkdir -p "boot-app-gradle/src/main/java/${PKG//.//}/controller"
+          cat > "boot-app-gradle/src/main/java/${PKG//.//}/controller/HelloController.java" <<EOF
+          package ${PKG}.controller;
+          import org.springframework.web.bind.annotation.GetMapping;
+          import org.springframework.web.bind.annotation.RestController;
+          @RestController
+          public class HelloController {
+            @GetMapping("/hello") public String hello(){ return "hello-gradle"; }
+          }
+          EOF
+          # Testcontainers 스텁은 의존만 추가(Gradle)
+          sed -i '/dependencies {/a \ \ \ \ testImplementation("org.testcontainers:junit-jupiter:1.19.7")\n\ \ \ \ testImplementation("org.testcontainers:testcontainers:1.19.7")' boot-app-gradle/build.gradle || true
+        continue-on-error: true
+
+      - name: 🏗️ Build Boot(Gradle) (wrapper)
+        working-directory: boot-app-gradle
+        run: |
+          set -o pipefail
+          chmod +x ./gradlew || true
+          ./gradlew -q -Dorg.gradle.jvmargs="-Xmx1g" -x test build || true
+          ls -al build/libs || true
+        continue-on-error: true
+
+      # ── Docker 이미지(멀티스테이지, JDK별 베이스 자동 선택) ──
+      - name: 🐳 Setup QEMU/Buildx
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: all
+        continue-on-error: true
+
+      - uses: docker/setup-buildx-action@v3
         with:
           install: true
         continue-on-error: true
 
-      - name: 🐳 Create Dockerfile & .dockerignore (Multi-stage, Force)
-        working-directory: ${{ github.workspace }}/boot-app
+      - name: 🐳 Create Dockerfile (multi-stage, JDK=${{ matrix.java }})
+        working-directory: boot-app
         run: |
           set -o pipefail
-          rm -f Dockerfile || true
-          cat > Dockerfile <<'DOCKER'
-          # ---- Builder stage: build the jar inside container ----
-          FROM maven:3.9.9-eclipse-temurin-17 AS builder
+          J="${{ matrix.java }}"
+          BUILDER="maven:3.9.9-eclipse-temurin-${J}"
+          RUNTIME="eclipse-temurin:${J}-jre"
+          cat > Dockerfile <<DOCKER
+          FROM ${BUILDER} AS builder
           WORKDIR /workspace
           COPY pom.xml .
           COPY src ./src
           RUN --mount=type=cache,target=/root/.m2 mvn -q -DskipTests package
 
-          # ---- Runtime stage: slim JRE image ----
-          FROM eclipse-temurin:17-jre
+          FROM ${RUNTIME}
           WORKDIR /app
           COPY --from=builder /workspace/target/*.jar /app/app.jar
           EXPOSE 8080
@@ -369,138 +396,128 @@ jobs:
           **/.DS_Store
           *.log
           IGNORE
-          echo "----- Dockerfile -----"; sed -n '1,200p' Dockerfile || true
-          echo "----- .dockerignore -----"; sed -n '1,200p' .dockerignore || true
-          echo "[echo] build context preview:"; ls -la || true
+          sed -n '1,160p' Dockerfile || true
         continue-on-error: true
 
-      - name: 🐳 Prepare buildx cache dirs (no error if missing)
+      - name: 🐳 Prepare buildx cache
         run: |
-          set -o pipefail
           mkdir -p /tmp/.buildx-cache /tmp/.buildx-cache-new || true
         continue-on-error: true
 
-      - name: 🐳 Build image with Buildx (cached)
+      - name: 🐳 Build image (cached) - tag by JDK
         id: docker_build
-        working-directory: ${{ github.workspace }}/boot-app
+        working-directory: boot-app
         env:
-          IMAGE_TAG: ${{ inputs.boot_artifact }}:local
+          IMG: ${{ env.BOOT_ARTIFACT }}:local-j${{ matrix.java }}
         run: |
           set -o pipefail
-          docker buildx build \
-            --load \
-            -t "${IMAGE_TAG}" \
+          docker buildx build --load -t "${IMG}" \
             --cache-from type=local,src=/tmp/.buildx-cache \
             --cache-to   type=local,dest=/tmp/.buildx-cache-new,mode=max \
             .
           rm -rf /tmp/.buildx-cache || true
           mv /tmp/.buildx-cache-new /tmp/.buildx-cache || true
-          echo "image=${IMAGE_TAG}" >> $GITHUB_OUTPUT
-          echo "== docker images (after build head) =="; docker images | head -n 20 || true
+          echo "image=${IMG}" >> $GITHUB_OUTPUT
+          docker images | head -n 20 || true
         continue-on-error: true
 
-      - name: 🐳 Run container (boot-app, no stop/remove)
+      - name: 🐳 Save image tar
+        working-directory: ${{ github.workspace }}
+        env:
+          IMG: ${{ steps.docker_build.outputs.image }}
+        run: |
+          mkdir -p artifacts || true
+          docker save "${IMG}" -o artifacts/${IMG/:/_}.tar 2>/dev/null || true
+        continue-on-error: true
+
+      - name: 🐳 Run container (No-Stop)
         id: docker_run
         env:
-          IMAGE_TAG: ${{ steps.docker_build.outputs.image }}
-          HOST_PORT: ${{ inputs.container_port_host }}
-          APP_PORT: "8080"
+          IMG: ${{ steps.docker_build.outputs.image }}
+          BASE: ${{ env.BASE_PORT }}
+          J: ${{ matrix.java }}
         run: |
           set -o pipefail
-          NAME="boot-app-${GITHUB_RUN_ID}"
-          echo "[echo] docker run --name ${NAME} -p ${HOST_PORT}:${APP_PORT} ${IMAGE_TAG}"
-          CID=$(docker run -d --name "${NAME}" -p "${HOST_PORT}:${APP_PORT}" "${IMAGE_TAG}" 2>/dev/null || true)
+          # JDK21는 포트 +1 (충돌 방지)
+          PORT=$BASE
+          if [ "$J" = "21" ]; then PORT=$((BASE+1)); fi
+          NAME="boot-app-${J}-${GITHUB_RUN_ID}"
+          echo "[echo] docker run --name ${NAME} -p ${PORT}:8080 ${IMG}"
+          CID=$(docker run -d --name "${NAME}" -p "${PORT}:8080" "${IMG}" 2>/dev/null || true)
           echo "container_id=${CID}" >> $GITHUB_OUTPUT
           echo "container_name=${NAME}" >> $GITHUB_OUTPUT
-          echo "== docker ps (after run) =="; docker ps -a || true
-          for i in $(seq 1 20); do
+          echo "PORT=${PORT}" >> $GITHUB_OUTPUT
+          for i in $(seq 1 30); do
             sleep 2
-            curl -fsS "http://localhost:${HOST_PORT}/actuator/health" && break || true
-            curl -fsS "http://localhost:${HOST_PORT}/hello" && break || true
-            echo "[echo] waiting app... (${i})"
+            curl -fsS "http://localhost:${PORT}/actuator/health" && break || true
+            curl -fsS "http://localhost:${PORT}/hello" && break || true
+            echo "[echo] waiting app(${J})... ($i)"
           done
-          echo "== /hello =="
-          curl -fsS "http://localhost:${HOST_PORT}/hello" || true
-          echo "== docker logs (tail) =="; docker logs --tail 150 "${NAME}" 2>/dev/null || true
+          curl -fsS "http://localhost:${PORT}/hello" || true
+          docker logs --tail 200 "${NAME}" 2>/dev/null || true
         continue-on-error: true
 
-      # ========== 에코 전용 대량 디렉토리/파일 생성 + 권한 ==========
-      - name: 🗂️ Create ECHO dirs/files & perms (mass)
+      # ── Echo 대량 디렉토리/파일 & 권한 ──
+      - name: 🗂️ Echo dirs/files & perms (mass)
         run: |
-          set -o pipefail
-          ROOT="$GITHUB_WORKSPACE/echo"
+          ROOT="$GITHUB_WORKSPACE/echo-${{ matrix.java }}"
           mkdir -p "$ROOT"/{logs,bin,tmp,data/{a,b,c},conf,scripts,output} || true
-          for i in $(seq 1 50); do
-            echo "echo-file-$i $(date -u +%FT%TZ)" > "$ROOT/data/a/file_$i.txt"
-            echo "echo-file-$i $(date -u +%FT%TZ)" > "$ROOT/data/b/file_$i.txt"
-            echo "echo-file-$i $(date -u +%FT%TZ)" > "$ROOT/data/c/file_$i.txt"
+          for i in $(seq 1 150); do
+            echo "echo-j${{ matrix.java }}-$i $(date -u +%FT%TZ)" > "$ROOT/data/a/file_$i.txt"
           done
-          for i in $(seq 1 10); do
-            printf '#!/usr/bin/env bash\necho "echo-script-%s"\n' "$i" > "$ROOT/scripts/echo_$i.sh"
-            chmod +x "$ROOT/scripts/echo_$i.sh"
-          done
-          touch "$ROOT/logs/app.log" "$ROOT/logs/build.log" "$ROOT/logs/run.log"
-          echo "ECHO READY" > "$ROOT/output/ready.txt"
           chmod -R 777 "$ROOT" || true
-          echo "[echo] ECHO tree:"
-          find "$ROOT" -maxdepth 3 -type f | sort | head -n 200 || true
+          find "$ROOT" -type f | head -n 50 || true
         continue-on-error: true
 
-      - name: 📦 Archive (fast) & Upload Artifacts
-        run: |
-          set -o pipefail
-          mkdir -p "$GITHUB_WORKSPACE/artifacts" || true
-          cp -f "$GITHUB_WORKSPACE/maven-sample/target/"*.jar "$GITHUB_WORKSPACE/artifacts/" 2>/dev/null || true
-          cp -f "$GITHUB_WORKSPACE/boot-app/target/"*.jar "$GITHUB_WORKSPACE/artifacts/" 2>/dev/null || true
-          cp -f "$GITHUB_WORKSPACE/boot-app/Dockerfile" "$GITHUB_WORKSPACE/artifacts/" 2>/dev/null || true
-          cp -f "$GITHUB_WORKSPACE/boot-app/.dockerignore" "$GITHUB_WORKSPACE/artifacts/" 2>/dev/null || true
-          docker ps -a > "$GITHUB_WORKSPACE/artifacts/docker-ps.txt" 2>/dev/null || true
-          tar -czf "$GITHUB_WORKSPACE/artifacts/echo-tree.tgz" -C "$GITHUB_WORKSPACE" echo 2>/dev/null || true
-          if [ "${{ inputs.fast_compress }}" = "true" ]; then
-            command -v pigz >/dev/null 2>&1 || sudo apt-get install -y pigz || true
-            tar --use-compress-program=pigz -cf "$GITHUB_WORKSPACE/artifacts/boot-app.tgz" -C "$GITHUB_WORKSPACE" boot-app 2>/dev/null || true
-            tar --use-compress-program=pigz -cf "$GITHUB_WORKSPACE/artifacts/maven-sample.tgz" -C "$GITHUB_WORKSPACE" maven-sample 2>/dev/null || true
-          else
-            tar -czf "$GITHUB_WORKSPACE/artifacts/boot-app.tgz" -C "$GITHUB_WORKSPACE" boot-app 2>/dev/null || true
-            tar -czf "$GITHUB_WORKSPACE/artifacts/maven-sample.tgz" -C "$GITHUB_WORKSPACE" maven-sample 2>/dev/null || true
-          fi
-        continue-on-error: true
-
-      - name: ⬆️ Upload artifacts
+      # ── 아티팩트 업로드(매트릭스별 분리명) ──
+      - name: ⬆️ Upload artifacts (per JDK)
         uses: actions/upload-artifact@v4
         with:
-          name: test-server-bundles
-          path: artifacts/*
+          name: bundles-j${{ matrix.java }}
+          path: |
+            artifacts/*
+            maven-sample/target/*.jar
+            boot-app/target/*.jar
+            boot-app/Dockerfile
+            boot-app/.dockerignore
+            boot-app-gradle/build/libs/*.jar
           if-no-files-found: warn
           retention-days: 7
         continue-on-error: true
 
-      - name: 📄 Summary
-        run: |
-          set -o pipefail
-          echo "📄 DONE (Echo→Create→Build→Run, No-Stop, Multi-Stage Fix)"
-          echo "- freedisk_profile: ${{ inputs.freedisk_profile }}"
-          echo "- lowdisk_mode: ${{ inputs.lowdisk_mode }}"
-          echo "- java_version: ${{ inputs.java_version }}"
-          echo "- maven_version: ${{ inputs.maven_version || 'apt-default' }}"
-          echo "- Boot artifact: ${{ inputs.boot_artifact }}"
-          echo "- Boot dependencies: ${{ inputs.boot_dependencies }}"
-          echo "- Docker image tag: ${{ steps.docker_build.outputs.image }}"
-          echo "- Container(host:container): ${{ inputs.container_port_host }}:8080"
-          echo "- Container ID: ${{ steps.docker_run.outputs.container_id }}"
-          echo "- Container Name: ${{ steps.docker_run.outputs.container_name }}"
-          echo "== df -h =="; df -h || true
+  # ─────────────────────────────────────────────────────────────────────
+  # 2) 릴리즈 자동 생성(아티팩트 첨부)
+  # ─────────────────────────────────────────────────────────────────────
+  release:
+    needs: [setup_base, build_matrix]
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: 🛒 Checkout
+        uses: actions/checkout@v4
+
+      - name: ⬇️ Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release_artifacts
         continue-on-error: true
 
-      - name: 🧽 Post-cleanup (unmount only; no stop/remove)
-        if: always()
+      - name: 🧾 List artifacts
         run: |
           set -o pipefail
-          MODE="${{ steps.lowdisk.outputs.mode }}"
-          if [ "$MODE" = "tmpfs" ] && [ -n "${{ steps.lowdisk.outputs.mnt }}" ]; then sudo umount "${{ steps.lowdisk.outputs.mnt }}" || true; fi
-          if [ "$MODE" = "loop" ] ; then
-            if [ -n "${{ steps.lowdisk.outputs.mnt }}" ] && mountpoint -q "${{ steps.lowdisk.outputs.mnt }}"; then sudo umount "${{ steps.lowdisk.outputs.mnt }}" || true; fi
-            if [ -n "${{ steps.lowdisk.outputs.img }}" ] && [ -f "${{ steps.lowdisk.outputs.img }}" ]; then sudo rm -f "${{ steps.lowdisk.outputs.img }}" || true; fi
-          fi
-          echo "[echo] cleanup (mount) done. (컨테이너 중지/삭제는 포함하지 않음)"
+          echo "== release_artifacts =="
+          find release_artifacts -type f | sed 's/^/- /' || true
+        continue-on-error: true
+
+      - name: 🚀 Create GitHub Release (auto-tag)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: auto-${{ github.run_number }}
+          name: "Auto Release #${{ github.run_number }}"
+          draft: false
+          prerelease: true
+          files: |
+            release_artifacts/**/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         continue-on-error: true
