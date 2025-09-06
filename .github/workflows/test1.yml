@@ -1,10 +1,10 @@
-name: Setup SpringBoot & Maven (Fast Disk + Upgrades + Test-Mode + JDK Fix)
+name: Test-Server Setup (Fast Disk, Upgrades, Error-Tolerant)
 
 on:
   workflow_dispatch:
     inputs:
       freedisk_profile:
-        description: "FreeDisk 프로파일 (none|minimal/aggressive)"
+        description: "FreeDisk 프로파일 (none|minimal|aggressive)"
         required: true
         default: "minimal"
       lowdisk_mode:
@@ -38,7 +38,7 @@ permissions:
 jobs:
   setup:
     runs-on: ubuntu-latest
-    continue-on-error: true  # 테스트 서버 모드: 실패해도 진행
+    continue-on-error: true  # ✅ 테스트 서버 감성: 실패해도 다음 단계 진행
 
     steps:
       - name: 🛒 Checkout
@@ -52,24 +52,26 @@ jobs:
           echo "== ip a (head) ==" && ip a || true
         continue-on-error: true
 
+      # ✅ jlumbroso/free-disk-space: 지원 입력만 사용 (codeql 없음)
       - name: 🧹 Free up disk space (profiled)
         uses: jlumbroso/free-disk-space@main
         with:
-          android:        ${{ github.event.inputs.freedisk_profile == 'aggressive' }}
-          dotnet:         ${{ github.event.inputs.freedisk_profile == 'aggressive' }}
-          haskell:        ${{ github.event.inputs.freedisk_profile == 'aggressive' }}
-          large-packages: ${{ github.event.inputs.freedisk_profile == 'aggressive' }}
-          docker-images:  ${{ github.event.inputs.freedisk_profile == 'minimal' || github.event.inputs.freedisk_profile == 'aggressive' }}
-          tool-cache:     ${{ github.event.inputs.freedisk_profile == 'minimal' || github.event.inputs.freedisk_profile == 'aggressive' }}
-          swap-storage:   ${{ github.event.inputs.freedisk_profile == 'aggressive' }}
+          android:        ${{ inputs.freedisk_profile == 'aggressive' }}
+          dotnet:         ${{ inputs.freedisk_profile == 'aggressive' }}
+          haskell:        ${{ inputs.freedisk_profile == 'aggressive' }}
+          large-packages: ${{ inputs.freedisk_profile == 'aggressive' }}
+          docker-images:  ${{ inputs.freedisk_profile == 'minimal' || inputs.freedisk_profile == 'aggressive' }}
+          tool-cache:     ${{ inputs.freedisk_profile == 'minimal' || inputs.freedisk_profile == 'aggressive' }}
+          swap-storage:   ${{ inputs.freedisk_profile == 'aggressive' }}
         continue-on-error: true
 
       - name: 📊 df after cleanup
         run: df -h || true
         continue-on-error: true
 
+      # 선택: OS 업그레이드 (안전 모드)
       - name: ⬆️ Upgrade OS packages (safe)
-        if: ${{ github.event.inputs.upgrade_os == 'true' }}
+        if: ${{ inputs.upgrade_os == 'true' }}
         run: |
           set -o pipefail
           sudo apt-get update -y || true
@@ -79,8 +81,9 @@ jobs:
           df -h || true
         continue-on-error: true
 
+      # 선택: apt 캐시/로그 정리
       - name: 🧯 Purge apt cache & logs
-        if: ${{ github.event.inputs.purge_apt_cache == 'true' }}
+        if: ${{ inputs.purge_apt_cache == 'true' }}
         run: |
           set -o pipefail
           sudo apt-get clean || true
@@ -91,11 +94,12 @@ jobs:
           df -h || true
         continue-on-error: true
 
+      # ⚡ 저용량 디스크 시뮬 (고속: tmpfs 기본 / loop 옵션)
       - name: ⚡ Low-disk simulate (tmpfs/loop/off)
         id: lowdisk
         run: |
           set -o pipefail
-          MODE="${{ github.event.inputs.lowdisk_mode }}"
+          MODE="${{ inputs.lowdisk_mode }}"
           echo "lowdisk_mode=$MODE"
           if [ -z "$MODE" ] || [ "$MODE" = "off" ]; then
             echo "skip=true" >> $GITHUB_OUTPUT
@@ -131,6 +135,16 @@ jobs:
           echo "skip=true" >> $GITHUB_OUTPUT
         continue-on-error: true
 
+      # (선택) CodeQL 수동 정리 가이드 스텝 — ⚠️ 실제 삭제는 주석 해제 시에만 수행
+      - name: 🧼 Manual purge:CodeQL caches & DB (optional)
+        run: |
+          set -o pipefail
+          # 필요 시 아래 줄 주석 해제
+          # sudo rm -rf /opt/hostedtoolcache/codeql "$RUNNER_TEMP"/codeql* "$RUNNER_TEMP"/_github_home/codeql* ./.codeql ./codeql-db || true
+          echo "CodeQL manual purge step (no action by default)."
+        continue-on-error: true
+
+      # 데모 디렉토리
       - name: 🧱 Prepare dirs (workspace + /opt demo)
         run: |
           set -o pipefail
@@ -142,6 +156,7 @@ jobs:
           echo "Maven Placeholder"        | sudo tee /opt/project/maven/src/Main.java >/dev/null || true
         continue-on-error: true
 
+      # 자바 설치 (요청 버전)
       - name: ☕ Set up Java (no cache yet)
         uses: actions/setup-java@v4
         with:
@@ -149,10 +164,11 @@ jobs:
           java-version: ${{ inputs.java_version }}
         continue-on-error: true
 
+      # 메이븐 설치 (지정 버전 tarball or apt)
       - name: 📦 Install Maven (tarball if version set)
         run: |
           set -o pipefail
-          VER="${{ github.event.inputs.maven_version }}"
+          VER="${{ inputs.maven_version }}"
           if [ -n "$VER" ]; then
             echo "Installing Apache Maven $VER (tarball)"
             URL="https://archive.apache.org/dist/maven/maven-3/${VER}/binaries/apache-maven-${VER}-bin.tar.gz"
@@ -170,11 +186,11 @@ jobs:
           mvn -v || true
         continue-on-error: true
 
+      # 워크스페이스 내 Maven 샘플 생성
       - name: 🧪 Generate Maven sample (IN WORKSPACE)
         working-directory: ${{ github.workspace }}
         run: |
           set -o pipefail
-          # 최신 아키타입 버전 지정(호환성 향상)
           mvn -q archetype:generate \
             -DgroupId=com.example \
             -DartifactId=maven-sample \
@@ -184,19 +200,17 @@ jobs:
           test -f "$GITHUB_WORKSPACE/maven-sample/pom.xml" || echo "⚠️ pom.xml 생성 확인 필요" || true
         continue-on-error: true
 
-      # ✅ JDK 17/21에서도 컴파일되도록 POM 패치 (compiler plugin + <release>)
+      # JDK 17/21 호환 POM 패치 (release 지정 + 최신 플러그인)
       - name: 🩹 Patch POM for modern JDK (set compiler release)
         working-directory: ${{ github.workspace }}/maven-sample
         run: |
           set -o pipefail
-          JVER="${{ github.event.inputs.java_version }}"
+          JVER="${{ inputs.java_version }}"
           case "$JVER" in
-            ""|"11"|"17"|"21") : ;; # 허용
+            ""|"11"|"17"|"21") : ;;
             *) JVER="17" ;;
           esac
-          echo "Using Java release=$JVER for compilation"
-          # 기존 POM을 현대화된 설정으로 교체(소스 디렉토리는 유지)
-          cat > pom.xml <<EOF
+          cat > pom.xml <<'EOF'
           <?xml version="1.0" encoding="UTF-8"?>
           <project xmlns="http://maven.apache.org/POM/4.0.0"
                    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
@@ -208,7 +222,7 @@ jobs:
             <name>maven-sample</name>
             <properties>
               <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-              <maven.compiler.release>${JVER}</maven.compiler.release>
+              <maven.compiler.release>__REPLACE_JAVA_RELEASE__</maven.compiler.release>
             </properties>
             <build>
               <plugins>
@@ -217,7 +231,7 @@ jobs:
                   <artifactId>maven-compiler-plugin</artifactId>
                   <version>3.11.0</version>
                   <configuration>
-                    <release>\${maven.compiler.release}</release>
+                    <release>${maven.compiler.release}</release>
                   </configuration>
                 </plugin>
                 <plugin>
@@ -228,7 +242,6 @@ jobs:
               </plugins>
             </build>
             <dependencies>
-              <!-- JUnit 4 (아키타입 1.4 소스와 호환) -->
               <dependency>
                 <groupId>junit</groupId>
                 <artifactId>junit</artifactId>
@@ -238,9 +251,11 @@ jobs:
             </dependencies>
           </project>
           EOF
+          sed -i "s/__REPLACE_JAVA_RELEASE__/${JVER}/g" pom.xml || true
           echo "Patched POM with maven-compiler-plugin (release=${JVER})"
         continue-on-error: true
 
+      # Maven 캐시 활성화(이제 워크스페이스에 pom.xml 존재)
       - name: ☕ Enable Maven cache (setup-java)
         if: ${{ hashFiles('maven-sample/pom.xml') != '' }}
         uses: actions/setup-java@v4
@@ -265,7 +280,7 @@ jobs:
           set -o pipefail
           mkdir -p "$GITHUB_WORKSPACE/artifacts" || true
           cp -f "$GITHUB_WORKSPACE/maven-sample/target/"*.jar "$GITHUB_WORKSPACE/artifacts/" 2>/dev/null || true
-          if [ "${{ github.event.inputs.fast_compress }}" = "true" ]; then
+          if [ "${{ inputs.fast_compress }}" = "true" ]; then
             tar --use-compress-program=pigz -cf "$GITHUB_WORKSPACE/artifacts/maven-sample.tgz" -C "$GITHUB_WORKSPACE" maven-sample 2>/dev/null || true
           else
             tar -czf "$GITHUB_WORKSPACE/artifacts/maven-sample.tgz" -C "$GITHUB_WORKSPACE" maven-sample 2>/dev/null || true
@@ -284,11 +299,11 @@ jobs:
       - name: 📄 Summary
         run: |
           set -o pipefail
-          echo "📄 DONE (Fast Disk + Upgrades + Test-Mode + JDK Fix)"
-          echo "- freedisk_profile: ${{ github.event.inputs.freedisk_profile }}"
-          echo "- lowdisk_mode: ${{ github.event.inputs.lowdisk_mode }}"
-          echo "- java_version: ${{ github.event.inputs.java_version }}"
-          echo "- maven_version: ${{ github.event.inputs.maven_version || 'apt-default' }}"
+          echo "📄 DONE (Test-Server Mode)"
+          echo "- freedisk_profile: ${{ inputs.freedisk_profile }}"
+          echo "- lowdisk_mode: ${{ inputs.lowdisk_mode }}"
+          echo "- java_version: ${{ inputs.java_version }}"
+          echo "- maven_version: ${{ inputs.maven_version || 'apt-default' }}"
           if [ -n "${{ steps.lowdisk.outputs.mnt }}" ]; then
             echo "- lowdisk mount: ${{ steps.lowdisk.outputs.mnt }} (mode=${{ steps.lowdisk.outputs.mode }})"
           fi
