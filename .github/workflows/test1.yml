@@ -72,7 +72,7 @@ jobs:
           echo "deps=${{ inputs.boot_dependencies || 'web,actuator' }}" >> $GITHUB_OUTPUT
           echo "base_port=${{ inputs.container_port_host || '18080' }}" >> $GITHUB_OUTPUT
 
-      - name: 🔎 Echo: runner/env/docker/resources
+      - name: 🔎 Echo:runner/env/docker/resources
         run: |
           set -o pipefail
           uname -a || true
