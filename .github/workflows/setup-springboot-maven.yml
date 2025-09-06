@@ -1,7 +1,16 @@
-name: Setup SpringBoot and Maven Project
+name: Setup SpringBoot and Maven Project (Safe Disk)
 
 on:
   workflow_dispatch:
+    inputs:
+      free_disk_space:
+        description: "여유 공간 확보 실행 (Android/.NET/CodeQL/도커캐시 제거)"
+        required: true
+        default: "false"
+      simulate_low_disk:
+        description: "저용량 디스크 시뮬레이션 (루프백 2~4GB /mnt/lowdisk 마운트)"
+        required: true
+        default: "false"
 
 permissions:
   contents: write
@@ -14,53 +23,117 @@ jobs:
       - name: 🛒 Checkout Repository
         uses: actions/checkout@v4
 
+      - name: 📊 Show initial disk usage
+        run: |
+          set -Eeuo pipefail
+          echo "== df -h =="
+          df -h
+          echo "== docker images (top 10) =="
+          docker images | head -n 10 || true
+
+      # 공간이 필요할 때만 안전하게 정리 (Android/.NET/CodeQL/도커 이미지 캐시 등)
+      - name: 🧹 (Optional) Free up disk space
+        if: ${{ github.event.inputs.free_disk_space == 'true' }}
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          codeql: true
+          docker-images: true
+          large-packages: false
+          swap-storage: false
+      # 참고: 위 액션은 러너 이미지의 사전 설치 툴을 제거하여 수~십 GB 확보합니다. :contentReference[oaicite:1]{index=1}
+
+      - name: 📊 Show disk after cleanup
+        if: ${{ github.event.inputs.free_disk_space == 'true' }}
+        run: df -h
+
       - name: 🧱 Create Project Directories and Dummy Files
         run: |
-          mkdir -p /opt/project/springboot/{src,logs,temp}
-          mkdir -p /opt/project/maven/{src,target,logs}
+          set -Eeuo pipefail
+          sudo mkdir -p /opt/project/springboot/{src,logs,temp,server}
+          sudo mkdir -p /opt/project/maven/{src,target,logs}
           mkdir -p .github/workflows
-          mkdir -p /opt/disks/springboot /opt/disks/maven
-
-          echo "Spring Boot Server Log" > /opt/project/springboot/logs/server.log
-          echo "Maven Project Placeholder" > /opt/project/maven/src/Main.java
+          sudo mkdir -p /opt/disks/{springboot,maven}
+          echo "Spring Boot Server Log" | sudo tee /opt/project/springboot/logs/server.log >/dev/null
+          echo "Maven Project Placeholder" | sudo tee /opt/project/maven/src/Main.java >/dev/null
           echo "✅ 디렉토리 및 파일 생성 완료"
 
-      - name: 💽 Reserve Max Disk Space in .github/workflows
+      # ❌ 삭제: 시스템을 망가뜨리는 100GB 예약
+      # ✔️ 대안1: 저용량 디스크 '시뮬레이션'을 원할 때만 /mnt/lowdisk 에 루프백 마운트
+      - name: 🧪 (Optional) Simulate low-disk via loopback mount
+        if: ${{ github.event.inputs.simulate_low_disk == 'true' }}
+        id: lowdisk
         run: |
-          echo "📦 디스크 예약 공간 확보 중..."
-          if sudo fallocate -l 100G .github/workflows/.reserve_space; then
-            echo "✅ fallocate 사용 성공"
-          else
-            echo "⚠️ fallocate 실패: dd 방식으로 대체합니다"
-            sudo dd if=/dev/zero of=.github/workflows/.reserve_space bs=1M count=102400 || echo "❌ dd 실패: 디스크 용량 부족으로 예약 공간 확보 실패"
-          fi
-          sudo chmod 777 .github/workflows/.reserve_space
-          df -h
+          set -Eeuo pipefail
+          MNT="/mnt/lowdisk"
+          IMG="/mnt/tmp-pv.img"
+          sudo mkdir -p "$MNT"
+          # 남은 공간을 확인하고 2~4GB 사이에서 안전하게 파일 생성
+          AVAIL_GB=$(df --output=avail -BG /mnt | tail -1 | tr -dc '0-9')
+          # 최소 6GB는 시스템에 남기고, 그 안에서 최대 4GB 사용
+          SIZE_GB=2
+          if [ "$AVAIL_GB" -ge 12 ]; then SIZE_GB=4; fi
+          echo "Creating loopback file of ${SIZE_GB}G at $IMG (Avail=${AVAIL_GB}G)"
+          sudo fallocate -l ${SIZE_GB}G "$IMG" || sudo dd if=/dev/zero of="$IMG" bs=1M count=$((SIZE_GB*1024))
+          sudo mkfs.ext4 -F "$IMG"
+          sudo mount -o loop "$IMG" "$MNT"
+          sudo chmod 777 "$MNT"
+          echo "mounted" > "$MNT/.ok"
+          echo "img=$IMG" >> $GITHUB_OUTPUT
+          echo "mnt=$MNT" >> $GITHUB_OUTPUT
+          df -h "$MNT"
 
       - name: ☕ Install Maven
         run: |
-          sudo apt-get update
+          set -Eeuo pipefail
+          sudo apt-get update -y
           sudo apt-get install -y maven
           mvn -v
 
       - name: 🧪 Test Maven Build Directory
         run: |
+          set -Eeuo pipefail
           cd /opt/project/maven
-          mvn archetype:generate -DgroupId=com.example -DartifactId=test-app -DarchetypeArtifactId=maven-archetype-quickstart -DinteractiveMode=false
+          mvn -q archetype:generate \
+            -DgroupId=com.example \
+            -DartifactId=test-app \
+            -DarchetypeArtifactId=maven-archetype-quickstart \
+            -DinteractiveMode=false
           echo "✅ Maven 프로젝트 생성 완료"
 
       - name: 🚀 Simulate Spring Boot Server Setup
         run: |
+          set -Eeuo pipefail
           echo "🛠️ Spring Boot 서버 설치 중..."
-          mkdir -p /opt/project/springboot/server
-          touch /opt/project/springboot/server/app.jar
-          echo "Simulated Spring Boot JAR" > /opt/project/springboot/server/app.jar
+          sudo bash -c 'echo "Simulated Spring Boot JAR" > /opt/project/springboot/server/app.jar'
+          ls -al /opt/project/springboot/server
           echo "✅ Spring Boot 서버 설치 및 JAR 생성 완료"
 
-      - name: 🧾 Summary Report
+      - name: 📄 Summary Report
         run: |
           echo "📄 실행 완료 요약:"
           echo "- Spring Boot 경로: /opt/project/springboot"
           echo "- Maven 경로: /opt/project/maven"
-          echo "- 디스크 용량 파일: .github/workflows/.reserve_space"
           echo "- JAR 파일: /opt/project/springboot/server/app.jar"
+          if [[ "${{ steps.lowdisk.outcome || '' }}" == "success" ]]; then
+            echo "- 저용량 시뮬레이션 마운트: ${{ steps.lowdisk.outputs.mnt }}"
+          fi
+          echo "== df -h =="
+          df -h
+
+      # 항상 정리 (시뮬레이션 마운트/이미지 제거)
+      - name: 🧽 Post-cleanup
+        if: always()
+        run: |
+          set -Eeuo pipefail
+          if mountpoint -q "${{ steps.lowdisk.outputs.mnt }}"; then
+            sudo umount "${{ steps.lowdisk.outputs.mnt }}"
+          fi
+          if [ -n "${{ steps.lowdisk.outputs.img }}" ] && [ -f "${{ steps.lowdisk.outputs.img }}" ]; then
+            sudo rm -f "${{ steps.lowdisk.outputs.img }}"
+          fi
+          rm -f .github/workflows/.reserve_space || true
+          echo "Cleanup done."
