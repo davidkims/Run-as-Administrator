@@ -79,7 +79,7 @@ jobs:
       - name: 📊 Disk after action cleanup
         run: df -h
 
-      - name: 🧽 Manual prune: Docker ALL
+      - name: 🧽 Manual prune:Docker ALL
         if: ${{ github.event.inputs.prune_docker_all == 'true' }}
         run: |
           set -Eeuo pipefail
