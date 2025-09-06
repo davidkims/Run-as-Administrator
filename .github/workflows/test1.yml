@@ -1,4 +1,4 @@
-name: Setup SpringBoot and Maven Project (Safe Disk)
+name: Setup SpringBoot and Maven Project (Safe Disk + Maven Cache)
 
 on:
   workflow_dispatch:
@@ -65,7 +65,6 @@ jobs:
           echo "== ip a (head) =="
           ip a || true
 
-      # 허용된 입력만 boolean으로 전달 (표현식으로 true/false 변환)
       - name: 🧹 Free up disk space (action)
         uses: jlumbroso/free-disk-space@main
         with:
@@ -80,7 +79,7 @@ jobs:
       - name: 📊 Disk after action cleanup
         run: df -h
 
-      - name: 🧽 Manual prune:Docker ALL
+      - name: 🧽 Manual prune: Docker ALL
         if: ${{ github.event.inputs.prune_docker_all == 'true' }}
         run: |
           set -Eeuo pipefail
@@ -88,7 +87,7 @@ jobs:
           docker builder prune -af || true
           df -h
 
-      - name: 🧯 Manual purge:apt cache & logs
+      - name: 🧯 Manual purge: apt cache & logs
         if: ${{ github.event.inputs.purge_apt_cache == 'true' }}
         run: |
           set -Eeuo pipefail
@@ -120,78 +119,85 @@ jobs:
           echo "mnt=$MNT" >> $GITHUB_OUTPUT
           df -h "$MNT"
 
-      - name: 🧱 Create Project Directories and Dummy Files
+      - name: 🧱 Create dirs (workspace + /opt demo)
         run: |
           set -Eeuo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/artifacts"
+          # /opt 데모(실제 빌드는 워크스페이스에서 수행)
           sudo mkdir -p /opt/project/springboot/{src,logs,temp,server}
           sudo mkdir -p /opt/project/maven/{src,target,logs}
-          mkdir -p .github/workflows artifacts
-          sudo mkdir -p /opt/disks/{springboot,maven}
-          echo "Spring Boot Server Log" | sudo tee /opt/project/springboot/logs/server.log >/dev/null
-          echo "Maven Project Placeholder" | sudo tee /opt/project/maven/src/Main.java >/dev/null
-          echo "✅ 디렉토리 및 파일 생성 완료" | tee artifacts/summary.log
+          echo "Simulated Spring Boot JAR" | sudo tee /opt/project/springboot/server/app.jar >/dev/null
+          echo "Spring Boot Server Log"   | sudo tee /opt/project/springboot/logs/server.log >/dev/null
+          echo "Maven Placeholder"        | sudo tee /opt/project/maven/src/Main.java >/dev/null
 
-      - name: ☕ Set up Java (with Maven cache)
+      - name: ☕ Set up Java (no cache yet)
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: 📦 Install Maven CLI
+        run: |
+          set -Eeuo pipefail
+          sudo apt-get update -y
+          sudo apt-get install -y maven
+          mvn -v
+
+      - name: 🧪 Generate Maven sample project (IN WORKSPACE)
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -Eeuo pipefail
+          mvn -q archetype:generate \
+            -DgroupId=com.example \
+            -DartifactId=maven-sample \
+            -DarchetypeArtifactId=maven-archetype-quickstart \
+            -DinteractiveMode=false
+          echo "✅ Generated $GITHUB_WORKSPACE/maven-sample/pom.xml"
+
+      - name: ☕ Enable Maven cache (setup-java)
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
           java-version: '17'
           cache: 'maven'
+          cache-dependency-path: |
+            maven-sample/pom.xml
 
-      - name: ☕ Ensure Maven CLI
+      - name: 🏗️ Build (maven-sample)
+        working-directory: ${{ github.workspace }}/maven-sample
         run: |
           set -Eeuo pipefail
-          sudo apt-get update -y
-          sudo apt-get install -y maven
-          mvn -v | tee -a artifacts/summary.log
-
-      - name: 🧪 Generate Maven sample project
-        run: |
-          set -Eeuo pipefail
-          cd /opt/project/maven
-          mvn -q archetype:generate \
-            -DgroupId=com.example \
-            -DartifactId=test-app \
-            -DarchetypeArtifactId=maven-archetype-quickstart \
-            -DinteractiveMode=false
-          echo "✅ Maven 프로젝트 생성 완료" | tee -a $GITHUB_WORKSPACE/artifacts/summary.log
-
-      - name: 🚀 Simulate Spring Boot Server Setup
-        run: |
-          set -Eeuo pipefail
-          echo "🛠️ Spring Boot 서버 설치 중..."
-          echo "Simulated Spring Boot JAR" | sudo tee /opt/project/springboot/server/app.jar >/dev/null
-          ls -al /opt/project/springboot/server | tee -a artifacts/summary.log
-          echo "✅ Spring Boot 서버 설치 및 JAR 생성 완료" | tee -a artifacts/summary.log
+          mvn -q -DskipTests package
+          ls -al target
 
       - name: 📦 Archive & Upload Artifacts
         run: |
           set -Eeuo pipefail
-          tar -czf artifacts/maven-sample.tgz -C /opt/project/maven test-app || true
-          tar -czf artifacts/springboot-sim.tgz -C /opt/project/springboot server logs || true
-          echo "== df -h ==" >> artifacts/summary.log
-          df -h >> artifacts/summary.log
+          cp -f "$GITHUB_WORKSPACE/maven-sample/target/"*.jar "$GITHUB_WORKSPACE/artifacts/" || true
+          tar -czf "$GITHUB_WORKSPACE/artifacts/maven-sample.tgz" -C "$GITHUB_WORKSPACE" maven-sample
 
       - name: ⬆️ Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: setup-result
+          name: maven-sample-build
           path: artifacts/*
           if-no-files-found: warn
-          compression-level: 6
           retention-days: 7
 
-      - name: 📄 Summary Report (console)
+      - name: 📄 Summary
         run: |
-          echo "📄 실행 요약"
-          echo "- Spring Boot: /opt/project/springboot"
-          echo "- Maven: /opt/project/maven"
-          if [[ "${{ steps.lowdisk.outcome || '' }}" == "success" ]]; then
+          set -Eeuo pipefail
+          echo "📄 DONE"
+          echo "- Workspace project: $GITHUB_WORKSPACE/maven-sample"
+          echo "- Built JARs in: $GITHUB_WORKSPACE/maven-sample/target"
+          echo "- Demo JAR: /opt/project/springboot/server/app.jar"
+          if [ "${{ steps.lowdisk.outcome }}" = "success" ]; then
             echo "- LowDisk mount: ${{ steps.lowdisk.outputs.mnt }}"
           fi
+          echo "== df -h =="
           df -h
 
-      - name: 🧽 Post-cleanup (unmount & remove loopback, temp, etc.)
+      - name: 🧽 Post-cleanup (unmount & remove loopback)
         if: always()
         run: |
           set -Eeuo pipefail
