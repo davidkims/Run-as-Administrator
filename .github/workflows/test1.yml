@@ -1,12 +1,12 @@
-name: Test-Server + Spring Boot + Docker (Ultra-Expanded:Maven+Gradle, JDK17/21, Scheduled, Release)
+name: Test-Server + Spring Boot + Docker (Ultra:Maven+Gradle, JDK17/21, Schedule, Release, Promote)
 
 on:
   schedule:
-    - cron: "*/10 * * * *"   # ✅ 10분 주기 자동 실행
+    - cron: "*/10 * * * *" # 10분 주기
   workflow_dispatch:
     inputs:
       freedisk_profile:
-        description: "FreeDisk 프로파일 (none|minimal|aggressive)"
+        description: "FreeDisk 프로파일 (none|minimal/aggressive)"
         required: true
         default: "minimal"
       lowdisk_mode:
@@ -18,15 +18,15 @@ on:
         required: true
         default: "true"
       upgrade_os:
-        description: "OS 패키지 업그레이드 실행 (true/false)"
+        description: "OS 패키지 업그레이드 (true/false)"
         required: true
         default: "false"
       java_version:
-        description: "기본 JDK 버전(수동 실행용; 매트릭스는 17/21 고정)"
+        description: "수동 실행시 기본 JDK (17/21)"
         required: false
         default: "17"
       maven_version:
-        description: "Maven 버전(예: 3.9.9). 비우면 apt 기본"
+        description: "Maven 버전(예: 3.9.9) 비우면 apt 기본"
         required: false
         default: ""
       purge_apt_cache:
@@ -38,21 +38,22 @@ on:
         required: false
         default: "demo-app"
       boot_dependencies:
-        description: "Boot deps CSV (예: web,actuator)"
+        description: "Boot deps CSV (web,actuator,...)"
         required: false
         default: "web,actuator"
       container_port_host:
-        description: "호스트 포트(기본 18080; JDK21은 +1)"
+        description: "호스트 포트(기본 18080; JDK21는 +1)"
         required: false
         default: "18080"
 
 permissions:
   contents: write
+  pull-requests: write
+
+env:
+  BOOT_GROUP: com.example
 
 jobs:
-  # ─────────────────────────────────────────────────────────────────────
-  # 0) 공통 준비(디스크/에코/numfmt shim 등) — 한 번만 실행
-  # ─────────────────────────────────────────────────────────────────────
   setup_base:
     runs-on: ubuntu-latest
     continue-on-error: true
@@ -74,7 +75,6 @@ jobs:
 
       - name: 🔎 Echo:runner/env/docker/resources
         run: |
-          set -o pipefail
           uname -a || true
           nproc || true
           free -h || true
@@ -82,16 +82,14 @@ jobs:
           ip a || true
           docker version || true
           docker info || true
-        continue-on-error: true
 
-      - name: 📦 Reserve fast disk (5G) + df
+      - name: 📦 Reserve fast disk (5G)
         run: |
           mkdir -p .github/workflows || true
           sudo fallocate -l 5G .github/workflows/.reserve_space || true
           sudo chmod 666 .github/workflows/.reserve_space || true
           du -h .github/workflows/.reserve_space || true
           df -h || true
-        continue-on-error: true
 
       - name: 🛠️ numfmt shim (-4 옵션 무시)
         run: |
@@ -105,7 +103,6 @@ jobs:
           SH
           sudo chmod +x /usr/local/bin/numfmt
           /usr/local/bin/numfmt -4 --to=iec 1024 || true
-        continue-on-error: true
 
       - name: 🧹 Free up disk (profiled)
         uses: jlumbroso/free-disk-space@main
@@ -117,7 +114,6 @@ jobs:
           docker-images:  ${{ inputs.freedisk_profile == 'minimal' || inputs.freedisk_profile == 'aggressive' }}
           tool-cache:     ${{ inputs.freedisk_profile == 'minimal' || inputs.freedisk_profile == 'aggressive' }}
           swap-storage:   ${{ inputs.freedisk_profile == 'aggressive' }}
-        continue-on-error: true
 
       - name: ⬆️ Upgrade OS (opt)
         if: ${{ inputs.upgrade_os == 'true' }}
@@ -126,7 +122,6 @@ jobs:
           sudo DEBIAN_FRONTEND=noninteractive apt-get -y upgrade || true
           sudo dpkg --configure -a || true
           sudo apt-get -f install || true
-        continue-on-error: true
 
       - name: 🧯 Purge apt cache&logs (opt)
         if: ${{ inputs.purge_apt_cache == 'true' }}
@@ -137,11 +132,7 @@ jobs:
           sudo find /var/log -type f -name "*.gz" -delete || true
           sudo find /var/log -type f -name "*.1" -delete || true
           df -h || true
-        continue-on-error: true
 
-  # ─────────────────────────────────────────────────────────────────────
-  # 1) 매트릭스 빌드/이미지 (JDK 17/21) — Maven + Gradle 동시 생성/빌드
-  # ─────────────────────────────────────────────────────────────────────
   build_matrix:
     needs: setup_base
     runs-on: ubuntu-latest
@@ -149,47 +140,43 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        java: [ '17', '21' ]
+        java: ['17','21']
     env:
-      BOOT_GROUP: com.example
       BOOT_ARTIFACT: ${{ needs.setup_base.outputs.artifact }}
       BOOT_DEPS: ${{ needs.setup_base.outputs.deps }}
       BASE_PORT: ${{ needs.setup_base.outputs.base_port }}
+      BOOT_GROUP: com.example
 
     steps:
       - name: 🛒 Checkout
         uses: actions/checkout@v4
-        continue-on-error: true
 
-      - name: ☕ Setup Java (matrix)
+      # 1) 첫 Java 설정(캐시 없이) → 캐시 미스/경로 오류 방지
+      - name: ☕ Setup Java (no cache yet)
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: ${{ matrix.java }}
-          cache: 'maven'
-        continue-on-error: true
 
       - name: 📦 Install Maven (tarball if version set)
         run: |
-          set -o pipefail
           VER="${{ inputs.maven_version }}"
           if [ -n "$VER" ]; then
             URL="https://archive.apache.org/dist/maven/maven-3/${VER}/binaries/apache-maven-${VER}-bin.tar.gz"
             TMPD="$(mktemp -d)" || true
             (cd "$TMPD" && curl -fsSL "$URL" -o maven.tgz && tar -xzf maven.tgz) || true
             sudo rm -rf /opt/maven || true; sudo mv "$TMPD/apache-maven-${VER}" /opt/maven || true
-            echo "/opt/maven/bin" >> "$GITHUB_PATH"; rm -rf "$TMPD" || true
+            echo "/opt/maven/bin" >> "$GITHUB_PATH"
+            rm -rf "$TMPD" || true
           else
             sudo apt-get update -y || true
             sudo apt-get install -y maven unzip pigz || true
           fi
           mvn -v || true
-        continue-on-error: true
 
-      # ── Maven 샘플(컴파일러 release=matrix.java) ──
+      # 2) Maven 샘플 생성/패치/빌드
       - name: 🧪 Generate Maven sample + patch (JDK=${{ matrix.java }})
         run: |
-          set -o pipefail
           mvn -q -T 1C archetype:generate \
             -DgroupId=com.example -DartifactId=maven-sample \
             -DarchetypeArtifactId=maven-archetype-quickstart \
@@ -234,16 +221,11 @@ jobs:
           sed -i "s/__REL__/${{ matrix.java }}/g" maven-sample/pom.xml || true
           (cd maven-sample && mvn -q -T 1C -DskipTests package) || true
           ls -al maven-sample/target || true
-        continue-on-error: true
 
-      # ── Spring Boot (Maven) 생성 + HelloController + Testcontainers 스텁 ──
-      - name: 🌱 Generate Boot(Maven) + Hello + IT stub
+      # 3) Spring Boot(Maven) 프로젝트 생성 + Hello + Testcontainers 스텁
+      - name: 🌱 Generate Boot (Maven) + Hello + IT stub
         run: |
-          set -o pipefail
-          G="${BOOT_GROUP}"
-          A="${BOOT_ARTIFACT}"
-          D="${BOOT_DEPS}"
-          J="${{ matrix.java }}"
+          G="${{ env.BOOT_GROUP }}"; A="${{ env.BOOT_ARTIFACT }}"; D="${{ env.BOOT_DEPS }}"; J="${{ matrix.java }}"
           PKG="${G}.${A//-/.}"
           mkdir -p boot-app || true
           curl -fsSL -G https://start.spring.io/starter.zip \
@@ -258,18 +240,14 @@ jobs:
             --data-urlencode "packaging=jar" \
             -o boot-app.zip || true
           unzip -q -o boot-app.zip -d boot-app || true
-          # HelloController
           mkdir -p "boot-app/src/main/java/${PKG//.//}/controller"
           cat > "boot-app/src/main/java/${PKG//.//}/controller/HelloController.java" <<EOF
           package ${PKG}.controller;
           import org.springframework.web.bind.annotation.GetMapping;
           import org.springframework.web.bind.annotation.RestController;
           @RestController
-          public class HelloController {
-            @GetMapping("/hello") public String hello(){ return "hello"; }
-          }
+          public class HelloController { @GetMapping("/hello") public String hello(){ return "hello"; } }
           EOF
-          # Testcontainers 통합테스트 스텁 (기본 Disabled)
           mkdir -p "boot-app/src/test/java/${PKG//.//}/it"
           cat > "boot-app/src/test/java/${PKG//.//}/it/DemoIT.java" <<EOF
           package ${PKG}.it;
@@ -277,46 +255,41 @@ jobs:
           import org.junit.jupiter.api.Test;
           import org.testcontainers.containers.GenericContainer;
           import org.testcontainers.junit.jupiter.Testcontainers;
-
-          @Testcontainers
-          @Disabled("RUN_IT=true 환경변수로 활성화")
+          @Testcontainers @Disabled("RUN_IT=true 로 활성화")
           public class DemoIT {
-            @Test
-            void smoke() {
-              try (GenericContainer<?> c = new GenericContainer<>("alpine:3.19").withCommand("sleep","1")) {
-                c.start();
-              }
+            @Test void smoke() {
+              try (GenericContainer<?> c = new GenericContainer<>("alpine:3.19").withCommand("sleep","1")) { c.start(); }
             }
           }
           EOF
-          # pom.xml에 junit-jupiter & testcontainers 추가(있으면 덮어씀)
-          sed -i 's#</dependencies>#  <dependency>\n    <groupId>org.junit.jupiter</groupId>\n    <artifactId>junit-jupiter</artifactId>\n    <version>5.10.2</version>\n    <scope>test</scope>\n  </dependency>\n  <dependency>\n    <groupId>org.testcontainers</groupId>\n    <artifactId>junit-jupiter</artifactId>\n    <version>1.19.7</version>\n    <scope>test</scope>\n  </dependency>\n  <dependency>\n    <groupId>org.testcontainers</groupId>\n    <artifactId>testcontainers</artifactId>\n    <version>1.19.7</version>\n    <scope>test</scope>\n  </dependency>\n</dependencies>#' boot-app/pom.xml || true
-          # application.properties
           mkdir -p boot-app/src/main/resources
-          {
-            echo "server.port=8080"
-            echo "management.endpoints.web.exposure.include=*"
-          } >> boot-app/src/main/resources/application.properties
-        continue-on-error: true
+          { echo "server.port=8080"; echo "management.endpoints.web.exposure.include=*"; } >> boot-app/src/main/resources/application.properties
+          # testcontainers deps 주입
+          sed -i 's#</dependencies>#  <dependency>\n    <groupId>org.junit.jupiter</groupId>\n    <artifactId>junit-jupiter</artifactId>\n    <version>5.10.2</version>\n    <scope>test</scope>\n  </dependency>\n  <dependency>\n    <groupId>org.testcontainers</groupId>\n    <artifactId>junit-jupiter</artifactId>\n    <version>1.19.7</version>\n    <scope>test</scope>\n  </dependency>\n  <dependency>\n    <groupId>org.testcontainers</groupId>\n    <artifactId>testcontainers</artifactId>\n    <version>1.19.7</version>\n    <scope>test</scope>\n  </dependency>\n</dependencies>#' boot-app/pom.xml || true
 
-      - name: 🏗️ Build Boot(Maven)
+      # 4) (이 시점에) Maven 캐시 활성화 — 이제 pom.xml 존재
+      - name: ☕ Enable Maven cache (now projects exist)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ matrix.java }}
+          cache: maven
+          cache-dependency-path: |
+            maven-sample/pom.xml
+            boot-app/pom.xml
+
+      - name: 🏗️ Build Boot (Maven)
         working-directory: boot-app
         run: |
-          set -o pipefail
           if [ -x "./mvnw" ]; then ./mvnw -q -T 1C -DskipTests package || true
           else mvn -q -T 1C -DskipTests package || true
           fi
           ls -al target || true
-        continue-on-error: true
 
-      # ── Spring Boot (Gradle) 동시 생성(샘플 비교) ──
-      - name: 🌱 Generate Boot(Gradle) project
+      # 5) Spring Boot (Gradle) 동시 생성/빌드(샘플 비교)
+      - name: 🌱 Generate Boot (Gradle)
         run: |
-          set -o pipefail
-          G="${BOOT_GROUP}"
-          A="${BOOT_ARTIFACT}-gradle"
-          D="${BOOT_DEPS}"
-          J="${{ matrix.java }}"
+          G="${{ env.BOOT_GROUP }}"; A="${{ env.BOOT_ARTIFACT }}-gradle"; D="${{ env.BOOT_DEPS }}"; J="${{ matrix.java }}"
           PKG="${G}.${A//-/.}"
           mkdir -p boot-app-gradle || true
           curl -fsSL -G https://start.spring.io/starter.zip \
@@ -331,46 +304,36 @@ jobs:
             --data-urlencode "packaging=jar" \
             -o boot-app-gradle.zip || true
           unzip -q -o boot-app-gradle.zip -d boot-app-gradle || true
-          # 동일 HelloController
           mkdir -p "boot-app-gradle/src/main/java/${PKG//.//}/controller"
           cat > "boot-app-gradle/src/main/java/${PKG//.//}/controller/HelloController.java" <<EOF
           package ${PKG}.controller;
           import org.springframework.web.bind.annotation.GetMapping;
           import org.springframework.web.bind.annotation.RestController;
           @RestController
-          public class HelloController {
-            @GetMapping("/hello") public String hello(){ return "hello-gradle"; }
-          }
+          public class HelloController { @GetMapping("/hello") public String hello(){ return "hello-gradle"; } }
           EOF
-          # Testcontainers 스텁은 의존만 추가(Gradle)
           sed -i '/dependencies {/a \ \ \ \ testImplementation("org.testcontainers:junit-jupiter:1.19.7")\n\ \ \ \ testImplementation("org.testcontainers:testcontainers:1.19.7")' boot-app-gradle/build.gradle || true
-        continue-on-error: true
 
-      - name: 🏗️ Build Boot(Gradle) (wrapper)
+      - name: 🏗️ Build Boot (Gradle)
         working-directory: boot-app-gradle
         run: |
-          set -o pipefail
           chmod +x ./gradlew || true
           ./gradlew -q -Dorg.gradle.jvmargs="-Xmx1g" -x test build || true
           ls -al build/libs || true
-        continue-on-error: true
 
-      # ── Docker 이미지(멀티스테이지, JDK별 베이스 자동 선택) ──
+      # 6) Docker 이미지(멀티스테이지) 빌드/기동
       - name: 🐳 Setup QEMU/Buildx
         uses: docker/setup-qemu-action@v3
         with:
           platforms: all
-        continue-on-error: true
 
       - uses: docker/setup-buildx-action@v3
         with:
           install: true
-        continue-on-error: true
 
       - name: 🐳 Create Dockerfile (multi-stage, JDK=${{ matrix.java }})
         working-directory: boot-app
         run: |
-          set -o pipefail
           J="${{ matrix.java }}"
           BUILDER="maven:3.9.9-eclipse-temurin-${J}"
           RUNTIME="eclipse-temurin:${J}-jre"
@@ -380,7 +343,6 @@ jobs:
           COPY pom.xml .
           COPY src ./src
           RUN --mount=type=cache,target=/root/.m2 mvn -q -DskipTests package
-
           FROM ${RUNTIME}
           WORKDIR /app
           COPY --from=builder /workspace/target/*.jar /app/app.jar
@@ -388,21 +350,7 @@ jobs:
           USER 1000
           ENTRYPOINT ["java","-jar","/app/app.jar"]
           DOCKER
-          cat > .dockerignore <<'IGNORE'
-          target/
-          .git/
-          .github/
-          **/*.iml
-          **/.DS_Store
-          *.log
-          IGNORE
-          sed -n '1,160p' Dockerfile || true
-        continue-on-error: true
-
-      - name: 🐳 Prepare buildx cache
-        run: |
-          mkdir -p /tmp/.buildx-cache /tmp/.buildx-cache-new || true
-        continue-on-error: true
+          printf "target/\n.git/\n.github/\n**/*.iml\n**/.DS_Store\n*.log\n" > .dockerignore
 
       - name: 🐳 Build image (cached) - tag by JDK
         id: docker_build
@@ -410,16 +358,15 @@ jobs:
         env:
           IMG: ${{ env.BOOT_ARTIFACT }}:local-j${{ matrix.java }}
         run: |
-          set -o pipefail
+          mkdir -p /tmp/.buildx-cache-${{ matrix.java }} /tmp/.buildx-cache-new-${{ matrix.java }} || true
           docker buildx build --load -t "${IMG}" \
-            --cache-from type=local,src=/tmp/.buildx-cache \
-            --cache-to   type=local,dest=/tmp/.buildx-cache-new,mode=max \
+            --cache-from type=local,src=/tmp/.buildx-cache-${{ matrix.java }} \
+            --cache-to   type=local,dest=/tmp/.buildx-cache-new-${{ matrix.java }},mode=max \
             .
-          rm -rf /tmp/.buildx-cache || true
-          mv /tmp/.buildx-cache-new /tmp/.buildx-cache || true
+          rm -rf /tmp/.buildx-cache-${{ matrix.java }} || true
+          mv /tmp/.buildx-cache-new-${{ matrix.java }} /tmp/.buildx-cache-${{ matrix.java }} || true
           echo "image=${IMG}" >> $GITHUB_OUTPUT
           docker images | head -n 20 || true
-        continue-on-error: true
 
       - name: 🐳 Save image tar
         working-directory: ${{ github.workspace }}
@@ -428,7 +375,6 @@ jobs:
         run: |
           mkdir -p artifacts || true
           docker save "${IMG}" -o artifacts/${IMG/:/_}.tar 2>/dev/null || true
-        continue-on-error: true
 
       - name: 🐳 Run container (No-Stop)
         id: docker_run
@@ -437,14 +383,9 @@ jobs:
           BASE: ${{ env.BASE_PORT }}
           J: ${{ matrix.java }}
         run: |
-          set -o pipefail
-          # JDK21는 포트 +1 (충돌 방지)
-          PORT=$BASE
-          if [ "$J" = "21" ]; then PORT=$((BASE+1)); fi
+          PORT=$BASE; [ "$J" = "21" ] && PORT=$((BASE+1))
           NAME="boot-app-${J}-${GITHUB_RUN_ID}"
-          echo "[echo] docker run --name ${NAME} -p ${PORT}:8080 ${IMG}"
-          CID=$(docker run -d --name "${NAME}" -p "${PORT}:8080" "${IMG}" 2>/dev/null || true)
-          echo "container_id=${CID}" >> $GITHUB_OUTPUT
+          docker run -d --name "${NAME}" -p "${PORT}:8080" "${IMG}" 2>/dev/null || true
           echo "container_name=${NAME}" >> $GITHUB_OUTPUT
           echo "PORT=${PORT}" >> $GITHUB_OUTPUT
           for i in $(seq 1 30); do
@@ -454,22 +395,8 @@ jobs:
             echo "[echo] waiting app(${J})... ($i)"
           done
           curl -fsS "http://localhost:${PORT}/hello" || true
-          docker logs --tail 200 "${NAME}" 2>/dev/null || true
-        continue-on-error: true
+          docker logs --tail 120 "${NAME}" 2>/dev/null || true
 
-      # ── Echo 대량 디렉토리/파일 & 권한 ──
-      - name: 🗂️ Echo dirs/files & perms (mass)
-        run: |
-          ROOT="$GITHUB_WORKSPACE/echo-${{ matrix.java }}"
-          mkdir -p "$ROOT"/{logs,bin,tmp,data/{a,b,c},conf,scripts,output} || true
-          for i in $(seq 1 150); do
-            echo "echo-j${{ matrix.java }}-$i $(date -u +%FT%TZ)" > "$ROOT/data/a/file_$i.txt"
-          done
-          chmod -R 777 "$ROOT" || true
-          find "$ROOT" -type f | head -n 50 || true
-        continue-on-error: true
-
-      # ── 아티팩트 업로드(매트릭스별 분리명) ──
       - name: ⬆️ Upload artifacts (per JDK)
         uses: actions/upload-artifact@v4
         with:
@@ -483,33 +410,23 @@ jobs:
             boot-app-gradle/build/libs/*.jar
           if-no-files-found: warn
           retention-days: 7
-        continue-on-error: true
 
-  # ─────────────────────────────────────────────────────────────────────
-  # 2) 릴리즈 자동 생성(아티팩트 첨부)
-  # ─────────────────────────────────────────────────────────────────────
   release:
     needs: [setup_base, build_matrix]
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
-      - name: 🛒 Checkout
-        uses: actions/checkout@v4
-
-      - name: ⬇️ Download all artifacts
+      - name: ⬇️ Download artifacts
         uses: actions/download-artifact@v4
         with:
           path: release_artifacts
-        continue-on-error: true
 
       - name: 🧾 List artifacts
         run: |
-          set -o pipefail
-          echo "== release_artifacts =="
-          find release_artifacts -type f | sed 's/^/- /' || true
-        continue-on-error: true
+          echo "== release_artifacts =="; find release_artifacts -type f | sed 's/^/- /' || true
 
-      - name: 🚀 Create GitHub Release (auto-tag)
+      - name: 🚀 Create GitHub Release (only if files exist)
+        if: ${{ hashFiles('release_artifacts/**/*') != '' }}
         uses: softprops/action-gh-release@v2
         with:
           tag_name: auto-${{ github.run_number }}
@@ -517,7 +434,68 @@ jobs:
           draft: false
           prerelease: true
           files: |
-            release_artifacts/**/*
+            release_artifacts/**/* 
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        continue-on-error: true
+
+  promote_to_prod:
+    # 테스트 산출물을 운영 명명으로 복제/리태깅(tar) + 워크플로우 복제 PR 생성
+    needs: [setup_base, build_matrix]
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: ⬇️ Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: stage_artifacts
+
+      - name: 📦 Promote artifacts → prod (rename/retag tar)
+        run: |
+          mkdir -p prod_artifacts
+          find stage_artifacts -type f -name "*.tar" -print0 | while IFS= read -r -d '' f; do
+            base="$(basename "$f")"
+            prod="${base/local/prod}"
+            cp -f "$f" "prod_artifacts/${prod}"
+          done
+          # JAR도 prod 접미사로 복제
+          find stage_artifacts -type f \( -name "*.jar" -o -name "*.tgz" \) -print0 | while IFS= read -r -d '' f; do
+            cp -f "$f" "prod_artifacts/$(basename "$f")"
+          done
+          echo "== prod_artifacts =="; ls -al prod_artifacts || true
+
+      - name: ⬆️ Upload prod bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: prod-bundles
+          path: prod_artifacts/*
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: 🛒 Checkout (for PR)
+        uses: actions/checkout@v4
+
+      - name: 📝 Create a PROD workflow copy (PR)
+        run: |
+          mkdir -p .github/workflows
+          cat > .github/workflows/test1-prod.yml <<'YML'
+          name: PROD Runner (wrapper)
+          on:
+            workflow_dispatch:
+          jobs:
+            info:
+              runs-on: ubuntu-latest
+              steps:
+                - run: echo "This is a placeholder PROD workflow. It exists as a copy for ops traceability."
+          YML
+
+      - name: 🔁 Open PR for PROD workflow copy
+        uses: peter-evans/create-pull-request@v6
+        with:
+          commit-message: "chore(prod): add prod workflow copy & promote bundles"
+          title: "chore(prod): add prod workflow copy & promote bundles"
+          body: |
+            자동 생성된 PROD 워크플로우 래퍼 및 프로모션 번들 업로드.
+            - test1-prod.yml 추가(운영 추적용)
+            - 아티팩트(prod-bundles) 포함
+          branch: promote/prod-${{ github.run_number }}
+          delete-branch: true
