@@ -88,7 +88,7 @@ jobs:
           docker builder prune -af || true
           df -h
 
-      - name: 🧯 Manual purge: apt cache & logs
+      - name: 🧯 Manual purge:apt cache & logs
         if: ${{ github.event.inputs.purge_apt_cache == 'true' }}
         run: |
           set -Eeuo pipefail
