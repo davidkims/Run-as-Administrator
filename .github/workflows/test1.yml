@@ -1,0 +1,204 @@
+name: Setup SpringBoot and Maven Project (Safe Disk)
+
+on:
+  workflow_dispatch:
+    inputs:
+      clean_android:
+        description: "FreeDisk: Android 제거"
+        required: true
+        default: "false"
+      clean_dotnet:
+        description: "FreeDisk: .NET 제거"
+        required: true
+        default: "false"
+      clean_haskell:
+        description: "FreeDisk: Haskell 제거"
+        required: true
+        default: "false"
+      clean_large_packages:
+        description: "FreeDisk: Large packages 제거"
+        required: true
+        default: "false"
+      clean_docker_images:
+        description: "FreeDisk: Docker images 제거"
+        required: true
+        default: "false"
+      clean_tool_cache:
+        description: "FreeDisk: Tool cache 제거"
+        required: true
+        default: "false"
+      clean_swap_storage:
+        description: "FreeDisk: Swap 제거"
+        required: true
+        default: "false"
+      prune_docker_all:
+        description: "수동: docker system prune -af --volumes"
+        required: true
+        default: "false"
+      purge_apt_cache:
+        description: "수동: apt/로그 정리"
+        required: true
+        default: "false"
+      simulate_low_disk:
+        description: "루프백 2~4GB /mnt/lowdisk 마운트"
+        required: true
+        default: "false"
+
+permissions:
+  contents: write
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 🛒 Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: 📊 Show initial disk/network info
+        run: |
+          set -Eeuo pipefail
+          echo "== df -h =="
+          df -h
+          echo "== docker images (head) =="
+          docker images | head -n 15 || true
+          echo "== ip a (head) =="
+          ip a || true
+
+      # 허용된 입력만 boolean으로 전달 (표현식으로 true/false 변환)
+      - name: 🧹 Free up disk space (action)
+        uses: jlumbroso/free-disk-space@main
+        with:
+          android:        ${{ github.event.inputs.clean_android == 'true' }}
+          dotnet:         ${{ github.event.inputs.clean_dotnet == 'true' }}
+          haskell:        ${{ github.event.inputs.clean_haskell == 'true' }}
+          large-packages: ${{ github.event.inputs.clean_large_packages == 'true' }}
+          docker-images:  ${{ github.event.inputs.clean_docker_images == 'true' }}
+          tool-cache:     ${{ github.event.inputs.clean_tool_cache == 'true' }}
+          swap-storage:   ${{ github.event.inputs.clean_swap_storage == 'true' }}
+
+      - name: 📊 Disk after action cleanup
+        run: df -h
+
+      - name: 🧽 Manual prune:Docker ALL
+        if: ${{ github.event.inputs.prune_docker_all == 'true' }}
+        run: |
+          set -Eeuo pipefail
+          docker system prune -af --volumes || true
+          docker builder prune -af || true
+          df -h
+
+      - name: 🧯 Manual purge: apt cache & logs
+        if: ${{ github.event.inputs.purge_apt_cache == 'true' }}
+        run: |
+          set -Eeuo pipefail
+          sudo apt-get clean
+          sudo rm -rf /var/lib/apt/lists/* || true
+          sudo journalctl --vacuum-time=1s || true
+          sudo find /var/log -type f -name "*.gz" -delete || true
+          sudo find /var/log -type f -name "*.1" -delete || true
+          df -h
+
+      - name: 🧪 (Optional) Simulate low-disk via loopback mount
+        if: ${{ github.event.inputs.simulate_low_disk == 'true' }}
+        id: lowdisk
+        run: |
+          set -Eeuo pipefail
+          MNT="/mnt/lowdisk"
+          IMG="/mnt/tmp-pv.img"
+          sudo mkdir -p "$MNT"
+          AVAIL_GB=$(df --output=avail -BG /mnt | tail -1 | tr -dc '0-9')
+          SIZE_GB=2
+          if [ "$AVAIL_GB" -ge 12 ]; then SIZE_GB=4; fi
+          echo "Creating loopback file of ${SIZE_GB}G at $IMG (Avail=${AVAIL_GB}G)"
+          sudo fallocate -l ${SIZE_GB}G "$IMG" || sudo dd if=/dev/zero of="$IMG" bs=1M count=$((SIZE_GB*1024))
+          sudo mkfs.ext4 -F "$IMG"
+          sudo mount -o loop "$IMG" "$MNT"
+          sudo chmod 777 "$MNT"
+          echo "mounted" > "$MNT/.ok"
+          echo "img=$IMG" >> $GITHUB_OUTPUT
+          echo "mnt=$MNT" >> $GITHUB_OUTPUT
+          df -h "$MNT"
+
+      - name: 🧱 Create Project Directories and Dummy Files
+        run: |
+          set -Eeuo pipefail
+          sudo mkdir -p /opt/project/springboot/{src,logs,temp,server}
+          sudo mkdir -p /opt/project/maven/{src,target,logs}
+          mkdir -p .github/workflows artifacts
+          sudo mkdir -p /opt/disks/{springboot,maven}
+          echo "Spring Boot Server Log" | sudo tee /opt/project/springboot/logs/server.log >/dev/null
+          echo "Maven Project Placeholder" | sudo tee /opt/project/maven/src/Main.java >/dev/null
+          echo "✅ 디렉토리 및 파일 생성 완료" | tee artifacts/summary.log
+
+      - name: ☕ Set up Java (with Maven cache)
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+          cache: 'maven'
+
+      - name: ☕ Ensure Maven CLI
+        run: |
+          set -Eeuo pipefail
+          sudo apt-get update -y
+          sudo apt-get install -y maven
+          mvn -v | tee -a artifacts/summary.log
+
+      - name: 🧪 Generate Maven sample project
+        run: |
+          set -Eeuo pipefail
+          cd /opt/project/maven
+          mvn -q archetype:generate \
+            -DgroupId=com.example \
+            -DartifactId=test-app \
+            -DarchetypeArtifactId=maven-archetype-quickstart \
+            -DinteractiveMode=false
+          echo "✅ Maven 프로젝트 생성 완료" | tee -a $GITHUB_WORKSPACE/artifacts/summary.log
+
+      - name: 🚀 Simulate Spring Boot Server Setup
+        run: |
+          set -Eeuo pipefail
+          echo "🛠️ Spring Boot 서버 설치 중..."
+          echo "Simulated Spring Boot JAR" | sudo tee /opt/project/springboot/server/app.jar >/dev/null
+          ls -al /opt/project/springboot/server | tee -a artifacts/summary.log
+          echo "✅ Spring Boot 서버 설치 및 JAR 생성 완료" | tee -a artifacts/summary.log
+
+      - name: 📦 Archive & Upload Artifacts
+        run: |
+          set -Eeuo pipefail
+          tar -czf artifacts/maven-sample.tgz -C /opt/project/maven test-app || true
+          tar -czf artifacts/springboot-sim.tgz -C /opt/project/springboot server logs || true
+          echo "== df -h ==" >> artifacts/summary.log
+          df -h >> artifacts/summary.log
+
+      - name: ⬆️ Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: setup-result
+          path: artifacts/*
+          if-no-files-found: warn
+          compression-level: 6
+          retention-days: 7
+
+      - name: 📄 Summary Report (console)
+        run: |
+          echo "📄 실행 요약"
+          echo "- Spring Boot: /opt/project/springboot"
+          echo "- Maven: /opt/project/maven"
+          if [[ "${{ steps.lowdisk.outcome || '' }}" == "success" ]]; then
+            echo "- LowDisk mount: ${{ steps.lowdisk.outputs.mnt }}"
+          fi
+          df -h
+
+      - name: 🧽 Post-cleanup (unmount & remove loopback, temp, etc.)
+        if: always()
+        run: |
+          set -Eeuo pipefail
+          if [ -n "${{ steps.lowdisk.outputs.mnt }}" ] && mountpoint -q "${{ steps.lowdisk.outputs.mnt }}"; then
+            sudo umount "${{ steps.lowdisk.outputs.mnt }}"
+          fi
+          if [ -n "${{ steps.lowdisk.outputs.img }}" ] && [ -f "${{ steps.lowdisk.outputs.img }}" ]; then
+            sudo rm -f "${{ steps.lowdisk.outputs.img }}"
+          fi
+          echo "Cleanup done."
