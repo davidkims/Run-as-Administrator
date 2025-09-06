@@ -1,4 +1,4 @@
-name: Test-Server + Spring Boot + Docker (Echo→Create→Build→Run, No-Stop, Expanded)
+name: Test-Server + Spring Boot + Docker (Echo→Create→Build→Run, No-Stop, Final-Fix)
 
 on:
   workflow_dispatch:
@@ -59,8 +59,7 @@ jobs:
         uses: actions/checkout@v4
         continue-on-error: true
 
-      # ── Echo(환경/도커/리소스) ───────────────────────────────────────
-      - name: 🔎 Echo:runner/env/docker/resources
+      - name: 🔎 Echo: runner/env/docker/resources
         run: |
           set -o pipefail
           echo "== Runner =="; uname -a || true
@@ -72,19 +71,16 @@ jobs:
           echo "== Docker info =="; docker info || true
         continue-on-error: true
 
-      # ── 빠른 디스크 예약(대량 작업 대비, fallocate) ─────────────────
-      - name: 📦 Reserve fast disk space (fallocate)
+      - name: 📦 Reserve fast disk space (fallocate 5G)
         run: |
           set -o pipefail
           mkdir -p .github/workflows || true
-          # 5GB 빠른 예약(낮은 비용). 실패해도 넘어감.
           sudo fallocate -l 5G .github/workflows/.reserve_space || true
           sudo chmod 666 .github/workflows/.reserve_space || true
           echo "[echo] reserved: $(du -h .github/workflows/.reserve_space || true)"
           df -h || true
         continue-on-error: true
 
-      # ── numfmt shim (비표준 -4 옵션 무시) ────────────────────────────
       - name: 🛠️ numfmt shim 설치 (-4 옵션 무시)
         run: |
           set -o pipefail
@@ -100,7 +96,6 @@ jobs:
           /usr/local/bin/numfmt -4 --to=iec 1024 || true
         continue-on-error: true
 
-      # ── 디스크 최적화 (허용 입력만; codeql 없음) ─────────────────────
       - name: 🧹 Free up disk space (profiled)
         uses: jlumbroso/free-disk-space@main
         with:
@@ -117,7 +112,6 @@ jobs:
         run: df -h || true
         continue-on-error: true
 
-      # ── 선택: OS 업그레이드 / apt 로그 정리 ─────────────────────────
       - name: ⬆️ Upgrade OS packages (safe)
         if: ${{ inputs.upgrade_os == 'true' }}
         run: |
@@ -140,7 +134,6 @@ jobs:
           df -h || true
         continue-on-error: true
 
-      # ── 고속 저용량 디스크 시뮬(tmpfs/loop) ─────────────────────────
       - name: ⚡ Low-disk simulate (tmpfs/loop/off)
         id: lowdisk
         run: |
@@ -171,7 +164,6 @@ jobs:
           echo "skip=true" >> $GITHUB_OUTPUT
         continue-on-error: true
 
-      # ── Java & Maven ─────────────────────────────────────────────────
       - name: ☕ Set up Java (no cache yet)
         uses: actions/setup-java@v4
         with:
@@ -197,7 +189,6 @@ jobs:
           echo "== mvn -v =="; mvn -v || true
         continue-on-error: true
 
-      # ── Maven Quickstart 생성/패치/빌드 + 에코 ───────────────────────
       - name: 🧪 Generate Maven sample (IN WORKSPACE)
         working-directory: ${{ github.workspace }}
         run: |
@@ -276,8 +267,7 @@ jobs:
           echo "== target =="; ls -al target || true
         continue-on-error: true
 
-      # ── Spring Boot Initializr 생성/보강/빌드 + 에코 ──────────────────
-      - name: 🌱 Generate Spring Boot project (Initializr)
+      - name: 🌱 Generate Spring Boot project (Initializr + HelloController)
         working-directory: ${{ github.workspace }}
         run: |
           set -o pipefail
@@ -299,7 +289,6 @@ jobs:
             --data-urlencode "packaging=jar" \
             -o boot-app.zip || true
           unzip -q -o boot-app.zip -d boot-app || true
-          # 대량 확장 보강: 기본 HelloController & 설정 자동 추가
           mkdir -p "boot-app/src/main/java/${PKG//.//}/controller" || true
           cat > "boot-app/src/main/java/${PKG//.//}/controller/HelloController.java" <<EOF
           package ${PKG}.controller;
@@ -307,8 +296,7 @@ jobs:
           import org.springframework.web.bind.annotation.RestController;
           @RestController
           public class HelloController {
-              @GetMapping("/hello")
-              public String hello() { return "hello"; }
+              @GetMapping("/hello") public String hello() { return "hello"; }
           }
           EOF
           mkdir -p boot-app/src/main/resources || true
@@ -317,7 +305,7 @@ jobs:
             echo "management.endpoints.web.exposure.include=*"
             echo "management.endpoint.health.probes.enabled=true"
           } >> boot-app/src/main/resources/application.properties
-          echo "[echo] Initializr project at: $GITHUB_WORKSPACE/boot-app"
+          echo "[echo] boot-app content:"; ls -la boot-app || true
         continue-on-error: true
 
       - name: 👀 Echo important files (boot-app)
@@ -345,33 +333,31 @@ jobs:
           echo "== target =="; ls -al target || true
         continue-on-error: true
 
-      # ── Docker Buildx + 캐시 빌드(대량 확장), 실행(중지/삭제 없음) ──
+      # ========== 멀티스테이지 Dockerfile 강제 적용(이전 Dockerfile 제거) ==========
       - name: 🐳 Setup Docker Buildx
         uses: docker/setup-buildx-action@v3
         with:
           install: true
         continue-on-error: true
 
-      - name: 🐳 Echo Docker pre-check
-        run: |
-          set -o pipefail
-          echo "== docker images (head) =="; docker images | head -n 20 || true
-          echo "== docker ps (before) =="; docker ps -a || true
-        continue-on-error: true
-
-      - name: 🐳 Create Dockerfile & .dockerignore (boot-app, healthcheck)
+      - name: 🐳 Create Dockerfile & .dockerignore (Multi-stage, Force)
         working-directory: ${{ github.workspace }}/boot-app
         run: |
           set -o pipefail
-          JAR="$(ls -1 target/*.jar 2>/dev/null | head -n1 || true)"
-          echo "[echo] detected JAR: ${JAR:-'(not found yet)'}"
+          rm -f Dockerfile || true
           cat > Dockerfile <<'DOCKER'
+          # ---- Builder stage: build the jar inside container ----
+          FROM maven:3.9.9-eclipse-temurin-17 AS builder
+          WORKDIR /workspace
+          COPY pom.xml .
+          COPY src ./src
+          RUN --mount=type=cache,target=/root/.m2 mvn -q -DskipTests package
+
+          # ---- Runtime stage: slim JRE image ----
           FROM eclipse-temurin:17-jre
           WORKDIR /app
-          ARG JAR_FILE=target/*.jar
-          COPY ${JAR_FILE} app.jar
+          COPY --from=builder /workspace/target/*.jar /app/app.jar
           EXPOSE 8080
-          HEALTHCHECK --interval=10s --timeout=3s --retries=10 CMD wget -qO- http://localhost:8080/actuator/health || exit 1
           USER 1000
           ENTRYPOINT ["java","-jar","/app/app.jar"]
           DOCKER
@@ -385,17 +371,13 @@ jobs:
           IGNORE
           echo "----- Dockerfile -----"; sed -n '1,200p' Dockerfile || true
           echo "----- .dockerignore -----"; sed -n '1,200p' .dockerignore || true
+          echo "[echo] build context preview:"; ls -la || true
         continue-on-error: true
 
-      - name: 🐳 Cache docker build layers
-        uses: actions/cache@v4
-        with:
-          path: |
-            /tmp/.buildx-cache
-            /tmp/.buildx-cache-new
-          key: ${{ runner.os }}-buildx-${{ github.sha }}
-          restore-keys: |
-            ${{ runner.os }}-buildx-
+      - name: 🐳 Prepare buildx cache dirs (no error if missing)
+        run: |
+          set -o pipefail
+          mkdir -p /tmp/.buildx-cache /tmp/.buildx-cache-new || true
         continue-on-error: true
 
       - name: 🐳 Build image with Buildx (cached)
@@ -411,7 +393,6 @@ jobs:
             --cache-from type=local,src=/tmp/.buildx-cache \
             --cache-to   type=local,dest=/tmp/.buildx-cache-new,mode=max \
             .
-          # rotate cache
           rm -rf /tmp/.buildx-cache || true
           mv /tmp/.buildx-cache-new /tmp/.buildx-cache || true
           echo "image=${IMAGE_TAG}" >> $GITHUB_OUTPUT
@@ -432,7 +413,6 @@ jobs:
           echo "container_id=${CID}" >> $GITHUB_OUTPUT
           echo "container_name=${NAME}" >> $GITHUB_OUTPUT
           echo "== docker ps (after run) =="; docker ps -a || true
-          # 간단 가동 확인(헬스/hello). 실패해도 계속.
           for i in $(seq 1 20); do
             sleep 2
             curl -fsS "http://localhost:${HOST_PORT}/actuator/health" && break || true
@@ -444,20 +424,38 @@ jobs:
           echo "== docker logs (tail) =="; docker logs --tail 150 "${NAME}" 2>/dev/null || true
         continue-on-error: true
 
-      # ── 아티팩트(프로젝트/빌드물/도커파일/로그) 압축 & 업로드 ────────
+      # ========== 에코 전용 대량 디렉토리/파일 생성 + 권한 ==========
+      - name: 🗂️ Create ECHO dirs/files & perms (mass)
+        run: |
+          set -o pipefail
+          ROOT="$GITHUB_WORKSPACE/echo"
+          mkdir -p "$ROOT"/{logs,bin,tmp,data/{a,b,c},conf,scripts,output} || true
+          for i in $(seq 1 50); do
+            echo "echo-file-$i $(date -u +%FT%TZ)" > "$ROOT/data/a/file_$i.txt"
+            echo "echo-file-$i $(date -u +%FT%TZ)" > "$ROOT/data/b/file_$i.txt"
+            echo "echo-file-$i $(date -u +%FT%TZ)" > "$ROOT/data/c/file_$i.txt"
+          done
+          for i in $(seq 1 10); do
+            printf '#!/usr/bin/env bash\necho "echo-script-%s"\n' "$i" > "$ROOT/scripts/echo_$i.sh"
+            chmod +x "$ROOT/scripts/echo_$i.sh"
+          done
+          touch "$ROOT/logs/app.log" "$ROOT/logs/build.log" "$ROOT/logs/run.log"
+          echo "ECHO READY" > "$ROOT/output/ready.txt"
+          chmod -R 777 "$ROOT" || true
+          echo "[echo] ECHO tree:"
+          find "$ROOT" -maxdepth 3 -type f | sort | head -n 200 || true
+        continue-on-error: true
+
       - name: 📦 Archive (fast) & Upload Artifacts
         run: |
           set -o pipefail
           mkdir -p "$GITHUB_WORKSPACE/artifacts" || true
-          # JAR
           cp -f "$GITHUB_WORKSPACE/maven-sample/target/"*.jar "$GITHUB_WORKSPACE/artifacts/" 2>/dev/null || true
           cp -f "$GITHUB_WORKSPACE/boot-app/target/"*.jar "$GITHUB_WORKSPACE/artifacts/" 2>/dev/null || true
-          # Docker files
           cp -f "$GITHUB_WORKSPACE/boot-app/Dockerfile" "$GITHUB_WORKSPACE/artifacts/" 2>/dev/null || true
           cp -f "$GITHUB_WORKSPACE/boot-app/.dockerignore" "$GITHUB_WORKSPACE/artifacts/" 2>/dev/null || true
-          # Logs (있으면)
           docker ps -a > "$GITHUB_WORKSPACE/artifacts/docker-ps.txt" 2>/dev/null || true
-          # 전체 폴더 압축
+          tar -czf "$GITHUB_WORKSPACE/artifacts/echo-tree.tgz" -C "$GITHUB_WORKSPACE" echo 2>/dev/null || true
           if [ "${{ inputs.fast_compress }}" = "true" ]; then
             command -v pigz >/dev/null 2>&1 || sudo apt-get install -y pigz || true
             tar --use-compress-program=pigz -cf "$GITHUB_WORKSPACE/artifacts/boot-app.tgz" -C "$GITHUB_WORKSPACE" boot-app 2>/dev/null || true
@@ -477,11 +475,10 @@ jobs:
           retention-days: 7
         continue-on-error: true
 
-      # ── 요약 ────────────────────────────────────────────────────────
       - name: 📄 Summary
         run: |
           set -o pipefail
-          echo "📄 DONE (Echo→Create→Build→Run, No-Stop, Expanded)"
+          echo "📄 DONE (Echo→Create→Build→Run, No-Stop, Multi-Stage Fix)"
           echo "- freedisk_profile: ${{ inputs.freedisk_profile }}"
           echo "- lowdisk_mode: ${{ inputs.lowdisk_mode }}"
           echo "- java_version: ${{ inputs.java_version }}"
@@ -495,14 +492,13 @@ jobs:
           echo "== df -h =="; df -h || true
         continue-on-error: true
 
-      # ── 마운트만 정리(컨테이너 stop/remove는 포함하지 않음) ───────────
       - name: 🧽 Post-cleanup (unmount only; no stop/remove)
         if: always()
         run: |
           set -o pipefail
           MODE="${{ steps.lowdisk.outputs.mode }}"
           if [ "$MODE" = "tmpfs" ] && [ -n "${{ steps.lowdisk.outputs.mnt }}" ]; then sudo umount "${{ steps.lowdisk.outputs.mnt }}" || true; fi
-          if [ "$MODE" = "loop" ]; then
+          if [ "$MODE" = "loop" ] ; then
             if [ -n "${{ steps.lowdisk.outputs.mnt }}" ] && mountpoint -q "${{ steps.lowdisk.outputs.mnt }}"; then sudo umount "${{ steps.lowdisk.outputs.mnt }}" || true; fi
             if [ -n "${{ steps.lowdisk.outputs.img }}" ] && [ -f "${{ steps.lowdisk.outputs.img }}" ]; then sudo rm -f "${{ steps.lowdisk.outputs.img }}" || true; fi
           fi
