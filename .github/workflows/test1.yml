@@ -60,7 +60,7 @@ jobs:
         continue-on-error: true
 
       # ── Echo(환경/도커/리소스) ───────────────────────────────────────
-      - name: 🔎 Echo: runner/env/docker/resources
+      - name: 🔎 Echo:runner/env/docker/resources
         run: |
           set -o pipefail
           echo "== Runner =="; uname -a || true
