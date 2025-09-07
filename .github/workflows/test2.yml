@@ -1,0 +1,376 @@
+name: "🧪 Test Server EchoOps (Build + Run + Restart + Kill Fallback)"
+
+on:
+  workflow_dispatch:
+    inputs:
+      project_dir:
+        description: "프로젝트 루트 (pom.xml 위치)"
+        required: true
+        default: "."
+      app_port:
+        description: "애플리케이션 포트"
+        required: true
+        default: "8080"
+      main_class:
+        description: "메인 클래스 (예: com.example.demo.DemoApplication)"
+        required: true
+        default: "com.example.demo.DemoApplication"
+      image_gen_enabled:
+        description: "Vertex AI 이미지 생성 컨트롤러 추가/빌드 (true/false)"
+        required: true
+        default: "false"
+      gcp_project_id:
+        description: "GCP Project ID (image_gen_enabled=true일 때 필요)"
+        required: false
+        default: ""
+      gcp_location:
+        description: "Vertex AI Region (예: us-central1)"
+        required: false
+        default: "us-central1"
+
+permissions:
+  contents: read
+
+jobs:
+  test-server:
+    runs-on: ubuntu-latest
+    env:
+      APP_PORT: ${{ inputs.app_port }}
+      PROJ_DIR: ${{ inputs.project_dir }}
+      MAIN_CLASS: ${{ inputs.main_class }}
+      IMAGE_GEN_ENABLED: ${{ inputs.image_gen_enabled }}
+      GCP_PROJECT_ID: ${{ inputs.gcp_project_id }}
+      GCP_LOCATION: ${{ inputs.gcp_location }}
+      JAVA_DISTRIBUTION: temurin
+      JAVA_VERSION: "17"
+      ECHO_ROOT: .github/echo_test
+      PID_FILE: .github/echo_test/app.pid
+      LOG_FILE: .github/echo_test/app.log
+      HEALTH_URL: http://127.0.0.1:${{ inputs.app_port }}/actuator/health
+      STARTUP_WAIT: "3"
+
+    steps:
+      - name: "📥 Checkout"
+        uses: actions/checkout@v4
+
+      - name: "☕ Setup Java + Maven Cache"
+        uses: actions/setup-java@v4
+        with:
+          distribution: ${{ env.JAVA_DISTRIBUTION }}
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: "maven"
+
+      - name: "🧰 EchoOps: helpers & folders"
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p "${ECHO_ROOT}"
+          TS(){ date '+%Y-%m-%d %H:%M:%S'; }
+          echoe(){ printf '[%s] [INFO] %s\n' "$(TS)" "$*"; }
+          warn(){ printf '[%s] [WARN] %s\n' "$(TS)" "$*"; }
+          fail(){ printf '[%s] [FAIL] %s\n' "$(TS)" "$*"; exit 1; }
+
+          echoe "Runner: $(uname -a)"
+          echoe "Repo: $GITHUB_REPOSITORY | SHA: $GITHUB_SHA"
+          echoe "ProjectDir: ${PROJ_DIR}"
+          echoe "MAIN_CLASS: ${MAIN_CLASS}"
+          echoe "APP_PORT: ${APP_PORT}"
+
+          # 표준 Maven 디렉토리 생성
+          mkdir -p "${PROJ_DIR}/src/main/java" \
+                   "${PROJ_DIR}/src/main/resources" \
+                   "${PROJ_DIR}/src/test/java" \
+                   "${PROJ_DIR}/src/test/resources"
+
+          # 로그/상태 파일 준비
+          : > "${LOG_FILE}"
+          echo $$ > "${ECHO_ROOT}/runner.pid"
+
+      - name: "🧪 Sanity: pom.xml 존재 여부 확인"
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          TS(){ date '+%Y-%m-%d %H:%M:%S'; }
+          echoe(){ printf '[%s] [INFO] %s\n' "$(TS)" "$*"; }
+
+          if [ ! -f "${PROJ_DIR}/pom.xml" ]; then
+            echoe "pom.xml이 없습니다. 간단한 Spring Boot POM을 생성합니다."
+            cat > "${PROJ_DIR}/pom.xml" <<'POM'
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>com.example</groupId>
+  <artifactId>demo-app</artifactId>
+  <version>0.0.1-SNAPSHOT</version>
+  <name>demo-app</name>
+  <properties>
+    <java.version>17</java.version>
+    <spring-boot.version>3.3.4</spring-boot.version>
+  </properties>
+  <dependencyManagement>
+    <dependencies>
+      <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-dependencies</artifactId>
+        <version>${spring-boot.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
+  <dependencies>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-web</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-actuator</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-devtools</artifactId>
+      <scope>runtime</scope>
+      <optional>true</optional>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-test</artifactId>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-maven-plugin</artifactId>
+        <configuration>
+          <jvmArguments>-Dserver.port=${env.APP_PORT}</jvmArguments>
+        </configuration>
+      </plugin>
+    </plugins>
+  </build>
+</project>
+POM
+          fi
+
+      - name: "🧩 (옵션) Vertex AI 이미지 생성 컨트롤러 & 의존성 주입"
+        if: ${{ env.IMAGE_GEN_ENABLED == 'true' }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          TS(){ date '+%Y-%m-%d %H:%M:%S'; }
+          echoe(){ printf '[%s] [INFO] %s\n' "$(TS)" "$*"; }
+          fail(){ printf '[%s] [FAIL] %s\n' "$(TS)" "$*"; exit 1; }
+
+          [ -n "${GCP_PROJECT_ID}" ] || fail "gcp_project_id 입력이 필요합니다."
+          [ -n "${GCP_LOCATION}" ] || fail "gcp_location 입력이 필요합니다."
+
+          # POM에 Google BOM/vertexai 의존성 추가(중복 방지)
+          if ! grep -q "google-cloud-vertexai" "${PROJ_DIR}/pom.xml"; then
+            echoe "google-cloud-vertexai 의존성 추가"
+            awk '
+              /<\/dependencyManagement>/ && !added_dm {
+                print "    <dependencies>\n      <dependency>\n        <groupId>com.google.cloud</groupId>\n        <artifactId>libraries-bom</artifactId>\n        <version>26.32.0</version>\n        <type>pom</type>\n        <scope>import</scope>\n      </dependency>\n    </dependencies>";
+                added_dm=1
+              }
+              { print }
+            ' "${PROJ_DIR}/pom.xml" > "${PROJ_DIR}/pom.xml.tmp" && mv "${PROJ_DIR}/pom.xml.tmp" "${PROJ_DIR}/pom.xml"
+
+            awk '
+              /<\/dependencies>/ && !added_dep {
+                print "    <dependency>\n      <groupId>com.google.cloud</groupId>\n      <artifactId>google-cloud-vertexai</artifactId>\n    </dependency>";
+                added_dep=1
+              }
+              { print }
+            ' "${PROJ_DIR}/pom.xml" > "${PROJ_DIR}/pom.xml.tmp" && mv "${PROJ_DIR}/pom.xml.tmp" "${PROJ_DIR}/pom.xml"
+          else
+            echoe "vertexai 의존성이 이미 존재합니다."
+          fi
+
+          # 컨트롤러 생성
+          PKG_DIR="${PROJ_DIR}/src/main/java/com/example/demo"
+          mkdir -p "${PKG_DIR}"
+          cat > "${PKG_DIR}/ImageGenerationController.java" <<'JAVA'
+package com.example.demo;
+
+import com.google.cloud.vertexai.VertexAI;
+import com.google.cloud.vertexai.api.GenerateContentResponse;
+import com.google.cloud.vertexai.generativeai.GenerativeModel;
+import com.google.cloud.vertexai.generativeai.ResponseHandler;
+import org.springframework.http.MediaType;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+
+import java.io.IOException;
+import java.util.Base64;
+
+@RestController
+public class ImageGenerationController {
+
+    @GetMapping(value = "/generate-image", produces = MediaType.IMAGE_PNG_VALUE)
+    public ResponseEntity<byte[]> generateImage(
+            @RequestParam(defaultValue = "A painting of a cat sitting on a windowsill looking at the moon")
+            String prompt) throws IOException {
+
+        String projectId = System.getenv("GOOGLE_CLOUD_PROJECT_ID");
+        String location  = System.getenv("GOOGLE_CLOUD_LOCATION");
+        if (projectId == null || projectId.isBlank()) {
+            projectId = "${GCP_PROJECT_ID}";
+        }
+        if (location == null || location.isBlank()) {
+            location = "${GCP_LOCATION}";
+        }
+        String modelName = "imagegeneration@006";
+
+        try (VertexAI vertexAI = new VertexAI(projectId, location)) {
+            GenerativeModel model = new GenerativeModel(modelName, vertexAI);
+            GenerateContentResponse response = model.generateContent(prompt);
+
+            // 이미지 파트(Base64 인라인 데이터) 추출
+            String b64 = ResponseHandler.getContent(response)
+                                        .getParts(0)
+                                        .getInlineData()
+                                        .getData()
+                                        .toStringUtf8();
+
+            byte[] imageBytes = Base64.getDecoder().decode(b64);
+            return ResponseEntity.ok()
+                    .contentType(MediaType.IMAGE_PNG)
+                    .body(imageBytes);
+        }
+    }
+}
+JAVA
+
+          echoe "컨트롤러 생성 완료: ${PKG_DIR}/ImageGenerationController.java"
+          echoe "주의: GCP 인증은 런타임 환경변수/자격 필요(GOOGLE_APPLICATION_CREDENTIALS 등)"
+
+      - name: "🧱 Build (mvn clean package -DskipTests)"
+        shell: bash
+        working-directory: ${{ env.PROJ_DIR }}
+        run: |
+          set -Eeuo pipefail
+          TS(){ date '+%Y-%m-%d %H:%M:%S'; }
+          echoe(){ printf '[%s] [INFO] %s\n' "$(TS)" "$*"; }
+
+          echoe "Maven Build 시작"
+          mvn -B -ntp -DskipTests clean package
+          echoe "JAR 산출물 확인"
+          ls -l target/*.jar || (echo "JAR 미생성" && exit 1)
+
+      - name: "🚀 Start app (background) & write PID"
+        shell: bash
+        working-directory: ${{ env.PROJ_DIR }}
+        run: |
+          set -Eeuo pipefail
+          TS(){ date '+%Y-%m-%d %H:%M:%S'; }
+          echoe(){ printf '[%s] [INFO] %s\n' "$(TS)" "$*"; }
+          warn(){ printf '[%s] [WARN] %s\n' "$(TS)" "$*"; }
+
+          JAR="$(ls target/*.jar | head -n1)"
+          echoe "실행 JAR: $JAR"
+          # 기존 프로세스 정리
+          if [ -f "${PID_FILE}" ] && ps -p "$(cat ${PID_FILE})" > /dev/null 2>&1; then
+            warn "기존 프로세스 감지 → 종료 시도"
+            kill "$(cat ${PID_FILE})" || true
+            sleep 2
+          fi
+
+          # 실행
+          nohup java -jar "$JAR" --server.port="${APP_PORT}" > "${LOG_FILE}" 2>&1 &
+          NEW_PID=$!
+          echo "${NEW_PID}" > "${PID_FILE}"
+          echoe "실행 PID: ${NEW_PID} | 로그: ${LOG_FILE}"
+
+          # 1차 대기
+          sleep "${STARTUP_WAIT}"
+
+      - name: "🩺 Health Check (actuator 우선, 실패 시 루트)"
+        shell: bash
+        run: |
+          set +e
+          TS(){ date '+%Y-%m-%d %H:%M:%S'; }
+          echoe(){ printf '[%s] [INFO] %s\n' "$(TS)" "$*"; }
+          warn(){ printf '[%s] [WARN] %s\n' "$(TS)" "$*"; }
+
+          HEALTH_OK=0
+          if curl -fsS "${HEALTH_URL}" | grep -q '"status":"UP"'; then
+            echoe "Actuator OK"
+            HEALTH_OK=1
+          else
+            warn "Actuator 실패, 루트(/) 시도"
+            curl -fsS "http://127.0.0.1:${APP_PORT}/" >/dev/null && HEALTH_OK=1 || true
+          fi
+
+          if [ "${HEALTH_OK}" -eq 1 ]; then
+            echoe "애플리케이션 가동 정상"
+            exit 0
+          else
+            echoe "애플리케이션 비정상 → 재기동 루틴 진입"
+            exit 1
+          fi
+
+      - name: "🔁 재기동 루틴: stop → start → sleep 3 → (여전히 비정상 시) kill"
+        if: failure()   # 바로 앞 Health Check 실패 시 실행
+        shell: bash
+        working-directory: ${{ env.PROJ_DIR }}
+        run: |
+          set -Eeuo pipefail
+          TS(){ date '+%Y-%m-%d %H:%M:%S'; }
+          echoe(){ printf '[%s] [INFO] %s\n' "$(TS)" "$*"; }
+          warn(){ printf '[%s] [WARN] %s\n' "$(TS)" "$*"; }
+
+          stop_if_running(){
+            if [ -f "${PID_FILE}" ]; then
+              OLD_PID="$(cat ${PID_FILE})"
+              if ps -p "${OLD_PID}" > /dev/null 2>&1; then
+                echoe "기존 PID ${OLD_PID} 종료"
+                kill "${OLD_PID}" || true
+                sleep 2
+              fi
+            fi
+          }
+
+          start_app(){
+            JAR="$(ls target/*.jar | head -n1)"
+            echoe "재기동: $JAR"
+            nohup java -jar "$JAR" --server.port="${APP_PORT}" > "${LOG_FILE}" 2>&1 &
+            echo $! > "${PID_FILE}"
+            echoe "재기동 PID: $(cat ${PID_FILE})"
+          }
+
+          # 1) stop
+          stop_if_running
+
+          # 2) start
+          start_app
+
+          # 3) sleep 3
+          sleep 3
+
+          # 4) 건강 재확인 (실패 시 kill)
+          if curl -fsS "${HEALTH_URL}" | grep -q '"status":"UP"'; then
+            echoe "재기동 후 Actuator OK"
+            exit 0
+          else
+            warn "재기동 후에도 비정상 → 강제 종료"
+            if [ -f "${PID_FILE}" ]; then
+              KPID="$(cat ${PID_FILE})"
+              kill -9 "${KPID}" || true
+              echoe "kill -9 ${KPID} 수행"
+            fi
+            exit 1
+          fi
+
+      - name: "🧾 Log & Artifact"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-server-logs-and-jar
+          path: |
+            ${{ env.LOG_FILE }}
+            ${{ env.PROJ_DIR }}/target/*.jar
+            ${{ env.PID_FILE }}
+          if-no-files-found: "warn"
