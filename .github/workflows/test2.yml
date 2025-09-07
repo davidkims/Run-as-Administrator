@@ -43,7 +43,7 @@ jobs:
       LOG_DIR: dist/logs
       META_DIR: dist/meta
       SEED_DIR: dist/seed
-      WORK_DIR: dist/work  # base ISO 추출/커스텀 작업
+      WORK_DIR: dist/work
       GHCR_BASE: ghcr.io/${{ github.repository }}/image-suite
 
     steps:
@@ -137,7 +137,6 @@ jobs:
           }
 
           # 리스트 파일에서 해당 파일 라인만 뽑아 표준 형식으로 정규화하여 검증
-          #  - Ubuntu SHA256SUMS는 "*FILENAME" 형식이므로 이를 "HASH  FILENAME"로 변환
           verify_sum(){
             local fpath="$1"      # full path to target file
             local stype="$2"      # sha256|sha512
@@ -146,7 +145,6 @@ jobs:
             dir="$(dirname "$fpath")"; base="$(basename "$fpath")"
             if [[ -n "$list_path" && -f "$list_path" ]]; then
               tmp="$dir/.sumline.$$.$stype"
-              # awk: 두 번째 필드가 FILENAME 이거나 "*FILENAME" 인 라인만 추출 후 표준 포맷으로 재구성
               awk -v f="$base" '{ fn=$2; sub(/^\*/, "", fn); if (fn==f) print $1 "  " f }' "$list_path" > "$tmp"
               if [[ ! -s "$tmp" ]]; then
                 echoe "WARN: checksum entry for $base not found in $(basename "$list_path"); computing local hash only"
@@ -155,11 +153,8 @@ jobs:
                 else ( cd "$dir" && sha256sum "$base" | tee "${base}.sha256.txt" ); fi
                 return
               fi
-              if [[ "$stype" = "sha512" ]]; then
-                ( cd "$dir" && sha512sum -c "$(basename "$tmp")" )
-              else
-                ( cd "$dir" && sha256sum -c "$(basename "$tmp")" )
-              fi
+              if [[ "$stype" = "sha512" ]]; then ( cd "$dir" && sha512sum -c "$(basename "$tmp")" )
+              else ( cd "$dir" && sha256sum -c "$(basename "$tmp")" ); fi
               rm -f "$tmp"
             else
               echoe "WARN: checksum list not found; computing local $stype only"
@@ -192,8 +187,10 @@ jobs:
                   echoe "WARN: debian-archive-keyring missing"
                 fi
                 ;;
-              *) echoe "GPG verify skipped for $distro";;
-            </
+              *)
+                echoe "GPG verify skipped for $distro"
+                ;;
+            esac
           }
           EOS
           chmod +x "$ECHO_ROOT/echo_tools.sh"
@@ -331,7 +328,7 @@ jobs:
           d-i pkgsel/include string vim curl
           PS
 
-          # Cloud-Init 전용 ISO(CIDATA)도 유지
+          # Cloud-Init 전용 ISO(CIDATA)
           CIDATA="$ISO_DIR/seed-cidata.iso"
           if command -v mkisofs >/dev/null 2>&1; then
             mkisofs -V CIDATA -J -R -o "$CIDATA" "$SEED_DIR/cloud-init"
@@ -357,34 +354,23 @@ jobs:
 
           WORK="$WORK_DIR/root"
           rm -rf "$WORK"; mkdir -p "$WORK"
-          # ISO 전체 추출
           xorriso -osirrox on -indev "$BASE_ISO" -extract / "$WORK"
 
-          # 배포판별 자동 설치 파라미터 주입
           case "$D" in
             ubuntu)
-              # Subiquity: nocloud seed 포함 및 autoinstall 파라미터
               mkdir -p "$WORK/nocloud"
               cp "$SEED_DIR/cloud-init/user-data" "$WORK/nocloud/user-data"
               cp "$SEED_DIR/cloud-init/meta-data" "$WORK/nocloud/meta-data"
-              # isolinux
-              if [ -f "$WORK/isolinux/txt.cfg" ]; then
-                sed -i 's,^\(\s*append .*\)$,\1 autoinstall ds=nocloud;s=/cdrom/nocloud/,' "$WORK/isolinux/txt.cfg" || true
-              fi
-              # GRUB (UEFI)
-              if [ -f "$WORK/boot/grub/grub.cfg" ]; then
-                sed -i 's,^\(\s*linux\s\+\S\+\s\+\S\+.*\)$,\1 autoinstall ds=nocloud;s=/cdrom/nocloud/,' "$WORK/boot/grub/grub.cfg" || true
-              fi
+              [ -f "$WORK/isolinux/txt.cfg" ] && sed -i 's,^\(\s*append .*\)$,\1 autoinstall ds=nocloud;s=/cdrom/nocloud/,' "$WORK/isolinux/txt.cfg" || true
+              [ -f "$WORK/boot/grub/grub.cfg" ] && sed -i 's,^\(\s*linux\s\+\S\+\s\+\S\+.*\)$,\1 autoinstall ds=nocloud;s=/cdrom/nocloud/,' "$WORK/boot/grub/grub.cfg" || true
               ;;
             debian)
-              # Preseed 포함 및 커널 파라미터 주입
               mkdir -p "$WORK/preseed"
               cp "$SEED_DIR/preseed/preseed.cfg" "$WORK/preseed/preseed.cfg"
               [ -f "$WORK/isolinux/txt.cfg" ] && sed -i 's,^\(\s*append .*\)$,\1 auto=true priority=critical file=/cdrom/preseed/preseed.cfg,' "$WORK/isolinux/txt.cfg" || true
               [ -f "$WORK/boot/grub/grub.cfg" ] && sed -i 's,^\(\s*linux\s\+\S\+\s\+\S\+.*\)$,\1 auto=true priority=critical file=/cdrom/preseed/preseed.cfg,' "$WORK/boot/grub/grub.cfg" || true
               ;;
             rocky|alma|rhel)
-              # Kickstart 포함 및 파라미터
               cp "$SEED_DIR/kickstart/ks.cfg" "$WORK/ks.cfg"
               [ -f "$WORK/isolinux/isolinux.cfg" ] && sed -i 's,^\(\s*append .*\)$,\1 inst.ks=cdrom:/ks.cfg,' "$WORK/isolinux/isolinux.cfg" || true
               [ -f "$WORK/EFI/BOOT/grub.cfg" ] && sed -i 's,^\(\s*linuxefi\s\+\S\+\s\+.*\)$,\1 inst.ks=cdrom:/ks.cfg,' "$WORK/EFI/BOOT/grub.cfg" || true
@@ -392,10 +378,8 @@ jobs:
               ;;
           esac
 
-          # 하이브리드 ISO 다시 만들기 (UEFI + BIOS)
           OUT="$ISO_DIR/custom_installer_${D}.iso"
           LABEL="ECHO_INST_${D}_$(date -u +%Y%m%d)"
-          # EFI 이미지 존재 시 감지
           EFI_IMG=""
           [ -f "$WORK/boot/grub/efi.img" ] && EFI_IMG="boot/grub/efi.img"
           [ -z "$EFI_IMG" ] && [ -f "$WORK/efi.img" ] && EFI_IMG="efi.img"
