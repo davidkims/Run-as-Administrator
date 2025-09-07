@@ -1,108 +1,79 @@
-name: "🐧 Linux & RHEL Image Suite (Dirs + ISO + Download + QCOW2 + Release)"
+name: "🐧 Linux/RHEL Image Suite (Dirs+ISO Download/Create+QCOW2+Release)"
 
 on:
   workflow_dispatch:
     inputs:
       distro:
-        description: "타겟 계열 (linux=우분투/데비안, rhel=레드햇/로키/알마)"
+        description: "배포판 선택 (ubuntu|debian|rocky|alma|rhel)"
         type: choice
         required: true
-        default: "linux"
-        options:
-          - "linux"
-          - "rhel"
+        default: "ubuntu"
+        options: [ "ubuntu", "debian", "rocky", "alma", "rhel" ]
+
       generate_dirs:
         description: "대량 디렉토리/파일 생성"
         type: boolean
         default: true
+
       dir_spec:
-        description: "생성 규칙 예: linux:100,rhel:100 (콤마 구분, 각 prefix별 개수)"
+        description: "생성 규칙 (예: linux:100,rhel:100)"
         required: false
         default: "linux:100,rhel:100"
-      create_iso:
-        description: "작업물로 ISO 생성"
+
+      download_base_iso:
+        description: "공식 ISO 자동 다운로드(배포판별 기본 URL 사용)"
         type: boolean
         default: true
-      iso_label:
-        description: "ISO 라벨"
-        required: false
-        default: "ECHO_LINUX_RHEL"
-      base_iso_url:
-        description: "기존 ISO 다운로드 URL(선택, RHEL은 사용자 계정/권한 필요)"
+
+      base_iso_custom_url:
+        description: "커스텀 ISO URL (선택). 값이 있으면 이 주소로 다운로드"
         required: false
         default: ""
-      create_qcow2:
-        description: "QCOW2 디스크 이미지 및 스냅샷 생성"
+
+      create_iso:
+        description: "작업물로 커스텀 ISO 생성"
         type: boolean
         default: true
+
+      create_qcow2:
+        description: "QCOW2 베이스/스냅샷 생성"
+        type: boolean
+        default: true
+
       qcow_size_gb:
         description: "QCOW2 사이즈(GB)"
         required: false
         default: "8"
+
       create_release:
         description: "GitHub Release 발행"
         type: boolean
         default: false
-      release_tag:
-        description: "Release 태그(예: auto-1)"
-        required: false
-        default: "auto-1"
 
-  # 다른 워크플로우에서 호출 가능 (호출 기능)
-  workflow_call:
-    inputs:
-      distro:
-        type: string
-        required: true
-      generate_dirs:
-        type: boolean
-        required: false
-        default: true
-      dir_spec:
-        type: string
-        required: false
-        default: "linux:100,rhel:100"
-      create_iso:
-        type: boolean
-        required: false
-        default: true
-      iso_label:
-        type: string
-        required: false
-        default: "ECHO_LINUX_RHEL"
-      base_iso_url:
-        type: string
+      release_tag:
+        description: "Release 태그(비우면 auto-{run_id})"
         required: false
         default: ""
-      create_qcow2:
-        type: boolean
-        required: false
-        default: true
-      qcow_size_gb:
-        type: string
-        required: false
-        default: "8"
-      create_release:
-        type: boolean
-        required: false
-        default: false
-      release_tag:
-        type: string
-        required: false
-        default: "auto-1"
+
+  workflow_call:
+    inputs:
+      distro: { type: string, required: true }
+      generate_dirs: { type: boolean, default: true }
+      dir_spec: { type: string, default: "linux:100,rhel:100" }
+      download_base_iso: { type: boolean, default: true }
+      base_iso_custom_url: { type: string, default: "" }
+      create_iso: { type: boolean, default: true }
+      create_qcow2: { type: boolean, default: true }
+      qcow_size_gb: { type: string, default: "8" }
+      create_release: { type: boolean, default: false }
+      release_tag: { type: string, default: "" }
     outputs:
-      iso_path:
-        description: "생성된 ISO 경로"
-        value: ${{ jobs.image-suite.outputs.iso_path }}
-      qcow2_base:
-        description: "생성된 QCOW2 베이스 경로"
-        value: ${{ jobs.image-suite.outputs.qcow2_base }}
-      qcow2_snap:
-        description: "생성된 QCOW2 스냅샷 경로"
-        value: ${{ jobs.image-suite.outputs.qcow2_snap }}
+      iso_path: { description: "생성된 커스텀 ISO 경로", value: ${{ jobs.image-suite.outputs.iso_path }} }
+      qcow2_base: { description: "QCOW2 베이스 경로", value: ${{ jobs.image-suite.outputs.qcow2_base }} }
+      qcow2_snap: { description: "QCOW2 스냅샷 경로", value: ${{ jobs.image-suite.outputs.qcow2_snap }} }
 
 permissions:
-  contents: write  # Release 업로드 위해 write
+  contents: write
 
 concurrency:
   group: linux-rhel-image-suite-${{ github.ref }}
@@ -110,7 +81,7 @@ concurrency:
 
 jobs:
   image-suite:
-    name: "Build/Pack (Dirs+ISO+QCOW2+Artifacts)"
+    name: "Build/Pack (Dirs + ISO DL/Create + QCOW2 + Artifacts)"
     runs-on: ubuntu-latest
     outputs:
       iso_path: ${{ steps.set-outputs.outputs.iso_path }}
@@ -123,6 +94,7 @@ jobs:
       IMG_DIR: dist/images
       LOG_DIR: dist/logs
       META_DIR: dist/meta
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -148,29 +120,16 @@ jobs:
             local cmd="$1"
             if ! command -v "$cmd" >/dev/null 2>&1; then
               echoe "installing: $cmd"
-              if [ -f /etc/debian_version ] || grep -qi 'ubuntu' /etc/os-release 2>/dev/null; then
-                sudo apt-get update -y
-                case "$cmd" in
-                  mkisofs) sudo apt-get install -y genisoimage ;;
-                  xorriso) sudo apt-get install -y xorriso ;;
-                  qemu-img) sudo apt-get install -y qemu-utils ;;
-                  curl|xz-utils|coreutils|jq|sha256sum) sudo apt-get install -y curl xz-utils coreutils jq ;;
-                  *) sudo apt-get install -y "$cmd" || true ;;
-                esac
-              elif [ -f /etc/redhat-release ] || grep -qi 'rocky\|alma\|rhel' /etc/os-release 2>/dev/null; then
-                # RHEL 계열 (self-hosted에서 동작). 권한/리포지토리 필요.
-                if command -v dnf >/dev/null 2>&1; then
-                  sudo dnf install -y "$cmd" || true
-                  [[ "$cmd" == "mkisofs" ]] && sudo dnf install -y genisoimage || true
-                  [[ "$cmd" == "qemu-img" ]] && sudo dnf install -y qemu-img || true
-                else
-                  sudo yum install -y "$cmd" || true
-                  [[ "$cmd" == "mkisofs" ]] && sudo yum install -y genisoimage || true
-                  [[ "$cmd" == "qemu-img" ]] && sudo yum install -y qemu-img || true
-                fi
-              else
-                echoe "WARN: unknown distro, skip installing $cmd"
-              fi
+              sudo apt-get update -y
+              case "$cmd" in
+                mkisofs) sudo apt-get install -y genisoimage ;;
+                xorriso) sudo apt-get install -y xorriso ;;
+                qemu-img) sudo apt-get install -y qemu-utils ;;
+                curl|jq) sudo apt-get install -y curl jq ;;
+                sha256sum|sha512sum) sudo apt-get install -y coreutils ;;
+                file) sudo apt-get install -y file ;;
+                *) sudo apt-get install -y "$cmd" || true ;;
+              esac
             fi
           }
           parse_dir_spec(){
@@ -178,14 +137,85 @@ jobs:
             : > "$out"
             IFS=',' read -ra items <<< "$spec"
             for it in "${items[@]}"; do
-              name="${it%%:*}"; cnt="${it##*:}"
+              local name="${it%%:*}"; local cnt="${it##*:}"
               [[ -z "$name" || -z "$cnt" ]] && continue
               printf '%s %s\n' "$name" "$cnt" >> "$out"
             done
           }
+          set_official_iso_vars(){
+            # 입력: $1=distro (ubuntu|debian|rocky|alma|rhel)
+            # 출력: ISO_URL, SUM_URL(선택), SUM_TYPE(sha256|sha512), FILE_NAME
+            local d="$1"
+            case "$d" in
+              ubuntu)
+                ISO_URL="https://releases.ubuntu.com/noble/ubuntu-24.04.3-live-server-amd64.iso"
+                FILE_NAME="ubuntu-24.04.3-live-server-amd64.iso"
+                SUM_TYPE="sha256"
+                # Canonical 공식 SHA256 (Ubuntu 24.04.3 Server)
+                SUM_EXPECTED="c3514bf0056180d09376462a7a1b4f213c1d6e8ea67fae5c25099c6fd3d8274b"
+                ;;
+              debian)
+                ISO_URL="https://cdimage.debian.org/debian-cd/current/amd64/iso-cd/debian-13.1.0-amd64-netinst.iso"
+                FILE_NAME="debian-13.1.0-amd64-netinst.iso"
+                SUM_TYPE="sha512"
+                SUM_URL="https://cdimage.debian.org/debian-cd/current/amd64/iso-cd/SHA512SUMS"
+                ;;
+              rocky)
+                ISO_URL="https://download.rockylinux.org/pub/rocky/9/isos/x86_64/Rocky-x86_64-minimal.iso"
+                FILE_NAME="Rocky-x86_64-minimal.iso"
+                SUM_TYPE="sha256"
+                SUM_URL="https://download.rockylinux.org/pub/rocky/9/isos/x86_64/Rocky-x86_64-minimal.iso.CHECKSUM"
+                ;;
+              alma)
+                ISO_URL="https://repo.almalinux.org/almalinux/9/isos/x86_64/AlmaLinux-9-latest-x86_64-minimal.iso"
+                FILE_NAME="AlmaLinux-9-latest-x86_64-minimal.iso"
+                SUM_TYPE="sha256"
+                SUM_URL="https://repo.almalinux.org/almalinux/9/isos/x86_64/CHECKSUM"
+                ;;
+              rhel)
+                # RHEL은 인증 필요. 커스텀 URL이 없으면 AlmaLinux로 폴백.
+                ISO_URL=""
+                FILE_NAME=""
+                ;;
+              *)
+                ISO_URL=""
+                FILE_NAME=""
+                ;;
+            esac
+          }
+          verify_sum(){
+            local fpath="$1"
+            local stype="$2"   # sha256|sha512
+            local expected="$3"
+            local sum_url="$4"
+
+            if [[ -n "$expected" ]]; then
+              echoe "Verifying ($stype) with embedded expected hash"
+              if [[ "$stype" = "sha512" ]]; then
+                echo "${expected}  $(basename "$fpath")" | sha512sum -c -
+              else
+                echo "${expected}  $(basename "$fpath")" | sha256sum -c -
+              fi
+              return
+            fi
+
+            if [[ -n "$sum_url" ]]; then
+              echoe "Fetching checksum list: $sum_url"
+              curl -fsSL "$sum_url" -o "$fpath.$stype.list" || { echoe "WARN: checksum fetch failed"; return; }
+              if [[ "$stype" = "sha512" ]]; then
+                grep "  $(basename "$fpath")\$" "$fpath.$stype.list" | sha512sum -c - || echoe "WARN: checksum mismatch or entry not found"
+              else
+                grep "  $(basename "$fpath")\$" "$fpath.$stype.list" | sha256sum -c - || echoe "WARN: checksum mismatch or entry not found"
+              fi
+            else
+              echoe "No checksum source provided; computing local hash only"
+              if [[ "$stype" = "sha512" ]]; then sha512sum "$fpath" | tee "$fpath.sha512.txt"
+              else sha256sum "$fpath" | tee "$fpath.sha256.txt"
+              fi
+            fi
+          }
           EOS
           chmod +x "$ECHO_ROOT/echo_tools.sh"
-          echo "ok=1" >> "$GITHUB_OUTPUT"
 
       - name: Generate bulk directories/files (optional)
         if: inputs.generate_dirs == true || github.event.inputs.generate_dirs == 'true'
@@ -193,10 +223,8 @@ jobs:
         run: |
           set -Eeuo pipefail
           source "$ECHO_ROOT/echo_tools.sh"
-          echoe "DIR_SPEC=${{ inputs.dir_spec || github.event.inputs.dir_spec }}"
           SPEC_FILE="$META_DIR/dir_spec.txt"
           parse_dir_spec "${{ inputs.dir_spec || github.event.inputs.dir_spec }}" "$SPEC_FILE"
-
           while read -r PREFIX COUNT; do
             echoe "Generating prefix=$PREFIX count=$COUNT"
             BASE="$ECHO_ROOT/$PREFIX/bulk"
@@ -207,40 +235,52 @@ jobs:
               printf '{"prefix":"%s","index":%d,"ts":"%s"}\n' "$PREFIX" "$i" "$(date -u +'%F %T')" > "$D/meta.json"
             done
           done < "$SPEC_FILE"
-
           tar -C "$ECHO_ROOT" -cf "$DIST_DIR/echo_bulk.tar" .
           echoe "Bulk generated -> $DIST_DIR/echo_bulk.tar"
 
-      - name: (optional) Download base ISO
-        if: ${{ (inputs.base_iso_url != '' && inputs.base_iso_url != null) || (github.event.inputs.base_iso_url != '' && github.event.inputs.base_iso_url != null) }}
+      - name: Download official base ISO (auto/custom)
+        if: inputs.download_base_iso == true || github.event.inputs.download_base_iso == 'true'
         shell: bash
         run: |
           set -Eeuo pipefail
           source "$ECHO_ROOT/echo_tools.sh"
-          ensure_cmd curl
-          URL="${{ inputs.base_iso_url || github.event.inputs.base_iso_url }}"
-          OUT="$ISO_DIR/base.iso"
-          echoe "Downloading base ISO: $URL"
-          curl -fL "$URL" -o "$OUT"
-          sha256sum "$OUT" | tee "$META_DIR/base_iso.sha256.txt"
-          file "$OUT" | tee "$META_DIR/base_iso.file.txt"
-          echoe "Base ISO saved -> $OUT"
+          ensure_cmd curl; ensure_cmd sha256sum; ensure_cmd sha512sum; ensure_cmd file
+          D="${{ inputs.distro || github.event.inputs.distro }}"
+          URL_CUSTOM="${{ inputs.base_iso_custom_url || github.event.inputs.base_iso_custom_url }}"
+          set_official_iso_vars "$D"
 
-      - name: Create ISO (optional)
+          if [[ -n "$URL_CUSTOM" ]]; then
+            ISO_URL="$URL_CUSTOM"
+            FILE_NAME="$(basename "$URL_CUSTOM")"
+            SUM_TYPE="sha256"
+            echoe "Using custom ISO URL: $ISO_URL"
+          elif [[ "$D" = "rhel" && -z "$ISO_URL" ]]; then
+            echoe "RHEL requires authenticated download; falling back to AlmaLinux official minimal ISO"
+            set_official_iso_vars "alma"
+          fi
+
+          [[ -z "$ISO_URL" ]] && fail "No ISO URL resolved"
+          OUT="$ISO_DIR/$FILE_NAME"
+          echoe "Downloading: $ISO_URL"
+          curl -fL "$ISO_URL" -o "$OUT"
+          file "$OUT" | tee "$META_DIR/base_iso.file.txt"
+
+          # Ubuntu: 임베디드 해시 검증(24.04.3), Debian/Rocky/Alma: 목록 기반 검증
+          verify_sum "$OUT" "${SUM_TYPE:-sha256}" "${SUM_EXPECTED:-}" "${SUM_URL:-}"
+
+      - name: Create custom ISO (optional)
         if: inputs.create_iso == true || github.event.inputs.create_iso == 'true'
         shell: bash
         run: |
           set -Eeuo pipefail
           source "$ECHO_ROOT/echo_tools.sh"
-          # Try mkisofs, fallback xorriso
           if ! command -v mkisofs >/dev/null 2>&1; then ensure_cmd mkisofs || true; fi
-          if ! command -v mkisofs >/dev/null 2>&1 && ! command -v xorriso >/dev/null 2>&1; then
-            ensure_cmd xorriso
-          fi
+          if ! command -v mkisofs >/dev/null 2>&1 && ! command -v xorriso >/dev/null 2>&1; then ensure_cmd xorriso; fi
 
           SRC="$ECHO_ROOT"
+          LABEL="ECHO_${{ inputs.distro || github.event.inputs.distro }}_$(date -u +%Y%m%d)"
           ISO_OUT="$ISO_DIR/custom_${{ inputs.distro || github.event.inputs.distro }}.iso"
-          LABEL="${{ inputs.iso_label || github.event.inputs.iso_label }}"
+
           if command -v mkisofs >/dev/null 2>&1; then
             mkisofs -V "$LABEL" -J -R -o "$ISO_OUT" "$SRC" 2>&1 | tee "$LOG_DIR/mkisofs.log"
           else
@@ -249,7 +289,7 @@ jobs:
           sha256sum "$ISO_OUT" | tee "$META_DIR/custom_iso.sha256.txt"
           printf '{"label":"%s","path":"%s","ts":"%s"}\n' "$LABEL" "$ISO_OUT" "$(date -u +'%F %T')" > "$META_DIR/custom_iso.json"
 
-      - name: Create QCOW2 & snapshot (optional)
+      - name: Create QCOW2 & snapshot (fixed backing path)
         if: inputs.create_qcow2 == true || github.event.inputs.create_qcow2 == 'true'
         shell: bash
         run: |
@@ -257,15 +297,22 @@ jobs:
           source "$ECHO_ROOT/echo_tools.sh"
           ensure_cmd qemu-img
           SIZE_GB="${{ inputs.qcow_size_gb || github.event.inputs.qcow_size_gb }}"
-          BASE="$IMG_DIR/base_${{ inputs.distro || github.event.inputs.distro }}.qcow2"
-          SNAP="$IMG_DIR/snap_${{ inputs.distro || github.event.inputs.distro }}.qcow2"
+          DISTRO="${{ inputs.distro || github.event.inputs.distro }}"
 
-          qemu-img create -f qcow2 "$BASE" "${SIZE_GB}G"
+          mkdir -p "$IMG_DIR"
+          cd "$IMG_DIR"
+          BASE="base_${DISTRO}.qcow2"
+          SNAP="snap_${DISTRO}.qcow2"
+
+          echoe "Creating base QCOW2: $BASE (${SIZE_GB}G)"
+          qemu-img create -f qcow2 -o cluster_size=65536,compression_type=zlib "$BASE" "${SIZE_GB}G"
           qemu-img info --output=json "$BASE" | tee "$META_DIR/qcow2_base.info.json"
+          qemu-img check "$BASE" | tee "$LOG_DIR/qcow2_base.check.log" || echoe "WARN: qemu-img check returned non-zero"
 
-          # snapshot via backing file
+          echoe "Creating snapshot QCOW2 with proper backing file (relative basename)"
           qemu-img create -f qcow2 -b "$BASE" -F qcow2 "$SNAP"
           qemu-img info --output=json "$SNAP" | tee "$META_DIR/qcow2_snap.info.json"
+          qemu-img check "$SNAP" | tee "$LOG_DIR/qcow2_snap.check.log" || echoe "WARN: qemu-img check returned non-zero"
 
       - name: Set outputs
         id: set-outputs
@@ -275,19 +322,11 @@ jobs:
           ISO_OUT=""
           BASE=""
           SNAP=""
-          if [ -f "${{ env.ISO_DIR }}/custom_${{ inputs.distro || github.event.inputs.distro }}.iso" ]; then
-            ISO_OUT="${{ env.ISO_DIR }}/custom_${{ inputs.distro || github.event.inputs.distro }}.iso"
-          fi
-          if [ -f "${{ env.IMG_DIR }}/base_${{ inputs.distro || github.event.inputs.distro }}.qcow2" ]; then
-            BASE="${{ env.IMG_DIR }}/base_${{ inputs.distro || github.event.inputs.distro }}.qcow2"
-          fi
-          if [ -f "${{ env.IMG_DIR }}/snap_${{ inputs.distro || github.event.inputs.distro }}.qcow2" ]; then
-            SNAP="${{ env.IMG_DIR }}/snap_${{ inputs.distro || github.event.inputs.distro }}.qcow2"
-          fi
+          test -f "${{ env.ISO_DIR }}/custom_${{ inputs.distro || github.event.inputs.distro }}.iso" && ISO_OUT="${{ env.ISO_DIR }}/custom_${{ inputs.distro || github.event.inputs.distro }}.iso"
+          test -f "${{ env.IMG_DIR }}/base_${{ inputs.distro || github.event.inputs.distro }}.qcow2" && BASE="${{ env.IMG_DIR }}/base_${{ inputs.distro || github.event.inputs.distro }}.qcow2"
+          test -f "${{ env.IMG_DIR }}/snap_${{ inputs.distro || github.event.inputs.distro }}.qcow2" && SNAP="${{ env.IMG_DIR }}/snap_${{ inputs.distro || github.event.inputs.distro }}.qcow2"
           echo "iso_path=$ISO_OUT" >> "$GITHUB_OUTPUT"
           echo "qcow2_base=$BASE" >> "$GITHUB_OUTPUT"
-          echo "qcow2_snap=$SNP" >> "$GITHUB_OUTPUT" || true
-          # correct var name
           echo "qcow2_snap=$SNAP" >> "$GITHUB_OUTPUT"
 
       - name: Upload artifacts
@@ -314,15 +353,17 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ inputs.release_tag || github.event.inputs.release_tag }}
-          name: "Linux & RHEL Image Suite • ${{ inputs.release_tag || github.event.inputs.release_tag }}"
+          tag_name: ${{ inputs.release_tag && inputs.release_tag != '' && inputs.release_tag || format('auto-{0}', github.run_id) }}
+          name: "Linux/RHEL Image Suite • ${{ inputs.distro || github.event.inputs.distro }}"
           body: |
             Automated release for Linux/RHEL image suite.
             - Distro: `${{ inputs.distro || github.event.inputs.distro }}`
             - Directories: `${{ inputs.generate_dirs || github.event.inputs.generate_dirs }}`
-            - ISO: `${{ inputs.create_iso || github.event.inputs.create_iso }}` (label=`${{ inputs.iso_label || github.event.inputs.iso_label }}`)
+            - ISO Download: `${{ inputs.download_base_iso || github.event.inputs.download_base_iso }}`
+            - Custom ISO: `${{ inputs.create_iso || github.event.inputs.create_iso }}`
             - QCOW2: `${{ inputs.create_qcow2 || github.event.inputs.create_qcow2 }}` (size=`${{ inputs.qcow_size_gb || github.event.inputs.qcow_size_gb }}G`)
-            - Base ISO URL: `${{ inputs.base_iso_url || github.event.inputs.base_iso_url }}`
+            - Custom ISO path: `${{ needs.image-suite.outputs.iso_path }}`
+            - QCOW2 base/snap: `${{ needs.image-suite.outputs.qcow2_base }} | ${{ needs.image-suite.outputs.qcow2_snap }}`
           files: |
             dist/isos/*.iso
             dist/images/*.qcow2
