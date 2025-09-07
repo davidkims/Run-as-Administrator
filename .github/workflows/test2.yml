@@ -1,4 +1,4 @@
-name: "🐧 Linux/RHEL Image Suite (ALL-IN-ONE: Dirs + ISO Download/Create + QCOW2 + Release)"
+name: "🐧 Linux/RHEL Image Suite (ALL-IN-ONE + GPG + Cloud-Init/Kickstart/Preseed + SBOM + GHCR + Hash Index)"
 
 on:
   workflow_dispatch:
@@ -25,6 +25,7 @@ on:
 
 permissions:
   contents: write
+  packages: write
 
 concurrency:
   group: linux-rhel-image-suite-${{ github.ref }}
@@ -32,7 +33,7 @@ concurrency:
 
 jobs:
   image-suite:
-    name: "Build/Pack: Dirs + ISO DL/Create + QCOW2 + Artifacts + Release"
+    name: "ALL-IN-ONE build: Dirs + ISO DL/Create + GPG verify + Cloud-Init/Kickstart/Preseed + QCOW2 + SBOM + GHCR + Release"
     runs-on: ubuntu-latest
     env:
       ECHO_ROOT: .github/echo_linux
@@ -41,6 +42,8 @@ jobs:
       IMG_DIR: dist/images
       LOG_DIR: dist/logs
       META_DIR: dist/meta
+      SEED_DIR: dist/seed
+      GHCR_BASE: ghcr.io/${{ github.repository }}/image-suite
 
     steps:
       - name: Checkout
@@ -50,7 +53,8 @@ jobs:
         run: |
           set -Eeuo pipefail
           mkdir -p "$ECHO_ROOT"/{linux,rhel}/bulk \
-                   "$DIST_DIR" "$ISO_DIR" "$IMG_DIR" "$LOG_DIR" "$META_DIR"
+                   "$DIST_DIR" "$ISO_DIR" "$IMG_DIR" "$LOG_DIR" "$META_DIR" \
+                   "$SEED_DIR"/{cloud-init,preseed,kickstart}
           printf '[%s] INIT: dirs ready\n' "$(date -u +'%F %T')"
 
       - name: Echo tools (functions)
@@ -76,70 +80,19 @@ jobs:
                 curl|jq) sudo apt-get install -y curl jq ;;
                 sha256sum|sha512sum) sudo apt-get install -y coreutils ;;
                 file) sudo apt-get install -y file ;;
+                gpg|gpgv|dirmngr) sudo apt-get install -y gnupg dirmngr ;;
+                debian-archive-keyring) sudo apt-get install -y debian-archive-keyring ;;
+                ubuntu-keyring) sudo apt-get install -y ubuntu-keyring ;;
+                oras) \
+                  curl -sSfL https://github.com/oras-project/oras/releases/latest/download/oras_$(uname -s | tr '[:upper:]' '[:lower:]')_amd64.tar.gz \
+                  | sudo tar -xz -C /usr/local/bin oras ;;
+                syft) \
+                  curl -fsSL https://raw.githubusercontent.com/anchore/sbom-action/main/install.sh | bash -s -- -b /usr/local/bin v1.31.0 ;;
                 *) sudo apt-get install -y "$cmd" || true ;;
               esac
             fi
           }
 
-          parse_dir_spec(){
-            local spec="$1"; local out="$2"
-            : > "$out"
-            IFS=',' read -ra items <<< "$spec"
-            for it in "${items[@]}"; do
-              local name="${it%%:*}"; local cnt="${it##*:}"
-              [[ -z "$name" || -z "$cnt" ]] && continue
-              printf '%s %s\n' "$name" "$cnt" >> "$out"
-            done
-          }
-
-          # 디렉토리 인지형 체크섬 검증 (이전 'No such file or directory' 문제 해결)
-          verify_sum(){
-            local fpath="$1"      # full path to ISO
-            local stype="$2"      # sha256|sha512
-            local expected="$3"   # embedded expected hash (optional)
-            local sum_url="$4"    # checksum list URL (optional)
-
-            local dir base
-            dir="$(dirname "$fpath")"
-            base="$(basename "$fpath")"
-
-            # 1) 임베디드 기대값으로 검증
-            if [[ -n "$expected" ]]; then
-              echoe "Verifying ($stype) with embedded expected hash in dir: $dir"
-              if [[ "$stype" = "sha512" ]]; then
-                ( cd "$dir" && printf "%s  %s\n" "$expected" "$base" | sha512sum -c - )
-              else
-                ( cd "$dir" && printf "%s  %s\n" "$expected" "$base" | sha256sum -c - )
-              fi
-              return
-            fi
-
-            # 2) 원격 목록 기반 검증
-            if [[ -n "$sum_url" ]]; then
-              echoe "Fetching checksum list: $sum_url"
-              local list_path="$dir/${base}.${stype}.list"
-              curl -fsSL "$sum_url" -o "$list_path" || { echoe "WARN: checksum fetch failed"; return; }
-              if [[ "$stype" = "sha512" ]]; then
-                ( cd "$dir" && grep -E "  ${base}\$" "$(basename "$list_path")" | sha512sum -c - ) \
-                  || echoe "WARN: checksum mismatch or entry not found"
-              else
-                ( cd "$dir" && grep -E "  ${base}\$" "$(basename "$list_path")" | sha256sum -c - ) \
-                  || echoe "WARN: checksum mismatch or entry not found"
-              fi
-              return
-            fi
-
-            # 3) 소스가 없으면 로컬 해시만 출력
-            echoe "No checksum source provided; computing local $stype only"
-            if [[ "$stype" = "sha512" ]]; then
-              ( cd "$dir" && sha512sum "$base" | tee "${base}.sha512.txt" )
-            else
-              ( cd "$dir" && sha256sum "$base" | tee "${base}.sha256.txt" )
-            fi
-          }
-
-          # 배포판별 공식 ISO 주소 및 체크섬 정보
-          # - URL과 체크섬 주소를 '자동으로' 보여주고 meta로 저장
           set_official_iso_vars(){
             local d="$1"
             case "$d" in
@@ -148,12 +101,14 @@ jobs:
                 FILE_NAME="ubuntu-24.04.3-live-server-amd64.iso"
                 SUM_TYPE="sha256"
                 SUM_URL="https://releases.ubuntu.com/24.04.3/SHA256SUMS"
+                SUM_SIG_URL="https://releases.ubuntu.com/24.04.3/SHA256SUMS.gpg"
                 ;;
               debian)
                 ISO_URL="https://cdimage.debian.org/debian-cd/current/amd64/iso-cd/debian-13.1.0-amd64-netinst.iso"
                 FILE_NAME="debian-13.1.0-amd64-netinst.iso"
                 SUM_TYPE="sha512"
                 SUM_URL="https://cdimage.debian.org/debian-cd/current/amd64/iso-cd/SHA512SUMS"
+                SUM_SIG_URL="https://cdimage.debian.org/debian-cd/current/amd64/iso-cd/SHA512SUMS.sign"
                 ;;
               rocky)
                 ISO_URL="https://download.rockylinux.org/pub/rocky/9/isos/x86_64/Rocky-9-latest-x86_64-minimal.iso"
@@ -167,17 +122,64 @@ jobs:
                 SUM_TYPE="sha256"
                 SUM_URL="https://repo.almalinux.org/almalinux/9/isos/x86_64/CHECKSUM"
                 ;;
-              rhel)
-                # RHEL은 인증 필요 → 자동으로 AlmaLinux로 대체
+              rhel) # 인증 필요 → AlmaLinux로 자동 대체
                 ISO_URL="https://repo.almalinux.org/almalinux/9/isos/x86_64/AlmaLinux-9-latest-x86_64-minimal.iso"
                 FILE_NAME="AlmaLinux-9-latest-x86_64-minimal.iso"
                 SUM_TYPE="sha256"
                 SUM_URL="https://repo.almalinux.org/almalinux/9/isos/x86_64/CHECKSUM"
-                FALLBACK_NOTE="Requested 'rhel' but used AlmaLinux official ISO due to auth requirement."
+                FALLBACK_NOTE="Requested 'rhel' but used AlmaLinux (auth required for RHEL)."
                 ;;
-              *)
-                ISO_URL=""; FILE_NAME=""
+              *) ISO_URL=""; FILE_NAME="";;
+            esac
+          }
+
+          # 디렉토리 인지형 체크섬 검증
+          verify_sum(){
+            local fpath="$1"      # full path to ISO
+            local stype="$2"      # sha256|sha512
+            local list_path="$3"  # checksum list file downloaded locally
+            local dir base
+            dir="$(dirname "$fpath")"; base="$(basename "$fpath")"
+            if [[ -n "$list_path" && -f "$list_path" ]]; then
+              echoe "Verifying ($stype) via list: $(basename "$list_path")"
+              if [[ "$stype" = "sha512" ]]; then
+                ( cd "$dir" && grep -E "  ${base}\$" "$(basename "$list_path")" | sha512sum -c - )
+              else
+                ( cd "$dir" && grep -E "  ${base}\$" "$(basename "$list_path")" | sha256sum -c - )
+              fi
+            else
+              echoe "WARN: checksum list not found; computing local hash only"
+              if [[ "$stype" = "sha512" ]]; then ( cd "$dir" && sha512sum "$base" | tee "${base}.sha512.txt" )
+              else ( cd "$dir" && sha256sum "$base" | tee "${base}.sha256.txt" ); fi
+            fi
+          }
+
+          # Ubuntu/Debian GPG 검증
+          verify_gpg(){
+            local stype="$1"     # sha256|sha512
+            local sums="$2"      # path to SUMS file
+            local sig="$3"       # path to signature
+            local distro="$4"    # ubuntu|debian|...
+
+            echoe "GPG verify: distro=$distro, $sums vs $sig"
+            case "$distro" in
+              ubuntu)
+                if [ -f /usr/share/keyrings/ubuntu-archive-keyring.gpg ]; then
+                  gpgv --keyring /usr/share/keyrings/ubuntu-archive-keyring.gpg "$sig" "$sums" \
+                    && { echoe "Ubuntu GPG OK (keyring)"; return; } || echoe "WARN: ubuntu-keyring gpgv failed; trying keyserver..."
+                fi
+                gpg --batch --keyserver hkps://keyserver.ubuntu.com --recv-keys 0xD94AA3F0EFE21092 0x46181433FBB75451 || true
+                gpg --verify "$sig" "$sums" && echoe "Ubuntu GPG OK (keyserver)" || echoe "WARN: Ubuntu GPG verify failed"
                 ;;
+              debian)
+                if [ -f /usr/share/keyrings/debian-archive-keyring.gpg ]; then
+                  gpgv --keyring /usr/share/keyrings/debian-archive-keyring.gpg "$sig" "$sums" \
+                    && { echoe "Debian GPG OK (keyring)"; return; } || echoe "WARN: debian-keyring gpgv failed"
+                else
+                  echoe "WARN: debian-archive-keyring missing"
+                fi
+                ;;
+              *) echoe "GPG verify skipped for $distro";;
             esac
           }
           EOS
@@ -188,7 +190,6 @@ jobs:
         run: |
           set -Eeuo pipefail
           source "$ECHO_ROOT/echo_tools.sh"
-          # 고정 스펙(“모든 과정 필수”)—원하시면 아래 값 조정 가능
           SPEC_FILE="$META_DIR/dir_spec.txt"
           echo "linux:100,rhel:100" > "$SPEC_FILE"
           while read -r PREFIX COUNT; do
@@ -204,33 +205,45 @@ jobs:
           tar -C "$ECHO_ROOT" -cf "$DIST_DIR/echo_bulk.tar" .
           echoe "Bulk generated -> $DIST_DIR/echo_bulk.tar"
 
-      - name: Download official base ISO (mandatory; show URLs)
+      - name: Download official base ISO + GPG verify (mandatory)
         shell: bash
         run: |
           set -Eeuo pipefail
           source "$ECHO_ROOT/echo_tools.sh"
           ensure_cmd curl; ensure_cmd sha256sum; ensure_cmd sha512sum; ensure_cmd file; ensure_cmd jq
+          ensure_cmd gpg; ensure_cmd gpgv; ensure_cmd dirmngr
+          ensure_cmd debian-archive-keyring || true
+          ensure_cmd ubuntu-keyring || true
+
           D="${{ inputs.distro || github.event.inputs.distro }}"
           set_official_iso_vars "$D"
-
           [[ -z "$ISO_URL" ]] && fail "No ISO URL resolved"
 
-          # 주소 자동 표시 + 메타 저장
           echoe "Base ISO URL: $ISO_URL"
           echoe "Checksum List: ${SUM_URL:-none} (${SUM_TYPE:-sha256})"
-          jq -n --arg url "$ISO_URL" --arg sumurl "${SUM_URL:-}" --arg sumtype "${SUM_TYPE:-sha256}" --arg note "${FALLBACK_NOTE:-}" \
-            '{base_iso_url:$url, checksum_url:$sumurl, checksum_type:$sumtype, note:$note}' \
+          echoe "Signature URL: ${SUM_SIG_URL:-none}"
+          jq -n --arg url "$ISO_URL" --arg sumurl "${SUM_URL:-}" --arg sigurl "${SUM_SIG_URL:-}" --arg sumtype "${SUM_TYPE:-sha256}" --arg note "${FALLBACK_NOTE:-}" \
+            '{base_iso_url:$url, checksum_url:$sumurl, signature_url:$sigurl, checksum_type:$sumtype, note:$note}' \
             | tee "$META_DIR/base_iso.urls.json"
 
           OUT="$ISO_DIR/$FILE_NAME"
-          echoe "Downloading -> $OUT"
           curl -fL "$ISO_URL" -o "$OUT"
           file "$OUT" | tee "$META_DIR/base_iso.file.txt"
 
-          # 체크섬 검증(가능하면): 실패해도 경고로만 처리(미러 상태 대비)
-          verify_sum "$OUT" "${SUM_TYPE:-sha256}" "" "${SUM_URL:-}"
+          LIST=""
+          if [[ -n "$SUM_URL" ]]; then
+            LIST="$ISO_DIR/$(basename "$SUM_URL")"
+            curl -fsSL "$SUM_URL" -o "$LIST" || echoe "WARN: checksum list fetch failed"
+          fi
+          if [[ -n "$SUM_SIG_URL" && -n "$LIST" && -f "$LIST" ]]; then
+            SIG="$ISO_DIR/$(basename "$SUM_SIG_URL")"
+            curl -fsSL "$SUM_SIG_URL" -o "$SIG" || echoe "WARN: signature fetch failed"
+            verify_gpg "${SUM_TYPE:-sha256}" "$LIST" "$SIG" "$D" || echoe "WARN: GPG verification did not fully pass"
+          fi
 
-      - name: Create custom ISO (mandatory)
+          verify_sum "$OUT" "${SUM_TYPE:-sha256}" "${LIST:-}"
+
+      - name: Create custom ISO (mandatory; payload = ECHO_ROOT)
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -248,26 +261,191 @@ jobs:
           sha256sum "$ISO_OUT" | tee "$META_DIR/custom_iso.sha256.txt"
           printf '{"label":"%s","path":"%s","ts":"%s"}\n' "$LABEL" "$ISO_OUT" "$(date -u +'%F %T')" > "$META_DIR/custom_iso.json"
 
-      - name: Create QCOW2 base & snapshot (mandatory; fixed backing)
+      - name: Create Cloud-Init CIDATA ISO + Kickstart/Preseed (mandatory)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          source "$ECHO_ROOT/echo_tools.sh"
+          ensure_cmd mkisofs || ensure_cmd xorriso
+          # Cloud-Init
+          cat > "$SEED_DIR/cloud-init/user-data" <<'UD'
+          #cloud-config
+          hostname: echo-host
+          users:
+            - name: ubuntu
+              sudo: ALL=(ALL) NOPASSWD:ALL
+              groups: users, admin, sudo
+              lock_passwd: false
+              plain_text_passwd: "echo1234"
+          ssh_pwauth: true
+          packages: [vim, curl]
+          runcmd:
+            - [ bash, -lc, "echo 'hello from cloud-init' > /root/hello.txt" ]
+          UD
+          echo "instance-id: iid-echo; local-hostname: echo-host" > "$SEED_DIR/cloud-init/meta-data"
+
+          # Kickstart
+          cat > "$SEED_DIR/kickstart/ks.cfg" <<'KS'
+          #version=RHEL9
+          text
+          lang en_US.UTF-8
+          keyboard us
+          timezone UTC
+          rootpw echo1234
+          network --bootproto=dhcp
+          firewall --enabled
+          selinux --enforcing
+          services --enabled=sshd
+          bootloader --location=mbr
+          autopart --type=lvm
+          %packages
+          @^minimal-environment
+          vim
+          %end
+          %post
+          echo "hello from kickstart" > /root/ks_hello.txt
+          %end
+          KS
+
+          # Preseed
+          cat > "$SEED_DIR/preseed/preseed.cfg" <<'PS'
+          d-i debian-installer/locale string en_US
+          d-i keyboard-configuration/layoutcode string us
+          d-i netcfg/choose_interface select auto
+          d-i time/zone string UTC
+          d-i passwd/user-fullname string Echo User
+          d-i passwd/username string echo
+          d-i passwd/user-password password echo1234
+          d-i passwd/user-password-again password echo1234
+          d-i pkgsel/include string vim curl
+          PS
+
+          CIDATA="$ISO_DIR/seed-cidata.iso"
+          if command -v mkisofs >/dev/null 2>&1; then
+            mkisofs -V CIDATA -J -R -o "$CIDATA" "$SEED_DIR/cloud-init"
+          else
+            xorriso -as mkisofs -V CIDATA -J -R -o "$CIDATA" "$SEED_DIR/cloud-init"
+          fi
+          sha256sum "$CIDATA" | tee "$META_DIR/seed_cidata.sha256.txt"
+          echoe "Seed ISO created -> $CIDATA"
+
+      - name: Post-ISO: create extra bulk and MOVE data (mandatory)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          source "$ECHO_ROOT/echo_tools.sh"
+          EXTRA="$ECHO_ROOT/after_iso_payload"
+          mkdir -p "$EXTRA/bulk_extra"
+          for i in $(seq 1 50); do
+            mkdir -p "$EXTRA/bulk_extra/extra_${i}/subA" "$EXTRA/bulk_extra/extra_${i}/subB"
+            echo "extra payload $i" > "$EXTRA/bulk_extra/extra_${i}/README.txt"
+          done
+          if [ -d "$ECHO_ROOT/linux/bulk" ]; then
+            mkdir -p "$EXTRA/bulk_from_linux"
+            find "$ECHO_ROOT/linux/bulk" -mindepth 1 -maxdepth 1 -type d -print0 | xargs -0 -I{} mv "{}" "$EXTRA/bulk_from_linux"/
+          fi
+          if [ -d "$ECHO_ROOT/rhel/bulk" ]; then
+            mkdir -p "$EXTRA/bulk_from_rhel"
+            find "$ECHO_ROOT/rhel/bulk" -mindepth 1 -maxdepth 1 -type d -print0 | xargs -0 -I{} mv "{}" "$EXTRA/bulk_from_rhel"/
+          fi
+          tar -C "$EXTRA" -cf "$DIST_DIR/after_iso_payload.tar" .
+          echoe "Moved/extended payload -> $DIST_DIR/after_iso_payload.tar"
+
+      - name: Create QCOW2 base & snapshot (mandatory; fixed backing + absolute meta/log paths)
         shell: bash
         run: |
           set -Eeuo pipefail
           source "$ECHO_ROOT/echo_tools.sh"
           ensure_cmd qemu-img
+
           SIZE_GB="${{ inputs.qcow_size_gb || github.event.inputs.qcow_size_gb }}"
           DISTRO="${{ inputs.distro || github.event.inputs.distro }}"
-          mkdir -p "$IMG_DIR"
-          cd "$IMG_DIR"
+
+          # 리포지토리 루트 기준 절대 경로
+          META_ABS="$GITHUB_WORKSPACE/${META_DIR}"
+          LOG_ABS="$GITHUB_WORKSPACE/${LOG_DIR}"
+          IMG_ABS="$GITHUB_WORKSPACE/${IMG_DIR}"
+          mkdir -p "$IMG_ABS" "$META_ABS" "$LOG_ABS"
+
+          cd "$IMG_ABS"
           BASE="base_${DISTRO}.qcow2"
           SNAP="snap_${DISTRO}.qcow2"
+
           echoe "Creating base QCOW2: $BASE (${SIZE_GB}G)"
           qemu-img create -f qcow2 -o cluster_size=65536,compression_type=zlib "$BASE" "${SIZE_GB}G"
-          qemu-img info --output=json "$BASE" | tee "$META_DIR/qcow2_base.info.json"
-          qemu-img check "$BASE" | tee "$LOG_DIR/qcow2_base.check.log" || echoe "WARN: qemu-img check returned non-zero"
+
+          qemu-img info --output=json "$BASE" | tee "$META_ABS/qcow2_base.info.json" >/dev/null
+          qemu-img check "$BASE" | tee "$LOG_ABS/qcow2_base.check.log" >/dev/null || echoe "WARN: qemu-img check returned non-zero"
+
           echoe "Creating snapshot with proper relative backing"
           qemu-img create -f qcow2 -b "$BASE" -F qcow2 "$SNAP"
-          qemu-img info --output=json "$SNAP" | tee "$META_DIR/qcow2_snap.info.json"
-          qemu-img check "$SNAP" | tee "$LOG_DIR/qcow2_snap.check.log" || echoe "WARN: qemu-img check returned non-zero"
+          qemu-img info --output=json "$SNAP" | tee "$META_ABS/qcow2_snap.info.json" >/dev/null
+          qemu-img check "$SNAP" | tee "$LOG_ABS/qcow2_snap.check.log" >/dev/null || echoe "WARN: qemu-img check returned non-zero"
+
+      - name: SBOM (SPDX-JSON) generate (mandatory)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          source "$ECHO_ROOT/echo_tools.sh"
+          ensure_cmd syft
+          mkdir -p "$DIST_DIR/sbom"
+          syft version
+          syft dir:"$DIST_DIR" -o spdx-json > "$DIST_DIR/sbom/dist.spdx.json"
+          echoe "SBOM generated -> $DIST_DIR/sbom/dist.spdx.json"
+
+      - name: Hash catalog & index (mandatory)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          source "$ECHO_ROOT/echo_tools.sh"
+          ensure_cmd jq
+          HASH_JSON="$META_DIR/hash_index.json"
+          : > "$HASH_JSON"
+          echo "[" >> "$HASH_JSON"
+          first=1
+          while IFS= read -r -d '' f; do
+            sha256=$(sha256sum "$f" | awk '{print $1}')
+            sha512=$(sha512sum "$f" | awk '{print $1}')
+            size=$(stat -c%s "$f")
+            rel="${f#dist/}"
+            entry=$(jq -n --arg path "$rel" --arg sha256 "$sha256" --arg sha512 "$sha512" --argjson size "$size" \
+                      '{path:$path,sha256:$sha256,sha512:$sha512,size:$size}')
+            if [ $first -eq 1 ]; then
+              echo "  $entry" >> "$HASH_JSON"; first=0
+            else
+              echo " ,$entry" >> "$HASH_JSON"
+            fi
+          done < <(find dist -type f -print0)
+          echo "]" >> "$HASH_JSON"
+          echoe "Hash index -> $HASH_JSON"
+
+      - name: GHCR upload via ORAS (mandatory)
+        env:
+          ORAS_REGISTRY: ghcr.io
+          ORAS_REPO: ${{ github.repository }}
+          ORAS_TAG: ${{ github.run_id }}
+          GH_USER: ${{ github.actor }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          source "$ECHO_ROOT/echo_tools.sh"
+          ensure_cmd oras
+          echo "$GH_TOKEN" | oras login ghcr.io -u "$GH_USER" --password-stdin
+          REF="${{ env.GHCR_BASE }}:${{ env.ORAS_TAG }}"
+          oras push "$REF" \
+            --artifact-type application/vnd.echo.bundle \
+            "$ISO_DIR/$(ls -1 $ISO_DIR | head -n1)":application/octet-stream \
+            "$ISO_DIR/custom_${{ inputs.distro || github.event.inputs.distro }}.iso":application/octet-stream \
+            "$ISO_DIR/seed-cidata.iso":application/octet-stream \
+            "$IMG_DIR/base_${{ inputs.distro || github.event.inputs.distro }}.qcow2":application/octet-stream \
+            "$IMG_DIR/snap_${{ inputs.distro || github.event.inputs.distro }}.qcow2":application/octet-stream \
+            "$DIST_DIR/echo_bulk.tar":application/x-tar \
+            "$DIST_DIR/after_iso_payload.tar":application/x-tar \
+            "$DIST_DIR/sbom/dist.spdx.json":application/spdx+json \
+            "$META_DIR/hash_index.json":application/json \
+            "$META_DIR/base_iso.urls.json":application/json
+          echoe "Pushed to GHCR: $REF"
 
       - name: Upload artifacts (mandatory)
         uses: actions/upload-artifact@v4
@@ -284,16 +462,22 @@ jobs:
           tag_name: ${{ inputs.release_tag && inputs.release_tag != '' && inputs.release_tag || format('auto-{0}', github.run_id) }}
           name: "Linux/RHEL Image Suite • ${{ inputs.distro || github.event.inputs.distro }}"
           body: |
-            Automated ALL-IN-ONE image suite.
+            ALL-IN-ONE image suite with GPG, Cloud-Init/Kickstart/Preseed, SBOM, GHCR, and hash index.
             - Distro: `${{ inputs.distro || github.event.inputs.distro }}`
             - Base ISO URL: (see dist/meta/base_iso.urls.json)
             - Custom ISO: `dist/isos/custom_${{ inputs.distro || github.event.inputs.distro }}.iso`
+            - Seed ISO (CIDATA): `dist/isos/seed-cidata.iso`
             - QCOW2: `dist/images/base_${{ inputs.distro || github.event.inputs.distro }}.qcow2` + `snap_${{ inputs.distro || github.event.inputs.distro }}.qcow2`
+            - SBOM: `dist/sbom/dist.spdx.json`
+            - Hash index: `dist/meta/hash_index.json`
+            - GHCR ref: `${{ env.GHCR_BASE }}:${{ github.run_id }}`
           files: |
             dist/isos/*.iso
             dist/images/*.qcow2
             dist/meta/**
             dist/logs/**
+            dist/sbom/**
             dist/echo_bulk.tar
+            dist/after_iso_payload.tar
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
