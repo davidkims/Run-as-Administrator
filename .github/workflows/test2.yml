@@ -329,7 +329,7 @@ jobs:
           sha256sum "$CIDATA" | tee "$META_DIR/seed_cidata.sha256.txt"
           echoe "Seed ISO created -> $CIDATA"
 
-      - name: Post-ISO: create extra bulk and MOVE data (mandatory)
+      - name: Post-ISO:create extra bulk and MOVE data (mandatory)
         shell: bash
         run: |
           set -Eeuo pipefail
