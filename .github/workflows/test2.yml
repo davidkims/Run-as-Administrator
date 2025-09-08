@@ -343,7 +343,7 @@ jobs:
         run: |
           set -Eeuo pipefail
           source "$ECHO_ROOT/echo_tools.sh"
-          ensure_cmd xorriso; ensure_cmd isohybrid || true; ensure_cmd isohdpfx.bin || true
+          ensure_cmd xorriso
 
           D="${{ inputs.distro || github.event.inputs.distro }}"
           BASE_ISO="$ISO_DIR/$(
@@ -354,25 +354,25 @@ jobs:
 
           WORK="$WORK_DIR/root"
           rm -rf "$WORK"; mkdir -p "$WORK"
+
+          # 1) ISO 전체 추출
           xorriso -osirrox on -indev "$BASE_ISO" -extract / "$WORK"
+
+          # 2) 수정 가능하도록 권한 부여
           chmod -R u+w "$WORK" || true
 
+          # 3) 자동 설치 파라미터/파일 주입
           case "$D" in
             ubuntu)
               mkdir -p "$WORK/nocloud"
               cp "$SEED_DIR/cloud-init/user-data" "$WORK/nocloud/user-data"
               cp "$SEED_DIR/cloud-init/meta-data" "$WORK/nocloud/meta-data"
-              for GRUB_CAND in \
-                "$WORK/boot/grub/grub.cfg" \
-                "$WORK/EFI/BOOT/grub.cfg" \
-                "$WORK/boot/grub/loopback.cfg" \
-                "$WORK/isolinux/txt.cfg"
-              do
-                [ -f "$GRUB_CAND" ] || continue
-                if grep -qE '^\s*linux(\s|efi)\s' "$GRUB_CAND"; then
-                  sed -i 's,^\(\s*linux[^#]*\)$,\1 autoinstall ds=nocloud;s=/cdrom/nocloud/,' "$GRUB_CAND" || true
-                elif grep -qE '^\s*append\s' "$GRUB_CAND"; then
-                  sed -i 's,^\(\s*append .*\)$,\1 autoinstall ds=nocloud;s=/cdrom/nocloud/,' "$GRUB_CAND" || true
+              for CFG in "$WORK/boot/grub/grub.cfg" "$WORK/EFI/BOOT/grub.cfg" "$WORK/boot/grub/loopback.cfg" "$WORK/isolinux/txt.cfg"; do
+                [ -f "$CFG" ] || continue
+                if grep -qE '^\s*linux(efi)?\s' "$CFG"; then
+                  sed -i 's,^\(\s*linux[^#]*\)$,\1 autoinstall ds=nocloud;s=/cdrom/nocloud/,' "$CFG" || true
+                elif grep -qE '^\s*append\s' "$CFG"; then
+                  sed -i 's,^\(\s*append .*\)$,\1 autoinstall ds=nocloud;s=/cdrom/nocloud/,' "$CFG" || true
                 fi
               done
               ;;
@@ -381,7 +381,7 @@ jobs:
               cp "$SEED_DIR/preseed/preseed.cfg" "$WORK/preseed/preseed.cfg"
               for CFG in "$WORK/isolinux/txt.cfg" "$WORK/boot/grub/grub.cfg" "$WORK/EFI/BOOT/grub.cfg"; do
                 [ -f "$CFG" ] || continue
-                if grep -qE '^\s*linux(\s|efi)\s' "$CFG"; then
+                if grep -qE '^\s*linux(efi)?\s' "$CFG"; then
                   sed -i 's,^\(\s*linux[^#]*\)$,\1 auto=true priority=critical file=/cdrom/preseed/preseed.cfg,' "$CFG" || true
                 elif grep -qE '^\s*append\s' "$CFG"; then
                   sed -i 's,^\(\s*append .*\)$,\1 auto=true priority=critical file=/cdrom/preseed/preseed.cfg,' "$CFG" || true
@@ -403,60 +403,17 @@ jobs:
               ;;
           esac
 
-          HAS_ISOLINUX_BIN=false
-          HAS_GRUB_BIOS_IMG=false
-          HAS_GRUB_EFI_IMG=false
-          ISOHYBRID_MBR="/usr/lib/ISOLINUX/isohdpfx.bin"
-
-          [ -f "$WORK/isolinux/isolinux.bin" ] && HAS_ISOLINUX_BIN=true
-          [ -f "$WORK/boot/grub/i386-pc/eltorito.img" ] && HAS_GRUB_BIOS_IMG=true
-          if [ -f "$WORK/boot/grub/efi.img" ]; then
-            EFI_IMG_PATH="boot/grub/efi.img"; HAS_GRUB_EFI_IMG=true
-          elif [ -f "$WORK/efi.img" ]; then
-            EFI_IMG_PATH="efi.img"; HAS_GRUB_EFI_IMG=true
-          else
-            EFI_IMG_PATH=""
-          fi
-
+          # 4) 원본 ISO의 부팅 구성을 그대로 재생성 (경로 탐지 불필요)
           OUT="$ISO_DIR/custom_installer_${D}.iso"
           LABEL="ECHO_INST_${D}_$(date -u +%Y%m%d)"
 
-          if $HAS_ISOLINUX_BIN; then
-            if $HAS_GRUB_EFI_IMG; then
-              xorriso -as mkisofs -r -V "$LABEL" -o "$OUT" -J -l \
-                -isohybrid-mbr "$ISOHYBRID_MBR" \
-                -c isolinux/boot.cat \
-                -b isolinux/isolinux.bin \
-                  -no-emul-boot -boot-load-size 4 -boot-info-table \
-                -eltorito-alt-boot \
-                -e "$EFI_IMG_PATH" -no-emul-boot -isohybrid-gpt-basdat \
-                "$WORK"
-            else
-              xorriso -as mkisofs -r -V "$LABEL" -o "$OUT" -J -l \
-                -isohybrid-mbr "$ISOHYBRID_MBR" \
-                -c isolinux/boot.cat \
-                -b isolinux/isolinux.bin \
-                  -no-emul-boot -boot-load-size 4 -boot-info-table \
-                "$WORK"
-            fi
-          else
-            if $HAS_GRUB_BIOS_IMG && $HAS_GRUB_EFI_IMG; then
-              xorriso -as mkisofs -r -V "$LABEL" -o "$OUT" -J -l \
-                -isohybrid-mbr "$ISOHYBRID_MBR" \
-                -c boot.cat \
-                -b boot/grub/i386-pc/eltorito.img \
-                  -no-emul-boot -boot-load-size 4 -boot-info-table \
-                -eltorito-alt-boot \
-                -e "$EFI_IMG_PATH" -no-emul-boot -isohybrid-gpt-basdat \
-                "$WORK"
-            elif $HAS_GRUB_EFI_IMG; then
-              xorriso -as mkisofs -r -V "$LABEL" -o "$OUT" -J -l \
-                -e "$EFI_IMG_PATH" -no-emul-boot -isohybrid-gpt-basdat \
-                "$WORK"
-            else
-              fail "No boot assets found (neither isolinux nor GRUB eltorito/efi images)"
-            fi
-          fi
+          xorriso \
+            -indev "$BASE_ISO" \
+            -outdev "stdio:$OUT" \
+            -map "$WORK" / \
+            -volid "$LABEL" \
+            -joliet on -rockridge on \
+            -boot_image any replay
 
           sha256sum "$OUT" | tee "$META_DIR/custom_installer.sha256.txt"
           echoe "Bootable custom installer ISO -> $OUT"
