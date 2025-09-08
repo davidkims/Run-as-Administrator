@@ -1,0 +1,31 @@
+name: Defender Bot Linux ISO Update
+
+on:
+  schedule:
+    - cron: '0 0 * * 0'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  update-linux-iso:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Update Linux ISO info
+        run: bash ./scripts/update-linux-iso-info.sh
+
+      - name: Commit changes
+        run: |
+          if [[ -n "$(git status --porcelain)" ]]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add linux-iso-info.txt
+            git commit -m "Update Linux ISO info"
+            git push
+          else
+            echo "No changes to commit"
+          fi
