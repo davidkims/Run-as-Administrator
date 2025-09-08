@@ -95,7 +95,6 @@ jobs:
             fi
           }
 
-          # 배포판별 공식 ISO/체크섬/서명 주소
           set_official_iso_vars(){
             local d="$1"
             case "$d" in
@@ -125,7 +124,7 @@ jobs:
                 SUM_TYPE="sha256"
                 SUM_URL="https://repo.almalinux.org/almalinux/9/isos/x86_64/CHECKSUM"
                 ;;
-              rhel) # 인증 필요 → AlmaLinux로 자동 대체
+              rhel)
                 ISO_URL="https://repo.almalinux.org/almalinux/9/isos/x86_64/AlmaLinux-9-latest-x86_64-minimal.iso"
                 FILE_NAME="AlmaLinux-9-latest-x86_64-minimal.iso"
                 SUM_TYPE="sha256"
@@ -136,13 +135,9 @@ jobs:
             esac
           }
 
-          # 체크섬 리스트에서 해당 파일 라인만 표준 포맷으로 정규화하여 검증
           verify_sum(){
-            local fpath="$1"      # full path to target file
-            local stype="$2"      # sha256|sha512
-            local list_path="$3"  # checksum list file
-            local dir base tmp
-            dir="$(dirname "$fpath")"; base="$(basename "$fpath")"
+            local fpath="$1"; local stype="$2"; local list_path="$3"
+            local dir base tmp; dir="$(dirname "$fpath")"; base="$(basename "$fpath")"
             if [[ -n "$list_path" && -f "$list_path" ]]; then
               tmp="$dir/.sumline.$$.$stype"
               awk -v f="$base" '{ fn=$2; sub(/^\*/, "", fn); if (fn==f) print $1 "  " f }' "$list_path" > "$tmp"
@@ -163,12 +158,8 @@ jobs:
             fi
           }
 
-          # Ubuntu/Debian GPG 검증
           verify_gpg(){
-            local stype="$1"     # sha256|sha512
-            local sums="$2"      # path to SUMS file
-            local sig="$3"       # path to signature
-            local distro="$4"    # ubuntu|debian|...
+            local stype="$1"; local sums="$2"; local sig="$3"; local distro="$4"
             echoe "GPG verify: distro=$distro, $sums vs $sig"
             case "$distro" in
               ubuntu)
@@ -343,7 +334,7 @@ jobs:
         run: |
           set -Eeuo pipefail
           source "$ECHO_ROOT/echo_tools.sh"
-          ensure_cmd xorriso
+          ensure_cmd xorriso; ensure_cmd isohybrid || true; ensure_cmd isohdpfx.bin || true
 
           D="${{ inputs.distro || github.event.inputs.distro }}"
           BASE_ISO="$ISO_DIR/$(
@@ -403,17 +394,46 @@ jobs:
               ;;
           esac
 
-          # 4) 원본 ISO의 부팅 구성을 그대로 재생성 (경로 탐지 불필요)
-          OUT="$ISO_DIR/custom_installer_${D}.iso"
-          LABEL="ECHO_INST_${D}_$(date -u +%Y%m%d)"
+          # 4) 부트 자산 동적 탐지 + 하이브리드 ISO 생성
+          BIOS_IMG=""; EFI_IMG=""; CATALOG=""
+          if [ -f "$WORK/boot/grub/i386-pc/eltorito.img" ]; then
+            BIOS_IMG="boot/grub/i386-pc/eltorito.img"; CATALOG="boot.catalog"
+          fi
+          if [ -z "$BIOS_IMG" ] && [ -f "$WORK/isolinux/isolinux.bin" ]; then
+            BIOS_IMG="isolinux/isolinux.bin"; CATALOG="isolinux/boot.cat"
+          fi
+          if [ -f "$WORK/boot/grub/efi.img" ]; then
+            EFI_IMG="boot/grub/efi.img"
+          elif [ -f "$WORK/EFI/BOOT/efiboot.img" ]; then
+            EFI_IMG="EFI/BOOT/efiboot.img"
+          elif [ -f "$WORK/efi.img" ]; then
+            EFI_IMG="efi.img"
+          fi
 
-          xorriso \
-            -indev "$BASE_ISO" \
-            -outdev "stdio:$OUT" \
-            -map "$WORK" / \
-            -volid "$LABEL" \
-            -joliet on -rockridge on \
-            -boot_image any replay
+          LABEL_RAW="ECHO_INST_${D}_$(date -u +%Y%m%d)"
+          LABEL="$(echo "$LABEL_RAW" | tr -cd 'A-Za-z0-9_-' | cut -c1-16)"
+          [ -z "$LABEL" ] && LABEL="ECHO_${D}_$(date -u +%y%m%d)"
+          OUT="$ISO_DIR/custom_installer_${D}.iso"
+
+          if [ -n "$BIOS_IMG" ] && [ -n "$EFI_IMG" ]; then
+            xorriso -as mkisofs -r -V "$LABEL" -o "$OUT" -J -l \
+              ${CATALOG:+-c "$CATALOG"} \
+              -b "$BIOS_IMG" -no-emul-boot -boot-load-size 4 -boot-info-table \
+              -eltorito-alt-boot \
+              -e "$EFI_IMG" -no-emul-boot -isohybrid-gpt-basdat \
+              "$WORK"
+          elif [ -n "$BIOS_IMG" ]; then
+            xorriso -as mkisofs -r -V "$LABEL" -o "$OUT" -J -l \
+              ${CATALOG:+-c "$CATALOG"} \
+              -b "$BIOS_IMG" -no-emul-boot -boot-load-size 4 -boot-info-table \
+              "$WORK"
+          elif [ -n "$EFI_IMG" ]; then
+            xorriso -as mkisofs -r -V "$LABEL" -o "$OUT" -J -l \
+              -e "$EFI_IMG" -no-emul-boot -isohybrid-gpt-basdat \
+              "$WORK"
+          else
+            fail "Boot images not found: expected one of (boot/grub/i386-pc/eltorito.img | isolinux/isolinux.bin) and/or (boot/grub/efi.img | EFI/BOOT/efiboot.img | efi.img)"
+          fi
 
           sha256sum "$OUT" | tee "$META_DIR/custom_installer.sha256.txt"
           echoe "Bootable custom installer ISO -> $OUT"
