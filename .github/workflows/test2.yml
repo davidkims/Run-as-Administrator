@@ -86,12 +86,37 @@ jobs:
                 debian-archive-keyring) sudo apt-get install -y debian-archive-keyring ;;
                 ubuntu-keyring) sudo apt-get install -y ubuntu-keyring ;;
                 oras)
-                  curl -fsSL --retry 5 --retry-connrefused \
-                    https://github.com/oras-project/oras/releases/latest/download/oras_$(uname -s | tr '[:upper:]' '[:lower:]')_amd64.tar.gz \
-                    | sudo tar -xz -C /usr/local/bin oras
+                  # ✅ ORAS: 최신 릴리스 조회 → 정확한 에셋 다운로드 (404 방지)
+                  ensure_cmd curl; ensure_cmd jq
+                  arch="$(uname -m)"
+                  case "$arch" in
+                    x86_64|amd64) goarch="amd64" ;;
+                    aarch64|arm64) goarch="arm64" ;;
+                    s390x) goarch="s390x" ;;
+                    ppc64le) goarch="ppc64le" ;;
+                    *) goarch="amd64" ;;  # 안전 폴백
+                  esac
+                  tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
+                  ver="$(curl -fsSL --retry 5 --retry-connrefused \
+                          https://api.github.com/repos/oras-project/oras/releases/latest \
+                          | jq -r '.tag_name' | sed 's/^v//')"
+                  if [ -z "$ver" ] || [ "$ver" = "null" ]; then
+                    echoe "WARN: GitHub API 불가 → ORAS v1.2.2로 폴백"
+                    ver="1.2.2"
+                  fi
+                  url="https://github.com/oras-project/oras/releases/download/v${ver}/oras_${ver}_linux_${goarch}.tar.gz"
+                  echoe "Downloading oras ${ver} (${goarch}) from: $url"
+                  if ! curl -fsSL --retry 5 --retry-connrefused -o "$tmp/oras.tgz" "$url"; then
+                    echoe "WARN: ${url} 404 → 고정 v1.2.2 재시도"
+                    ver="1.2.2"
+                    url="https://github.com/oras-project/oras/releases/download/v${ver}/oras_${ver}_linux_${goarch}.tar.gz"
+                    curl -fsSL --retry 5 --retry-connrefused -o "$tmp/oras.tgz" "$url"
+                  fi
+                  sudo tar -xzf "$tmp/oras.tgz" -C /usr/local/bin oras
+                  /usr/local/bin/oras version || fail "oras install failed"
                   ;;
                 syft)
-                  # ✅ Robust Syft installer (GitHub Releases API → latest, fallback to v1.31.0)
+                  # ✅ Syft: 최신 릴리스 조회 → 정확한 에셋 다운로드 (404 방지)
                   ensure_cmd curl; ensure_cmd jq
                   arch="$(uname -m)"
                   case "$arch" in
