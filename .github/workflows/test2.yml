@@ -85,16 +85,47 @@ jobs:
                 gpg|gpgv|dirmngr) sudo apt-get install -y gnupg dirmngr ;;
                 debian-archive-keyring) sudo apt-get install -y debian-archive-keyring ;;
                 ubuntu-keyring) sudo apt-get install -y ubuntu-keyring ;;
-                oras) \
-                  curl -sSfL https://github.com/oras-project/oras/releases/latest/download/oras_$(uname -s | tr '[:upper:]' '[:lower:]')_amd64.tar.gz \
-                  | sudo tar -xz -C /usr/local/bin oras ;;
-                syft) \
-                  curl -fsSL https://raw.githubusercontent.com/anchore/sbom-action/main/install.sh | bash -s -- -b /usr/local/bin v1.31.0 ;;
+                oras)
+                  curl -fsSL --retry 5 --retry-connrefused \
+                    https://github.com/oras-project/oras/releases/latest/download/oras_$(uname -s | tr '[:upper:]' '[:lower:]')_amd64.tar.gz \
+                    | sudo tar -xz -C /usr/local/bin oras
+                  ;;
+                syft)
+                  # ✅ Robust Syft installer (GitHub Releases API → latest, fallback to v1.31.0)
+                  ensure_cmd curl; ensure_cmd jq
+                  arch="$(uname -m)"
+                  case "$arch" in
+                    x86_64|amd64) goarch="amd64" ;;
+                    aarch64|arm64) goarch="arm64" ;;
+                    s390x) goarch="s390x" ;;
+                    ppc64le) goarch="ppc64le" ;;
+                    *) goarch="amd64" ;;  # safe default
+                  esac
+                  tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
+                  ver="$(curl -fsSL --retry 5 --retry-connrefused \
+                          https://api.github.com/repos/anchore/syft/releases/latest \
+                          | jq -r '.tag_name' | sed 's/^v//')"
+                  if [ -z "$ver" ] || [ "$ver" = "null" ]; then
+                    echoe "WARN: GitHub API unavailable; falling back to 1.31.0"
+                    ver="1.31.0"
+                  fi
+                  url="https://github.com/anchore/syft/releases/download/v${ver}/syft_${ver}_linux_${goarch}.tar.gz"
+                  echoe "Downloading syft ${ver} (${goarch}) from: $url"
+                  if ! curl -fsSL --retry 5 --retry-connrefused -o "$tmp/syft.tgz" "$url"; then
+                    echoe "WARN: ${url} not found; retry with pinned 1.31.0"
+                    ver="1.31.0"
+                    url="https://github.com/anchore/syft/releases/download/v${ver}/syft_${ver}_linux_${goarch}.tar.gz"
+                    curl -fsSL --retry 5 --retry-connrefused -o "$tmp/syft.tgz" "$url"
+                  fi
+                  sudo tar -xzf "$tmp/syft.tgz" -C /usr/local/bin syft
+                  /usr/local/bin/syft version || fail "syft install failed"
+                  ;;
                 *) sudo apt-get install -y "$cmd" || true ;;
               esac
             fi
           }
 
+          # 배포판별 공식 ISO/체크섬/서명 주소
           set_official_iso_vars(){
             local d="$1"
             case "$d" in
@@ -124,7 +155,7 @@ jobs:
                 SUM_TYPE="sha256"
                 SUM_URL="https://repo.almalinux.org/almalinux/9/isos/x86_64/CHECKSUM"
                 ;;
-              rhel)
+              rhel) # 인증 필요 → AlmaLinux로 자동 대체
                 ISO_URL="https://repo.almalinux.org/almalinux/9/isos/x86_64/AlmaLinux-9-latest-x86_64-minimal.iso"
                 FILE_NAME="AlmaLinux-9-latest-x86_64-minimal.iso"
                 SUM_TYPE="sha256"
@@ -135,6 +166,7 @@ jobs:
             esac
           }
 
+          # 체크섬 리스트에서 해당 파일 라인만 표준 포맷으로 정규화하여 검증
           verify_sum(){
             local fpath="$1"; local stype="$2"; local list_path="$3"
             local dir base tmp; dir="$(dirname "$fpath")"; base="$(basename "$fpath")"
@@ -158,6 +190,7 @@ jobs:
             fi
           }
 
+          # Ubuntu/Debian GPG 검증
           verify_gpg(){
             local stype="$1"; local sums="$2"; local sig="$3"; local distro="$4"
             echoe "GPG verify: distro=$distro, $sums vs $sig"
