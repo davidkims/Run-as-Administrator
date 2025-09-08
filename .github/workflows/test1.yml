@@ -417,7 +417,7 @@ jobs:
     continue-on-error: true
     steps:
       - name: ⬇️ Download artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           path: release_artifacts
 
@@ -445,7 +445,7 @@ jobs:
     continue-on-error: true
     steps:
       - name: ⬇️ Download artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           path: stage_artifacts
 
