@@ -1,4 +1,4 @@
-name: "🐧 Linux/RHEL Image Suite (ALL-IN-ONE + GPG + Bootable Installer ISO + Cloud-Init/Kickstart/Preseed + SBOM + GHCR + Hash Index)"
+name: "🐧 Linux/RHEL Image Suite (ALL-IN-ONE + GPG + Bootable Installer ISO + Cloud-Init/Kickstart/Preseed + QCOW2 + SBOM + GHCR + Hash Index)"
 
 on:
   workflow_dispatch:
@@ -44,7 +44,8 @@ jobs:
       META_DIR: dist/meta
       SEED_DIR: dist/seed
       WORK_DIR: dist/work
-      GHCR_BASE: ghcr.io/${{ github.repository }}/image-suite
+      # GHCR_BASE는 반드시 소문자여야 함
+      GHCR_BASE: ghcr.io/${{ toLower(github.repository) }}/image-suite
 
     steps:
       - name: Checkout
@@ -86,7 +87,7 @@ jobs:
                 debian-archive-keyring) sudo apt-get install -y debian-archive-keyring ;;
                 ubuntu-keyring) sudo apt-get install -y ubuntu-keyring ;;
                 oras)
-                  # ✅ ORAS: 최신 릴리스 조회 → 정확한 에셋 다운로드 (404 방지)
+                  # ORAS: 최신 릴리스 조회 → 정확한 에셋 다운로드 (404 방지)
                   ensure_cmd curl; ensure_cmd jq
                   arch="$(uname -m)"
                   case "$arch" in
@@ -94,20 +95,14 @@ jobs:
                     aarch64|arm64) goarch="arm64" ;;
                     s390x) goarch="s390x" ;;
                     ppc64le) goarch="ppc64le" ;;
-                    *) goarch="amd64" ;;  # 안전 폴백
+                    *) goarch="amd64" ;;
                   esac
                   tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
-                  ver="$(curl -fsSL --retry 5 --retry-connrefused \
-                          https://api.github.com/repos/oras-project/oras/releases/latest \
-                          | jq -r '.tag_name' | sed 's/^v//')"
-                  if [ -z "$ver" ] || [ "$ver" = "null" ]; then
-                    echoe "WARN: GitHub API 불가 → ORAS v1.2.2로 폴백"
-                    ver="1.2.2"
-                  fi
+                  ver="$(curl -fsSL --retry 5 --retry-connrefused https://api.github.com/repos/oras-project/oras/releases/latest | jq -r '.tag_name' | sed 's/^v//')"
+                  if [ -z "$ver" ] || [ "$ver" = "null" ]; then ver="1.2.2"; echoe "WARN: fallback ORAS $ver"; fi
                   url="https://github.com/oras-project/oras/releases/download/v${ver}/oras_${ver}_linux_${goarch}.tar.gz"
                   echoe "Downloading oras ${ver} (${goarch}) from: $url"
                   if ! curl -fsSL --retry 5 --retry-connrefused -o "$tmp/oras.tgz" "$url"; then
-                    echoe "WARN: ${url} 404 → 고정 v1.2.2 재시도"
                     ver="1.2.2"
                     url="https://github.com/oras-project/oras/releases/download/v${ver}/oras_${ver}_linux_${goarch}.tar.gz"
                     curl -fsSL --retry 5 --retry-connrefused -o "$tmp/oras.tgz" "$url"
@@ -116,7 +111,7 @@ jobs:
                   /usr/local/bin/oras version || fail "oras install failed"
                   ;;
                 syft)
-                  # ✅ Syft: 최신 릴리스 조회 → 정확한 에셋 다운로드 (404 방지)
+                  # Syft: 최신 릴리스 조회 → 정확한 에셋 다운로드 (404 방지)
                   ensure_cmd curl; ensure_cmd jq
                   arch="$(uname -m)"
                   case "$arch" in
@@ -124,20 +119,14 @@ jobs:
                     aarch64|arm64) goarch="arm64" ;;
                     s390x) goarch="s390x" ;;
                     ppc64le) goarch="ppc64le" ;;
-                    *) goarch="amd64" ;;  # safe default
+                    *) goarch="amd64" ;;
                   esac
                   tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
-                  ver="$(curl -fsSL --retry 5 --retry-connrefused \
-                          https://api.github.com/repos/anchore/syft/releases/latest \
-                          | jq -r '.tag_name' | sed 's/^v//')"
-                  if [ -z "$ver" ] || [ "$ver" = "null" ]; then
-                    echoe "WARN: GitHub API unavailable; falling back to 1.31.0"
-                    ver="1.31.0"
-                  fi
+                  ver="$(curl -fsSL --retry 5 --retry-connrefused https://api.github.com/repos/anchore/syft/releases/latest | jq -r '.tag_name' | sed 's/^v//')"
+                  if [ -z "$ver" ] || [ "$ver" = "null" ]; then ver="1.31.0"; echoe "WARN: fallback syft $ver"; fi
                   url="https://github.com/anchore/syft/releases/download/v${ver}/syft_${ver}_linux_${goarch}.tar.gz"
                   echoe "Downloading syft ${ver} (${goarch}) from: $url"
                   if ! curl -fsSL --retry 5 --retry-connrefused -o "$tmp/syft.tgz" "$url"; then
-                    echoe "WARN: ${url} not found; retry with pinned 1.31.0"
                     ver="1.31.0"
                     url="https://github.com/anchore/syft/releases/download/v${ver}/syft_${ver}_linux_${goarch}.tar.gz"
                     curl -fsSL --retry 5 --retry-connrefused -o "$tmp/syft.tgz" "$url"
@@ -180,7 +169,7 @@ jobs:
                 SUM_TYPE="sha256"
                 SUM_URL="https://repo.almalinux.org/almalinux/9/isos/x86_64/CHECKSUM"
                 ;;
-              rhel) # 인증 필요 → AlmaLinux로 자동 대체
+              rhel) # 인증 필요 → AlmaLinux 자동 대체
                 ISO_URL="https://repo.almalinux.org/almalinux/9/isos/x86_64/AlmaLinux-9-latest-x86_64-minimal.iso"
                 FILE_NAME="AlmaLinux-9-latest-x86_64-minimal.iso"
                 SUM_TYPE="sha256"
@@ -191,15 +180,16 @@ jobs:
             esac
           }
 
-          # 체크섬 리스트에서 해당 파일 라인만 표준 포맷으로 정규화하여 검증
+          # 체크섬 검증
           verify_sum(){
             local fpath="$1"; local stype="$2"; local list_path="$3"
             local dir base tmp; dir="$(dirname "$fpath")"; base="$(basename "$fpath")"
             if [[ -n "$list_path" && -f "$list_path" ]]; then
-              tmp="$dir/.sumline.$$.$stype"
+              tmp="$dir/.sum.$$.$stype"
+              # 표준 포맷 "HASH␣␣FILENAME" 라인만 생성
               awk -v f="$base" '{ fn=$2; sub(/^\*/, "", fn); if (fn==f) print $1 "  " f }' "$list_path" > "$tmp"
               if [[ ! -s "$tmp" ]]; then
-                echoe "WARN: checksum entry for $base not found in $(basename "$list_path"); computing local hash only"
+                echoe "WARN: checksum entry for $base not found; computing local hash only"
                 rm -f "$tmp"
                 if [[ "$stype" = "sha512" ]]; then ( cd "$dir" && sha512sum "$base" | tee "${base}.sha512.txt" )
                 else ( cd "$dir" && sha256sum "$base" | tee "${base}.sha256.txt" ); fi
@@ -236,9 +226,7 @@ jobs:
                   echoe "WARN: debian-archive-keyring missing"
                 fi
                 ;;
-              *)
-                echoe "GPG verify skipped for $distro"
-                ;;
+              *) echoe "GPG verify skipped for $distro" ;;
             esac
           }
           EOS
@@ -406,11 +394,9 @@ jobs:
 
           # 1) ISO 전체 추출
           xorriso -osirrox on -indev "$BASE_ISO" -extract / "$WORK"
-
-          # 2) 수정 가능하도록 권한 부여
           chmod -R u+w "$WORK" || true
 
-          # 3) 자동 설치 파라미터/파일 주입
+          # 2) 자동 설치 파라미터/파일 주입
           case "$D" in
             ubuntu)
               mkdir -p "$WORK/nocloud"
@@ -452,7 +438,7 @@ jobs:
               ;;
           esac
 
-          # 4) 부트 자산 동적 탐지 + 하이브리드 ISO 생성
+          # 3) 부트 자산 동적 탐지 + 하이브리드 ISO 생성
           BIOS_IMG=""; EFI_IMG=""; CATALOG=""
           if [ -f "$WORK/boot/grub/i386-pc/eltorito.img" ]; then
             BIOS_IMG="boot/grub/i386-pc/eltorito.img"; CATALOG="boot.catalog"
@@ -592,7 +578,10 @@ jobs:
           source "$ECHO_ROOT/echo_tools.sh"
           ensure_cmd oras
           echo "$GH_TOKEN" | oras login ghcr.io -u "$GH_USER" --password-stdin
-          REF="${{ env.GHCR_BASE }}:${{ env.ORAS_TAG }}"
+          # 안전: 혹시 env가 변경되어도 항상 소문자화
+          BASE_LC="$(echo "${GHCR_BASE}" | tr '[:upper:]' '[:lower:]')"
+          REF="${BASE_LC}:${ORAS_TAG}"
+          echoe "ORAS REF: $REF"
           oras push "$REF" \
             --artifact-type application/vnd.echo.bundle \
             "$ISO_DIR/$(ls -1 $ISO_DIR | head -n1)":application/octet-stream \
@@ -624,7 +613,7 @@ jobs:
           tag_name: ${{ inputs.release_tag && inputs.release_tag != '' && inputs.release_tag || format('auto-{0}', github.run_id) }}
           name: "Linux/RHEL Image Suite • ${{ inputs.distro || github.event.inputs.distro }}"
           body: |
-            ALL-IN-ONE image suite with GPG, FULL bootable installer ISO, Cloud-Init/Kickstart/Preseed, SBOM, GHCR, and hash index.
+            ALL-IN-ONE image suite with GPG, FULL bootable installer ISO, Cloud-Init/Kickstart/Preseed, QCOW2, SBOM, GHCR, and hash index.
             - Distro: `${{ inputs.distro || github.event.inputs.distro }}`
             - Base ISO URL: (see dist/meta/base_iso.urls.json)
             - Custom payload ISO: `dist/isos/custom_payload.iso`
