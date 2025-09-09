@@ -2,7 +2,7 @@ name: Dependabot Updates via Proxy
 
 on:
   schedule:
-    - cron: '0 0 * * 1' # 매주 월요일 00:00
+    - cron: '0 0 * * 1'
   workflow_dispatch:
   pull_request:
     types: [opened, reopened, synchronize]
@@ -15,18 +15,14 @@ permissions:
   contents: write
   pull-requests: write
 
-# 전역 프록시 환경 (필요시 secrets에 설정해두세요)
+# 전역 프록시(대문자만). 소문자는 런타임에 주입.
 env:
   HTTP_PROXY: ${{ secrets.HTTP_PROXY }}
   HTTPS_PROXY: ${{ secrets.HTTPS_PROXY }}
   NO_PROXY: ${{ secrets.NO_PROXY }}
-  http_proxy: ${{ secrets.HTTP_PROXY }}
-  https_proxy: ${{ secrets.HTTPS_PROXY }}
-  no_proxy: ${{ secrets.NO_PROXY }}
 
 jobs:
   run-dependabot:
-    # 스케줄/수동 실행에서만 동작
     if: ${{ github.event_name != 'pull_request' }}
     runs-on: ubuntu-latest
     steps:
@@ -42,8 +38,13 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Export JVM/Maven proxy env
+      - name: Export lowercase & JVM/Maven proxy env
         run: |
+          # 소문자 프록시
+          echo "http_proxy=${HTTP_PROXY}"  >> "$GITHUB_ENV"
+          echo "https_proxy=${HTTPS_PROXY}" >> "$GITHUB_ENV"
+          echo "no_proxy=${NO_PROXY}"       >> "$GITHUB_ENV"
+          # JVM / Maven 프록시
           echo "MAVEN_OPTS=-Dhttp.proxyHost=${{ secrets.PROXY_HOST }} -Dhttp.proxyPort=${{ secrets.PROXY_PORT }} -Dhttps.proxyHost=${{ secrets.PROXY_HOST }} -Dhttps.proxyPort=${{ secrets.PROXY_PORT }}" >> "$GITHUB_ENV"
           echo "JAVA_TOOL_OPTIONS=-Dhttp.proxyHost=${{ secrets.PROXY_HOST }} -Dhttp.proxyPort=${{ secrets.PROXY_PORT }} -Dhttps.proxyHost=${{ secrets.PROXY_HOST }} -Dhttps.proxyPort=${{ secrets.PROXY_PORT }}" >> "$GITHUB_ENV"
 
@@ -68,7 +69,6 @@ jobs:
             ghcr.io/dependabot/dependabot-core update docker /home/dependabot/app
 
   validate-pr:
-    # dependabot[bot]이 연 PR에서만 빌드/검증
     if: ${{ github.event_name == 'pull_request' && github.actor == 'dependabot[bot]' }}
     runs-on: ubuntu-latest
     steps:
@@ -84,8 +84,11 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Export JVM/Maven proxy env
+      - name: Export lowercase & JVM/Maven proxy env
         run: |
+          echo "http_proxy=${HTTP_PROXY}"   >> "$GITHUB_ENV"
+          echo "https_proxy=${HTTPS_PROXY}" >> "$GITHUB_ENV"
+          echo "no_proxy=${NO_PROXY}"       >> "$GITHUB_ENV"
           echo "MAVEN_OPTS=-Dhttp.proxyHost=${{ secrets.PROXY_HOST }} -Dhttp.proxyPort=${{ secrets.PROXY_PORT }} -Dhttps.proxyHost=${{ secrets.PROXY_HOST }} -Dhttps.proxyPort=${{ secrets.PROXY_PORT }}" >> "$GITHUB_ENV"
           echo "JAVA_TOOL_OPTIONS=-Dhttp.proxyHost=${{ secrets.PROXY_HOST }} -Dhttp.proxyPort=${{ secrets.PROXY_PORT }} -Dhttps.proxyHost=${{ secrets.PROXY_HOST }} -Dhttps.proxyPort=${{ secrets.PROXY_PORT }}" >> "$GITHUB_ENV"
 
@@ -102,10 +105,6 @@ jobs:
         run: docker build -t myapp:latest .
 
       - name: Install system packages via proxy (example)
-        env:
-          http_proxy: ${{ secrets.HTTP_PROXY }}
-          https_proxy: ${{ secrets.HTTPS_PROXY }}
-          no_proxy: ${{ secrets.NO_PROXY }}
         run: |
           sudo apt-get update
           sudo apt-get install -y curl
