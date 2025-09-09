@@ -15,28 +15,37 @@ permissions:
   contents: write
   pull-requests: write
 
-# 공통 프록시 환경 (시크릿 필요)
+# 전역 프록시 환경 (필요시 secrets에 설정해두세요)
 env:
   HTTP_PROXY: ${{ secrets.HTTP_PROXY }}
   HTTPS_PROXY: ${{ secrets.HTTPS_PROXY }}
   NO_PROXY: ${{ secrets.NO_PROXY }}
+  http_proxy: ${{ secrets.HTTP_PROXY }}
+  https_proxy: ${{ secrets.HTTPS_PROXY }}
+  no_proxy: ${{ secrets.NO_PROXY }}
 
 jobs:
   run-dependabot:
+    # 스케줄/수동 실행에서만 동작
     if: ${{ github.event_name != 'pull_request' }}
     runs-on: ubuntu-latest
-    env:
-      # env 컨텍스트 대신 secrets 직접 참조 (에러 방지)
-      MAVEN_OPTS: "-Dhttp.proxyHost=${{ secrets.PROXY_HOST }} -Dhttp.proxyPort=${{ secrets.PROXY_PORT }} -Dhttps.proxyHost=${{ secrets.PROXY_HOST }} -Dhttps.proxyPort=${{ secrets.PROXY_PORT }}"
-      JAVA_TOOL_OPTIONS: "-Dhttp.proxyHost=${{ secrets.PROXY_HOST }} -Dhttp.proxyPort=${{ secrets.PROXY_PORT }} -Dhttps.proxyHost=${{ secrets.PROXY_HOST }} -Dhttps.proxyPort=${{ secrets.PROXY_PORT }}"
     steps:
       - name: Configure apt proxy (system-wide)
         run: |
-          echo "Acquire::http::Proxy \"${HTTP_PROXY}\";" | sudo tee /etc/apt/apt.conf.d/99proxy
-          echo "Acquire::https::Proxy \"${HTTPS_PROXY}\";" | sudo tee -a /etc/apt/apt.conf.d/99proxy
+          if [ -n "${HTTP_PROXY}" ]; then
+            echo "Acquire::http::Proxy \"${HTTP_PROXY}\";" | sudo tee /etc/apt/apt.conf.d/99proxy
+          fi
+          if [ -n "${HTTPS_PROXY}" ]; then
+            echo "Acquire::https::Proxy \"${HTTPS_PROXY}\";" | sudo tee -a /etc/apt/apt.conf.d/99proxy
+          fi
 
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Export JVM/Maven proxy env
+        run: |
+          echo "MAVEN_OPTS=-Dhttp.proxyHost=${{ secrets.PROXY_HOST }} -Dhttp.proxyPort=${{ secrets.PROXY_PORT }} -Dhttps.proxyHost=${{ secrets.PROXY_HOST }} -Dhttps.proxyPort=${{ secrets.PROXY_PORT }}" >> "$GITHUB_ENV"
+          echo "JAVA_TOOL_OPTIONS=-Dhttp.proxyHost=${{ secrets.PROXY_HOST }} -Dhttp.proxyPort=${{ secrets.PROXY_PORT }} -Dhttps.proxyHost=${{ secrets.PROXY_HOST }} -Dhttps.proxyPort=${{ secrets.PROXY_PORT }}" >> "$GITHUB_ENV"
 
       - name: Run Dependabot for Maven (via proxy)
         run: |
@@ -59,19 +68,26 @@ jobs:
             ghcr.io/dependabot/dependabot-core update docker /home/dependabot/app
 
   validate-pr:
+    # dependabot[bot]이 연 PR에서만 빌드/검증
     if: ${{ github.event_name == 'pull_request' && github.actor == 'dependabot[bot]' }}
     runs-on: ubuntu-latest
-    env:
-      MAVEN_OPTS: "-Dhttp.proxyHost=${{ secrets.PROXY_HOST }} -Dhttp.proxyPort=${{ secrets.PROXY_PORT }} -Dhttps.proxyHost=${{ secrets.PROXY_HOST }} -Dhttps.proxyPort=${{ secrets.PROXY_PORT }}"
-      JAVA_TOOL_OPTIONS: "-Dhttp.proxyHost=${{ secrets.PROXY_HOST }} -Dhttp.proxyPort=${{ secrets.PROXY_PORT }} -Dhttps.proxyHost=${{ secrets.PROXY_HOST }} -Dhttps.proxyPort=${{ secrets.PROXY_PORT }}"
     steps:
       - name: Configure apt proxy (system-wide)
         run: |
-          echo "Acquire::http::Proxy \"${HTTP_PROXY}\";" | sudo tee /etc/apt/apt.conf.d/99proxy
-          echo "Acquire::https::Proxy \"${HTTPS_PROXY}\";" | sudo tee -a /etc/apt/apt.conf.d/99proxy
+          if [ -n "${HTTP_PROXY}" ]; then
+            echo "Acquire::http::Proxy \"${HTTP_PROXY}\";" | sudo tee /etc/apt/apt.conf.d/99proxy
+          fi
+          if [ -n "${HTTPS_PROXY}" ]; then
+            echo "Acquire::https::Proxy \"${HTTPS_PROXY}\";" | sudo tee -a /etc/apt/apt.conf.d/99proxy
+          fi
 
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Export JVM/Maven proxy env
+        run: |
+          echo "MAVEN_OPTS=-Dhttp.proxyHost=${{ secrets.PROXY_HOST }} -Dhttp.proxyPort=${{ secrets.PROXY_PORT }} -Dhttps.proxyHost=${{ secrets.PROXY_HOST }} -Dhttps.proxyPort=${{ secrets.PROXY_PORT }}" >> "$GITHUB_ENV"
+          echo "JAVA_TOOL_OPTIONS=-Dhttp.proxyHost=${{ secrets.PROXY_HOST }} -Dhttp.proxyPort=${{ secrets.PROXY_PORT }} -Dhttps.proxyHost=${{ secrets.PROXY_HOST }} -Dhttps.proxyPort=${{ secrets.PROXY_PORT }}" >> "$GITHUB_ENV"
 
       - name: Set up Java
         uses: actions/setup-java@v4
@@ -87,9 +103,9 @@ jobs:
 
       - name: Install system packages via proxy (example)
         env:
-          http_proxy: ${{ env.HTTP_PROXY }}
-          https_proxy: ${{ env.HTTPS_PROXY }}
-          no_proxy: ${{ env.NO_PROXY }}
+          http_proxy: ${{ secrets.HTTP_PROXY }}
+          https_proxy: ${{ secrets.HTTPS_PROXY }}
+          no_proxy: ${{ secrets.NO_PROXY }}
         run: |
           sudo apt-get update
           sudo apt-get install -y curl
