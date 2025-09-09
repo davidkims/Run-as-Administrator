@@ -2,7 +2,7 @@ name: Dependabot Updates via Proxy
 
 on:
   schedule:
-    - cron: '0 0 * * 1' # 매주 월요일 00:00 (Asia/Seoul 기준 리포지토리 타임존에 따라 다를 수 있음)
+    - cron: '0 0 * * 1' # 매주 월요일 00:00
   workflow_dispatch:
   pull_request:
     types: [opened, reopened, synchronize]
@@ -15,23 +15,20 @@ permissions:
   contents: write
   pull-requests: write
 
-# 공통 환경변수: 필요 시 리포지토리 시크릿에 설정
-# HTTP_PROXY, HTTPS_PROXY, NO_PROXY, PROXY_HOST, PROXY_PORT 필수
+# 공통 프록시 환경 (시크릿 필요)
 env:
   HTTP_PROXY: ${{ secrets.HTTP_PROXY }}
   HTTPS_PROXY: ${{ secrets.HTTPS_PROXY }}
   NO_PROXY: ${{ secrets.NO_PROXY }}
-  PROXY_HOST: ${{ secrets.PROXY_HOST }}
-  PROXY_PORT: ${{ secrets.PROXY_PORT }}
 
 jobs:
   run-dependabot:
-    # 스케줄/수동 실행에서만 동작 (PR 검증과 분리)
     if: ${{ github.event_name != 'pull_request' }}
     runs-on: ubuntu-latest
     env:
-      MAVEN_OPTS: "-Dhttp.proxyHost=${{ env.PROXY_HOST }} -Dhttp.proxyPort=${{ env.PROXY_PORT }} -Dhttps.proxyHost=${{ env.PROXY_HOST }} -Dhttps.proxyPort=${{ env.PROXY_PORT }}"
-      JAVA_TOOL_OPTIONS: "-Dhttp.proxyHost=${{ env.PROXY_HOST }} -Dhttp.proxyPort=${{ env.PROXY_PORT }} -Dhttps.proxyHost=${{ env.PROXY_HOST }} -Dhttps.proxyPort=${{ env.PROXY_PORT }}"
+      # env 컨텍스트 대신 secrets 직접 참조 (에러 방지)
+      MAVEN_OPTS: "-Dhttp.proxyHost=${{ secrets.PROXY_HOST }} -Dhttp.proxyPort=${{ secrets.PROXY_PORT }} -Dhttps.proxyHost=${{ secrets.PROXY_HOST }} -Dhttps.proxyPort=${{ secrets.PROXY_PORT }}"
+      JAVA_TOOL_OPTIONS: "-Dhttp.proxyHost=${{ secrets.PROXY_HOST }} -Dhttp.proxyPort=${{ secrets.PROXY_PORT }} -Dhttps.proxyHost=${{ secrets.PROXY_HOST }} -Dhttps.proxyPort=${{ secrets.PROXY_PORT }}"
     steps:
       - name: Configure apt proxy (system-wide)
         run: |
@@ -41,7 +38,6 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # Maven 업데이트 (dependabot-core 컨테이너)
       - name: Run Dependabot for Maven (via proxy)
         run: |
           docker run --rm \
@@ -52,7 +48,6 @@ jobs:
             -v "${{ github.workspace }}":/home/dependabot/app \
             ghcr.io/dependabot/dependabot-core update maven /home/dependabot/app
 
-      # Docker 업데이트 (dependabot-core 컨테이너)
       - name: Run Dependabot for Docker (via proxy)
         run: |
           docker run --rm \
@@ -64,12 +59,11 @@ jobs:
             ghcr.io/dependabot/dependabot-core update docker /home/dependabot/app
 
   validate-pr:
-    # Dependabot 봇이 연 PR에서만 빌드/검증 수행
     if: ${{ github.event_name == 'pull_request' && github.actor == 'dependabot[bot]' }}
     runs-on: ubuntu-latest
     env:
-      MAVEN_OPTS: "-Dhttp.proxyHost=${{ env.PROXY_HOST }} -Dhttp.proxyPort=${{ env.PROXY_PORT }} -Dhttps.proxyHost=${{ env.PROXY_HOST }} -Dhttps.proxyPort=${{ env.PROXY_PORT }}"
-      JAVA_TOOL_OPTIONS: "-Dhttp.proxyHost=${{ env.PROXY_HOST }} -Dhttp.proxyPort=${{ env.PROXY_PORT }} -Dhttps.proxyHost=${{ env.PROXY_HOST }} -Dhttps.proxyPort=${{ env.PROXY_PORT }}"
+      MAVEN_OPTS: "-Dhttp.proxyHost=${{ secrets.PROXY_HOST }} -Dhttp.proxyPort=${{ secrets.PROXY_PORT }} -Dhttps.proxyHost=${{ secrets.PROXY_HOST }} -Dhttps.proxyPort=${{ secrets.PROXY_PORT }}"
+      JAVA_TOOL_OPTIONS: "-Dhttp.proxyHost=${{ secrets.PROXY_HOST }} -Dhttp.proxyPort=${{ secrets.PROXY_PORT }} -Dhttps.proxyHost=${{ secrets.PROXY_HOST }} -Dhttps.proxyPort=${{ secrets.PROXY_PORT }}"
     steps:
       - name: Configure apt proxy (system-wide)
         run: |
