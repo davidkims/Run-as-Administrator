@@ -63,7 +63,7 @@ jobs:
       base_port: ${{ steps.cfg.outputs.base_port }}
     steps:
       - name: 🛒 Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         continue-on-error: true
 
       - name: 🔧 Config echo
@@ -149,7 +149,7 @@ jobs:
 
     steps:
       - name: 🛒 Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       # 1) 첫 Java 설정(캐시 없이) → 캐시 미스/경로 오류 방지
       - name: ☕ Setup Java (no cache yet)
@@ -472,7 +472,7 @@ jobs:
           retention-days: 14
 
       - name: 🛒 Checkout (for PR)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: 📝 Create a PROD workflow copy (PR)
         run: |
