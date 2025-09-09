@@ -655,7 +655,7 @@ jobs:
           echo "s3://${ECHO_S3_BUCKET}/" | tee -a "$META_DIR/deploy_targets.txt"
 
       # ======== 멀티 배포: Azure Blob ========
-      - name: Azure: create container & upload
+      - name: Azure:create container & upload
         if: env.AZURE_STORAGE_ACCOUNT != '' && env.AZURE_STORAGE_KEY != '' && env.ECHO_AZURE_CONTAINER != ''
         continue-on-error: true
         shell: bash
@@ -683,7 +683,7 @@ jobs:
         continue-on-error: true
         uses: google-github-actions/setup-gcloud@v2
 
-      - name: GCS: create bucket & rsync
+      - name: GCS:create bucket & rsync
         if: env.ECHO_GCS_BUCKET != '' && (success() || always())
         continue-on-error: true
         shell: bash
