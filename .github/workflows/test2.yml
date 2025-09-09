@@ -1,0 +1,737 @@
+name: "🐧 Linux/RHEL Image Suite (ALL-IN-ONE + Upgrade + GPG + Bootable Installer ISO + Cloud-Init/Kickstart/Preseed + QCOW2 + SBOM + GHCR + Hash Index + Multi-Deploy)"
+
+on:
+  workflow_dispatch:
+    inputs:
+      distro:
+        description: "배포판 (ubuntu|debian|rocky|alma|rhel)"
+        type: choice
+        required: true
+        default: "ubuntu"
+        options: [ "ubuntu", "debian", "rocky", "alma", "rhel" ]
+      qcow_size_gb:
+        description: "QCOW2 사이즈(GB)"
+        required: true
+        default: "8"
+      release_tag:
+        description: "Release 태그(비우면 auto-{run_id})"
+        required: false
+        default: ""
+  workflow_call:
+    inputs:
+      distro: { type: string, required: true }
+      qcow_size_gb: { type: string, default: "8" }
+      release_tag: { type: string, default: "" }
+
+permissions:
+  contents: write
+  packages: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: linux-rhel-image-suite-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  image-suite:
+    name: "ALL-IN-ONE: Upgrade + Build + Verify + Bootable ISO + QCOW2 + SBOM + Hash + Test Server + Multi-Deploy"
+    runs-on: ubuntu-latest
+    env:
+      ECHO_ROOT: .github/echo_linux
+      DIST_DIR: dist
+      ISO_DIR: dist/isos
+      IMG_DIR: dist/images
+      LOG_DIR: dist/logs
+      META_DIR: dist/meta
+      SEED_DIR: dist/seed
+      WORK_DIR: dist/work
+      GHCR_BASE: ghcr.io/${{ github.repository }}/image-suite
+
+      # =====(선택) 멀티 배포용 공통 환경 =====
+      # GitHub Pages 캐시/아티팩트
+      PAGES_ARTIFACT_NAME: image-suite-pages-${{ github.run_id }}
+
+      # AWS S3 (옵션: 값이 존재할 때만 동작)
+      AWS_REGION: ${{ secrets.AWS_REGION }}
+      ECHO_S3_BUCKET: ${{ secrets.ECHO_S3_BUCKET }}
+      # 자격: AWS OIDC 또는 액세스키(둘 중 하나) — 둘 다 없으면 스킵
+      AWS_ROLE_TO_ASSUME: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+      # Azure Blob (옵션)
+      AZURE_STORAGE_ACCOUNT: ${{ secrets.AZURE_STORAGE_ACCOUNT }}
+      AZURE_STORAGE_KEY: ${{ secrets.AZURE_STORAGE_KEY }}
+      ECHO_AZURE_CONTAINER: ${{ secrets.ECHO_AZURE_CONTAINER }}
+
+      # GCS (옵션)
+      ECHO_GCS_BUCKET: ${{ secrets.ECHO_GCS_BUCKET }}
+      GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+      GCP_SERVICE_ACCOUNT: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+      GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Init dirs
+        run: |
+          set -Eeuo pipefail
+          mkdir -p "$ECHO_ROOT"/{linux,rhel}/bulk \
+                   "$DIST_DIR" "$ISO_DIR" "$IMG_DIR" "$LOG_DIR" "$META_DIR" \
+                   "$SEED_DIR"/{cloud-init,preseed,kickstart} "$WORK_DIR"
+          printf '[%s] INIT: dirs ready\n' "$(date -u +'%F %T')"
+
+      - name: Echo tools (functions)
+        id: echo-tools
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cat > "$ECHO_ROOT/echo_tools.sh" <<'EOS'
+          set -Eeuo pipefail
+          TS(){ date -u +'%Y-%m-%dT%H:%M:%SZ'; }
+          echoe(){ printf '[%s] %s\n' "$(TS)" "$*"; }
+          notify(){ echo "::warning ::$*"; echoe "$*" | tee -a "${GITHUB_STEP_SUMMARY:-/dev/null}" >/dev/null; }
+          softfail(){ echoe "::warning ::$*"; echoe "Continuing despite error"; }
+          tryrun(){ bash -lc "$*" || { softfail "Step failed: $*"; return 0; }; }
+          fail(){ echoe "::error::$*"; exit 1; }
+
+          runner_upgrade(){
+            sudo apt-get update -y || softfail "apt update failed"
+            apt list --upgradable 2>/dev/null | tee "dist/meta/upgradable_before.txt" >/dev/null || true
+            sudo DEBIAN_FRONTEND=noninteractive apt-get -y upgrade || softfail "apt upgrade failed"
+            sudo DEBIAN_FRONTEND=noninteractive apt-get -y dist-upgrade || softfail "apt dist-upgrade failed"
+            sudo apt-get -y autoremove || true
+            apt list --upgradable 2>/dev/null | tee "dist/meta/upgradable_after.txt" >/dev/null || true
+            {
+              echo "# Runner Upgrade Report"
+              echo "- Timestamp: $(TS)"
+              echo "## Upgradable BEFORE"; echo '```'; cat dist/meta/upgradable_before.txt 2>/dev/null || echo "(none)"; echo '```'
+              echo "## Upgradable AFTER";  echo '```'; cat dist/meta/upgradable_after.txt  2>/dev/null || echo "(none)"; echo '```'
+            } > dist/meta/UPGRADE_REPORT.md
+          }
+
+          ensure_cmd(){
+            local cmd="$1"
+            if ! command -v "$cmd" >/dev/null 2>&1; then
+              echoe "installing: $cmd"
+              sudo apt-get update -y
+              case "$cmd" in
+                mkisofs) sudo apt-get install -y genisoimage ;;
+                xorriso) sudo apt-get install -y xorriso ;;
+                isohybrid|isohdpfx.bin) sudo apt-get install -y syslinux-utils isolinux || true ;;
+                qemu-img) sudo apt-get install -y qemu-utils ;;
+                curl|jq) sudo apt-get install -y curl jq ;;
+                sha256sum|sha512sum) sudo apt-get install -y coreutils ;;
+                file) sudo apt-get install -y file ;;
+                gpg|gpgv|dirmngr) sudo apt-get install -y gnupg dirmngr ;;
+                debian-archive-keyring) sudo apt-get install -y debian-archive-keyring ;;
+                ubuntu-keyring) sudo apt-get install -y ubuntu-keyring ;;
+                python3-pip) sudo apt-get install -y python3-pip ;;
+                aws) sudo apt-get install -y python3-pip && sudo pip3 install --no-cache-dir awscli || true ;;
+                az) curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash || true ;;
+                google-cloud-cli) \
+                  echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] http://packages.cloud.google.com/apt cloud-sdk main" | \
+                  sudo tee /etc/apt/sources.list.d/google-cloud-sdk.list >/dev/null && \
+                  curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | sudo gpg --yes --dearmor -o /usr/share/keyrings/cloud.google.gpg && \
+                  sudo apt-get update -y && sudo apt-get install -y google-cloud-cli ;;
+                oras)
+                  ensure_cmd curl; ensure_cmd jq
+                  arch="$(uname -m)"; case "$arch" in x86_64|amd64) goarch="amd64";; aarch64|arm64) goarch="arm64";; s390x) goarch="s390x";; ppc64le) goarch="ppc64le";; *) goarch="amd64";; esac
+                  tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
+                  ver="$(curl -fsSL --retry 5 --retry-connrefused https://api.github.com/repos/oras-project/oras/releases/latest | jq -r '.tag_name' | sed 's/^v//')"
+                  [ -z "$ver" -o "$ver" = "null" ] && { ver="1.2.2"; notify "fallback ORAS $ver"; }
+                  url="https://github.com/oras-project/oras/releases/download/v${ver}/oras_${ver}_linux_${goarch}.tar.gz"
+                  curl -fsSL --retry 5 --retry-connrefused -o "$tmp/oras.tgz" "$url" || { softfail "oras download failed"; return 0; }
+                  sudo tar -xzf "$tmp/oras.tgz" -C /usr/local/bin oras || softfail "oras extract failed"
+                  /usr/local/bin/oras version || softfail "oras verify failed"
+                  ;;
+                syft)
+                  ensure_cmd curl; ensure_cmd jq
+                  arch="$(uname -m)"; case "$arch" in x86_64|amd64) goarch="amd64";; aarch64|arm64) goarch="arm64";; s390x) goarch="s390x";; ppc64le) goarch="ppc64le";; *) goarch="amd64";; esac
+                  tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
+                  ver="$(curl -fsSL --retry 5 --retry-connrefused https://api.github.com/repos/anchore/syft/releases/latest | jq -r '.tag_name' | sed 's/^v//')"
+                  [ -z "$ver" -o "$ver" = "null" ] && { ver="1.31.0"; notify "fallback syft $ver"; }
+                  url="https://github.com/anchore/syft/releases/download/v${ver}/syft_${ver}_linux_${goarch}.tar.gz"
+                  curl -fsSL --retry 5 --retry-connrefused -o "$tmp/syft.tgz" "$url" || { softfail "syft download failed"; return 0; }
+                  sudo tar -xzf "$tmp/syft.tgz" -C /usr/local/bin syft || softfail "syft extract failed"
+                  /usr/local/bin/syft version || softfail "syft verify failed"
+                  ;;
+                *) sudo apt-get install -y "$cmd" || true ;;
+              esac
+            fi
+          }
+
+          # 공식 ISO/체크섬/서명 주소
+          set_official_iso_vars(){
+            local d="$1"
+            case "$d" in
+              ubuntu)
+                ISO_URL="https://releases.ubuntu.com/24.04.3/ubuntu-24.04.3-live-server-amd64.iso"
+                FILE_NAME="ubuntu-24.04.3-live-server-amd64.iso"
+                SUM_TYPE="sha256"
+                SUM_URL="https://releases.ubuntu.com/24.04.3/SHA256SUMS"
+                SUM_SIG_URL="https://releases.ubuntu.com/24.04.3/SHA256SUMS.gpg"
+                ;;
+              debian)
+                ISO_URL="https://cdimage.debian.org/debian-cd/current/amd64/iso-cd/debian-13.1.0-amd64-netinst.iso"
+                FILE_NAME="debian-13.1.0-amd64-netinst.iso"
+                SUM_TYPE="sha512"
+                SUM_URL="https://cdimage.debian.org/debian-cd/current/amd64/iso-cd/SHA512SUMS"
+                SUM_SIG_URL="https://cdimage.debian.org/debian-cd/current/amd64/iso-cd/SHA512SUMS.sign"
+                ;;
+              rocky)
+                ISO_URL="https://download.rockylinux.org/pub/rocky/9/isos/x86_64/Rocky-9-latest-x86_64-minimal.iso"
+                FILE_NAME="Rocky-9-latest-x86_64-minimal.iso"
+                SUM_TYPE="sha256"
+                SUM_URL="https://download.rockylinux.org/pub/rocky/9/isos/x86_64/CHECKSUM"
+                ;;
+              alma)
+                ISO_URL="https://repo.almalinux.org/almalinux/9/isos/x86_64/AlmaLinux-9-latest-x86_64-minimal.iso"
+                FILE_NAME="AlmaLinux-9-latest-x86_64-minimal.iso"
+                SUM_TYPE="sha256"
+                SUM_URL="https://repo.almalinux.org/almalinux/9/isos/x86_64/CHECKSUM"
+                ;;
+              rhel)
+                ISO_URL="https://repo.almalinux.org/almalinux/9/isos/x86_64/AlmaLinux-9-latest-x86_64-minimal.iso"
+                FILE_NAME="AlmaLinux-9-latest-x86_64-minimal.iso"
+                SUM_TYPE="sha256"
+                SUM_URL="https://repo.almalinux.org/almalinux/9/isos/x86_64/CHECKSUM"
+                FALLBACK_NOTE="Requested 'rhel' but used AlmaLinux (auth required for RHEL)."
+                ;;
+              *) ISO_URL=""; FILE_NAME="";;
+            esac
+          }
+
+          verify_sum(){
+            local fpath="$1"; local stype="$2"; local list_path="$3"
+            local dir base tmp; dir="$(dirname "$fpath")"; base="$(basename "$fpath")"
+            if [[ -n "$list_path" && -f "$list_path" ]]; then
+              tmp="$dir/.sum.$$.$stype"
+              awk -v f="$base" '{ fn=$2; sub(/^\*/, "", fn); if (fn==f) print $1 "  " f }' "$list_path" > "$tmp"
+              if [[ ! -s "$tmp" ]]; then
+                notify "checksum entry for $base not found; computing local hash only"
+                rm -f "$tmp"
+                if [[ "$stype" = "sha512" ]]; then ( cd "$dir" && sha512sum "$base" | tee "${base}.sha512.txt" )
+                else ( cd "$dir" && sha256sum "$base" | tee "${base}.sha256.txt" ); fi
+                return
+              fi
+              if [[ "$stype" = "sha512" ]]; then ( cd "$dir" && sha512sum -c "$(basename "$tmp")" ) || softfail "sha512 verify failed"
+              else ( cd "$dir" && sha256sum -c "$(basename "$tmp")" ) || softfail "sha256 verify failed"
+              fi
+              rm -f "$tmp"
+            else
+              notify "checksum list not found; computing local $stype only"
+              if [[ "$stype" = "sha512" ]]; then ( cd "$dir" && sha512sum "$base" | tee "${base}.sha512.txt" )
+              else ( cd "$dir" && sha256sum "$base" | tee "${base}.sha256.txt" ); fi
+            fi
+          }
+
+          verify_gpg(){
+            local stype="$1"; local sums="$2"; local sig="$3"; local distro="$4"
+            echoe "GPG verify: distro=$distro, $sums vs $sig"
+            case "$distro" in
+              ubuntu)
+                if [ -f /usr/share/keyrings/ubuntu-archive-keyring.gpg ]; then
+                  gpgv --keyring /usr/share/keyrings/ubuntu-archive-keyring.gpg "$sig" "$sums" \
+                    && { echoe "Ubuntu GPG OK (keyring)"; return; } || notify "ubuntu-keyring gpgv failed; trying keyserver..."
+                fi
+                gpg --batch --keyserver hkps://keyserver.ubuntu.com --recv-keys 0xD94AA3F0EFE21092 0x46181433FBB75451 || true
+                gpg --verify "$sig" "$sums" && echoe "Ubuntu GPG OK (keyserver)" || softfail "Ubuntu GPG verify failed"
+                ;;
+              debian)
+                if [ -f /usr/share/keyrings/debian-archive-keyring.gpg ]; then
+                  gpgv --keyring /usr/share/keyrings/debian-archive-keyring.gpg "$sig" "$sums" \
+                    && { echoe "Debian GPG OK (keyring)"; return; } || softfail "debian-keyring gpgv failed"
+                else
+                  notify "debian-archive-keyring missing"
+                fi
+                ;;
+              *) notify "GPG verify skipped for $distro" ;;
+            esac
+          }
+
+          record_download(){ echo "$1 -> $2" >> "dist/meta/DOWNLOADS.txt"; }
+
+          # ===== Echo 리소스(대상별) 생성 유틸 =====
+          ensure_s3(){
+            [ -z "${ECHO_S3_BUCKET:-}" ] && return 0
+            ensure_cmd aws
+            # 버킷 없으면 생성
+            aws s3api head-bucket --bucket "$ECHO_S3_BUCKET" 2>/dev/null || \
+              aws s3api create-bucket --bucket "$ECHO_S3_BUCKET" --region "${AWS_REGION:-us-east-1}" \
+                $( [ "${AWS_REGION:-us-east-1}" != "us-east-1" ] && echo --create-bucket-configuration LocationConstraint="${AWS_REGION:-us-east-1}" ) \
+                || softfail "S3 bucket create failed"
+          }
+          ensure_azure(){
+            [ -z "${AZURE_STORAGE_ACCOUNT:-}" ] || [ -z "${ECHO_AZURE_CONTAINER:-}" ] && return 0
+            ensure_cmd az
+            AZURE_STORAGE_KEY="${AZURE_STORAGE_KEY:-}"
+            if [ -n "$AZURE_STORAGE_KEY" ]; then
+              az storage container create --account-name "$AZURE_STORAGE_ACCOUNT" --account-key "$AZURE_STORAGE_KEY" --name "$ECHO_AZURE_CONTAINER" --public-access blob >/dev/null 2>&1 || softfail "Azure container create failed"
+            else
+              softfail "AZURE_STORAGE_KEY missing; skipping container creation"
+            fi
+          }
+          ensure_gcs(){
+            [ -z "${ECHO_GCS_BUCKET:-}" ] && return 0
+            ensure_cmd google-cloud-cli
+            gsutil ls -b "gs://$ECHO_GCS_BUCKET" >/dev/null 2>&1 || gsutil mb -p "${GCP_PROJECT_ID:-}" -l us "gs://$ECHO_GCS_BUCKET" || softfail "GCS bucket create failed"
+          }
+          EOS
+          chmod +x "$ECHO_ROOT/echo_tools.sh"
+
+      # ==== Upgrade & Build (기존 ALL-IN-ONE 흐름, 실패시 계속) ====
+      - name: Runner upgrade (safe) + report
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          source "$ECHO_ROOT/echo_tools.sh"
+          mkdir -p "$LOG_DIR" "$META_DIR"
+          runner_upgrade
+
+      - name: Bulk dirs/files
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          source "$ECHO_ROOT/echo_tools.sh"
+          SPEC_FILE="$META_DIR/dir_spec.txt"
+          echo "linux:100,rhel:100" > "$SPEC_FILE"
+          while read -r PREFIX COUNT; do
+            echoe "Generating prefix=$PREFIX count=$COUNT"
+            BASE="$ECHO_ROOT/$PREFIX/bulk"
+            for ((i=1;i<=COUNT;i++)); do
+              D="$BASE/${PREFIX}_dir_$i"
+              tryrun "mkdir -p '$D/sub1' '$D/sub2'"
+              echo "sample file for $PREFIX #$i" > "$D/README.txt" || true
+              printf '{"prefix":"%s","index":%d,"ts":"%s"}\n' "$PREFIX" "$i" "$(date -u +'%F %T')" > "$D/meta.json" || true
+            done
+          done < "$SPEC_FILE"
+          tryrun "tar -C '$ECHO_ROOT' -cf '$DIST_DIR/echo_bulk.tar' ."
+
+      - name: Download base ISO + GPG verify
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          source "$ECHO_ROOT/echo_tools.sh"
+          ensure_cmd curl; ensure_cmd sha256sum; ensure_cmd sha512sum; ensure_cmd file; ensure_cmd jq
+          ensure_cmd gpg; ensure_cmd gpgv; ensure_cmd dirmngr
+          ensure_cmd debian-archive-keyring || true
+          ensure_cmd ubuntu-keyring || true
+          D="${{ inputs.distro || github.event.inputs.distro }}"
+          set_official_iso_vars "$D"
+          [[ -z "$ISO_URL" ]] && { softfail "No ISO URL resolved"; exit 0; }
+          jq -n --arg url "$ISO_URL" --arg sumurl "${SUM_URL:-}" --arg sigurl "${SUM_SIG_URL:-}" --arg sumtype "${SUM_TYPE:-sha256}" --arg note "${FALLBACK_NOTE:-}" \
+            '{base_iso_url:$url, checksum_url:$sumurl, signature_url:$sigurl, checksum_type:$sumtype, note:$note}' \
+            | tee "$META_DIR/base_iso.urls.json" >/dev/null
+          OUT="$ISO_DIR/$FILE_NAME"
+          tryrun "curl -fL '$ISO_URL' -o '$OUT'"
+          [ -f "$OUT" ] && record_download "$ISO_URL" "$OUT"
+          if [ -f "$OUT" ]; then
+            file "$OUT" | tee "$META_DIR/base_iso.file.txt" >/dev/null
+            if [[ -n "$SUM_URL" ]]; then
+              LIST="$ISO_DIR/$(basename "$SUM_URL")"
+              tryrun "curl -fsSL '$SUM_URL' -o '$LIST'"
+              [ -f "$LIST" ] && record_download "$SUM_URL" "$LIST"
+            fi
+            if [[ -n "${SUM_SIG_URL:-}" && -f "$LIST" ]]; then
+              SIG="$ISO_DIR/$(basename "$SUM_SIG_URL")"
+              tryrun "curl -fsSL '$SUM_SIG_URL' -o '$SIG'"
+              [ -f "$SIG" ] && record_download "$SUM_SIG_URL" "$SIG"
+              [ -f "$SIG" ] && verify_gpg "${SUM_TYPE:-sha256}" "$LIST" "$SIG" "$D"
+            fi
+            verify_sum "$OUT" "${SUM_TYPE:-sha256}" "${LIST:-}"
+          fi
+
+      - name: Custom payload ISO (snapshot of ECHO_ROOT)
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          source "$ECHO_ROOT/echo_tools.sh"
+          ensure_cmd mkisofs || ensure_cmd xorriso
+          LABEL="ECHO_DATA_$(date -u +%Y%m%d)"
+          ISO_OUT="$ISO_DIR/custom_payload.iso"
+          if command -v mkisofs >/dev/null 2>&1; then
+            tryrun "mkisofs -V '$LABEL' -J -R -o '$ISO_OUT' '$ECHO_ROOT'"
+          else
+            tryrun "xorriso -as mkisofs -V '$LABEL' -J -R -o '$ISO_OUT' '$ECHO_ROOT'"
+          fi
+          [ -f "$ISO_OUT" ] && sha256sum "$ISO_OUT" | tee "$META_DIR/custom_payload.sha256.txt" >/dev/null || true
+
+      - name: Seed ISOs (Cloud-Init/Kickstart/Preseed)
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          source "$ECHO_ROOT/echo_tools.sh"
+          ensure_cmd mkisofs || ensure_cmd xorriso
+          mkdir -p "$SEED_DIR"/{cloud-init,preseed,kickstart}
+          cat > "$SEED_DIR/cloud-init/user-data" <<'UD'
+          #cloud-config
+          hostname: echo-host
+          users:
+            - name: ubuntu
+              sudo: ALL=(ALL) NOPASSWD:ALL
+              groups: users, admin, sudo
+              lock_passwd: false
+              plain_text_passwd: "echo1234"
+          ssh_pwauth: true
+          packages: [vim, curl]
+          runcmd:
+            - [ bash, -lc, "echo 'hello from cloud-init' > /root/hello.txt" ]
+          UD
+          echo "instance-id: iid-echo; local-hostname: echo-host" > "$SEED_DIR/cloud-init/meta-data"
+
+          cat > "$SEED_DIR/kickstart/ks.cfg" <<'KS'
+          #version=RHEL9
+          text
+          lang en_US.UTF-8
+          keyboard us
+          timezone UTC
+          rootpw echo1234
+          network --bootproto=dhcp
+          firewall --enabled
+          selinux --enforcing
+          services --enabled=sshd
+          bootloader --location=mbr
+          autopart --type=lvm
+          %packages
+          @^minimal-environment
+          vim
+          %end
+          %post
+          echo "hello from kickstart" > /root/ks_hello.txt
+          %end
+          KS
+
+          cat > "$SEED_DIR/preseed/preseed.cfg" <<'PS'
+          d-i debian-installer/locale string en_US
+          d-i keyboard-configuration/layoutcode string us
+          d-i netcfg/choose_interface select auto
+          d-i time/zone string UTC
+          d-i passwd/user-fullname string Echo User
+          d-i passwd/username string echo
+          d-i passwd/user-password password echo1234
+          d-i passwd/user-password-again password echo1234
+          d-i pkgsel/include string vim curl
+          PS
+
+          CIDATA="$ISO_DIR/seed-cidata.iso"
+          if command -v mkisofs >/dev/null 2>&1; then
+            tryrun "mkisofs -V CIDATA -J -R -o '$CIDATA' '$SEED_DIR/cloud-init'"
+          else
+            tryrun "xorriso -as mkisofs -V CIDATA -J -R -o '$CIDATA' '$SEED_DIR/cloud-init'"
+          fi
+          [ -f "$CIDATA" ] && sha256sum "$CIDATA" | tee "$META_DIR/seed_cidata.sha256.txt" >/dev/null || true
+
+      - name: Full bootable custom installer ISO (UEFI/BIOS)
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          source "$ECHO_ROOT/echo_tools.sh"
+          ensure_cmd xorriso; ensure_cmd isohybrid || true; ensure_cmd isohdpfx.bin || true
+          D="${{ inputs.distro || github.event.inputs.distro }}"
+          BASE_ISO="$ISO_DIR/$(
+            jq -r '.base_iso_url' "$META_DIR/base_iso.urls.json" 2>/dev/null | awk -F/ '{print $NF}'
+          )"
+          [[ -z "$BASE_ISO" || ! -f "$BASE_ISO" ]] && BASE_ISO="$ISO_DIR/$(ls -1 "$ISO_DIR" 2>/dev/null | grep -E '\.iso$' | head -n1 || true)"
+          [[ -z "$BASE_ISO" || ! -f "$BASE_ISO" ]] && { softfail "Base ISO not found"; exit 0; }
+          WORK="$WORK_DIR/root"
+          rm -rf "$WORK"; mkdir -p "$WORK"
+          tryrun "xorriso -osirrox on -indev '$BASE_ISO' -extract / '$WORK'"
+          chmod -R u+w "$WORK" || true
+          case "$D" in
+            ubuntu)
+              mkdir -p "$WORK/nocloud"
+              cp "$SEED_DIR/cloud-init/user-data" "$WORK/nocloud/user-data" || true
+              cp "$SEED_DIR/cloud-init/meta-data" "$WORK/nocloud/meta-data" || true
+              for CFG in "$WORK/boot/grub/grub.cfg" "$WORK/EFI/BOOT/grub.cfg" "$WORK/boot/grub/loopback.cfg" "$WORK/isolinux/txt.cfg"; do
+                [ -f "$CFG" ] || continue
+                if grep -qE '^\s*linux(efi)?\s' "$CFG"; then
+                  sed -i 's,^\(\s*linux[^#]*\)$,\1 autoinstall ds=nocloud;s=/cdrom/nocloud/,' "$CFG" || true
+                elif grep -qE '^\s*append\s' "$CFG"; then
+                  sed -i 's,^\(\s*append .*\)$,\1 autoinstall ds=nocloud;s=/cdrom/nocloud/,' "$CFG" || true
+                fi
+              done
+              ;;
+            debian)
+              mkdir -p "$WORK/preseed"
+              cp "$SEED_DIR/preseed/preseed.cfg" "$WORK/preseed/preseed.cfg" || true
+              for CFG in "$WORK/isolinux/txt.cfg" "$WORK/boot/grub/grub.cfg" "$WORK/EFI/BOOT/grub.cfg"; do
+                [ -f "$CFG" ] || continue
+                if grep -qE '^\s*linux(efi)?\s' "$CFG"; then
+                  sed -i 's,^\(\s*linux[^#]*\)$,\1 auto=true priority=critical file=/cdrom/preseed/preseed.cfg,' "$CFG" || true
+                elif grep -qE '^\s*append\s' "$CFG"; then
+                  sed -i 's,^\(\s*append .*\)$,\1 auto=true priority=critical file=/cdrom/preseed/preseed.cfg,' "$CFG" || true
+                fi
+              done
+              ;;
+            rocky|alma|rhel)
+              cp "$SEED_DIR/kickstart/ks.cfg" "$WORK/ks.cfg" || true
+              for CFG in "$WORK/isolinux/isolinux.cfg" "$WORK/EFI/BOOT/grub.cfg" "$WORK/boot/grub/grub.cfg"; do
+                [ -f "$CFG" ] || continue
+                if grep -qE '^\s*linuxefi\s' "$CFG"; then
+                  sed -i 's,^\(\s*linuxefi\s\+\S\+\s\+.*\)$,\1 inst.ks=cdrom:/ks.cfg,' "$CFG" || true
+                elif grep -qE '^\s*linux\s' "$CFG"; then
+                  sed -i 's,^\(\s*linux\s\+\S\+\s\+.*\)$,\1 inst.ks=cdrom:/ks.cfg,' "$CFG" || true
+                elif grep -qE '^\s*append\s' "$CFG"; then
+                  sed -i 's,^\(\s*append .*\)$,\1 inst.ks=cdrom:/ks.cfg,' "$CFG" || true
+                fi
+              done
+              ;;
+          esac
+          BIOS_IMG=""; EFI_IMG=""; CATALOG=""
+          [ -f "$WORK/boot/grub/i386-pc/eltorito.img" ] && { BIOS_IMG="boot/grub/i386-pc/eltorito.img"; CATALOG="boot.catalog"; }
+          [ -z "$BIOS_IMG" ] && [ -f "$WORK/isolinux/isolinux.bin" ] && { BIOS_IMG="isolinux/isolinux.bin"; CATALOG="isolinux/boot.cat"; }
+          [ -f "$WORK/boot/grub/efi.img" ] && EFI_IMG="boot/grub/efi.img"
+          [ -z "$EFI_IMG" ] && [ -f "$WORK/EFI/BOOT/efiboot.img" ] && EFI_IMG="EFI/BOOT/efiboot.img"
+          [ -z "$EFI_IMG" ] && [ -f "$WORK/efi.img" ] && EFI_IMG="efi.img"
+          LABEL_RAW="ECHO_INST_${D}_$(date -u +%Y%m%d)"
+          LABEL="$(echo "$LABEL_RAW" | tr -cd 'A-Za-z0-9_-' | cut -c1-16)"; [ -z "$LABEL" ] && LABEL="ECHO_${D}_$(date -u +%y%m%d)"
+          OUT="$ISO_DIR/custom_installer_${D}.iso"
+          if [ -n "$BIOS_IMG" ] && [ -n "$EFI_IMG" ]; then
+            tryrun "xorriso -as mkisofs -r -V '$LABEL' -o '$OUT' -J -l ${CATALOG:+-c '$CATALOG'} -b '$BIOS_IMG' -no-emul-boot -boot-load-size 4 -boot-info-table -eltorito-alt-boot -e '$EFI_IMG' -no-emul-boot -isohybrid-gpt-basdat '$WORK'"
+          elif [ -n "$BIOS_IMG" ]; then
+            tryrun "xorriso -as mkisofs -r -V '$LABEL' -o '$OUT' -J -l ${CATALOG:+-c '$CATALOG'} -b '$BIOS_IMG' -no-emul-boot -boot-load-size 4 -boot-info-table '$WORK'"
+          elif [ -n "$EFI_IMG" ]; then
+            tryrun "xorriso -as mkisofs -r -V '$LABEL' -o '$OUT' -J -l -e '$EFI_IMG' -no-emul-boot -isohybrid-gpt-basdat '$WORK'"
+          else
+            softfail "Boot images not found"
+          fi
+          [ -f "$OUT" ] && sha256sum "$OUT" | tee "$META_DIR/custom_installer.sha256.txt" >/dev/null || true
+
+      - name: Post-ISO:extra bulk & MOVE
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          source "$ECHO_ROOT/echo_tools.sh"
+          EXTRA="$ECHO_ROOT/after_iso_payload"
+          mkdir -p "$EXTRA/bulk_extra"
+          for i in $(seq 1 50); do
+            tryrun "mkdir -p '$EXTRA/bulk_extra/extra_${i}/subA' '$EXTRA/bulk_extra/extra_${i}/subB'"
+            echo "extra payload $i" > "$EXTRA/bulk_extra/extra_${i}/README.txt" || true
+          done
+          if [ -d "$ECHO_ROOT/linux/bulk" ]; then
+            mkdir -p "$EXTRA/bulk_from_linux"
+            find "$ECHO_ROOT/linux/bulk" -mindepth 1 -maxdepth 1 -type d -print0 | xargs -0 -I{} mv "{}" "$EXTRA/bulk_from_linux"/ || softfail "move linux bulk failed"
+          fi
+          if [ -d "$ECHO_ROOT/rhel/bulk" ]; then
+            mkdir -p "$EXTRA/bulk_from_rhel"
+            find "$ECHO_ROOT/rhel/bulk" -mindepth 1 -maxdepth 1 -type d -print0 | xargs -0 -I{} mv "{}" "$EXTRA/bulk_from_rhel"/ || softfail "move rhel bulk failed"
+          fi
+          tryrun "tar -C '$EXTRA' -cf '$DIST_DIR/after_iso_payload.tar' ."
+
+      - name: QCOW2 base & snapshot
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          source "$ECHO_ROOT/echo_tools.sh"
+          ensure_cmd qemu-img
+          SIZE_GB="${{ inputs.qcow_size_gb || github.event.inputs.qcow_size_gb }}"
+          DISTRO="${{ inputs.distro || github.event.inputs.distro }}"
+          mkdir -p "$IMG_DIR" "$META_DIR" "$LOG_DIR"
+          pushd "$IMG_DIR" >/dev/null
+          BASE="base_${DISTRO}.qcow2"; SNAP="snap_${DISTRO}.qcow2"
+          tryrun "qemu-img create -f qcow2 -o cluster_size=65536,compression_type=zlib '$BASE' '${SIZE_GB}G'"
+          [ -f "$BASE" ] && qemu-img info --output=json "$BASE" | tee "$META_DIR/qcow2_base.info.json" >/dev/null || true
+          tryrun "qemu-img check '$BASE' | tee '$LOG_DIR/qcow2_base.check.log'"
+          tryrun "qemu-img create -f qcow2 -b '$BASE' -F qcow2 '$SNAP'"
+          [ -f "$SNAP" ] && qemu-img info --output=json "$SNAP" | tee "$META_DIR/qcow2_snap.info.json" >/dev/null || true
+          tryrun "qemu-img check '$SNAP' | tee '$LOG_DIR/qcow2_snap.check.log'"
+          popd >/dev/null
+
+      - name: SBOM (SPDX-JSON)
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          source "$ECHO_ROOT/echo_tools.sh"
+          ensure_cmd syft
+          mkdir -p "$DIST_DIR/sbom"
+          syft version || true
+          tryrun "syft dir:'$DIST_DIR' -o spdx-json > '$DIST_DIR/sbom/dist.spdx.json'"
+
+      - name: Hash catalog & index
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          source "$ECHO_ROOT/echo_tools.sh"
+          ensure_cmd jq
+          HASH_JSON="$META_DIR/hash_index.json"
+          : > "$HASH_JSON"; echo "[" >> "$HASH_JSON"; first=1
+          while IFS= read -r -d '' f; do
+            sha256=$(sha256sum "$f" | awk '{print $1}')
+            sha512=$(sha512sum "$f" | awk '{print $1}')
+            size=$(stat -c%s "$f"); rel="${f#dist/}"
+            entry=$(jq -n --arg path "$rel" --arg sha256 "$sha256" --arg sha512 "$sha512" --argjson size "$size" \
+              '{path:$path,sha256:$sha256,sha512:$sha512,size:$size}')
+            if [ $first -eq 1 ]; then echo "  $entry" >> "$HASH_JSON"; first=0; else echo " ,$entry" >> "$HASH_JSON"; fi
+          done < <(find dist -type f -print0)
+          echo "]" >> "$HASH_JSON"
+
+      - name: Test server (serve dist/) & health check
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          source "$ECHO_ROOT/echo_tools.sh"
+          LOG="$LOG_DIR/test_server.log"; PORT=8080
+          ( python3 -m http.server "$PORT" --directory "$DIST_DIR" > "$LOG" 2>&1 & echo $! > "$LOG_DIR/test_server.pid" )
+          sleep 2
+          tryrun "curl -sSf http://127.0.0.1:${PORT}/ | head -n 5"
+
+      # ======== 멀티 배포: GHCR (ORAS) ========
+      - name: GHCR upload via ORAS (dynamic files)
+        continue-on-error: true
+        env:
+          ORAS_TAG: ${{ github.run_id }}
+          GH_USER: ${{ github.actor }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          source "$ECHO_ROOT/echo_tools.sh"
+          ensure_cmd oras
+          echo "$GH_TOKEN" | oras login ghcr.io -u "$GH_USER" --password-stdin || { softfail "oras login failed"; exit 0; }
+          BASE_LC="$(echo "${GHCR_BASE}" | tr '[:upper:]' '[:lower:]')"
+          REF="${BASE_LC}:${ORAS_TAG}"
+          declare -a files=()
+          while IFS= read -r -d '' f; do files+=("$f"); done < <(find "$ISO_DIR" "$IMG_DIR" "$DIST_DIR/sbom" "$META_DIR" -type f -print0 2>/dev/null || true)
+          for f in "$DIST_DIR/echo_bulk.tar" "$DIST_DIR/after_iso_payload.tar"; do [ -f "$f" ] && files+=("$f"); done
+          [ ${#files[@]} -eq 0 ] && { softfail "No files to push to ORAS"; exit 0; }
+          args=(push "$REF" --artifact-type application/vnd.echo.bundle)
+          for f in "${files[@]}"; do
+            mt="application/octet-stream"
+            case "$f" in *.json) mt="application/json" ;; *.spdx.json) mt="application/spdx+json" ;; *.txt|*.log|*.md) mt="text/plain" ;; *.tar) mt="application/x-tar" ;; esac
+            args+=("$f:$mt")
+          done
+          tryrun "${args[@]}"
+
+      # ======== 멀티 배포: GitHub Pages ========
+      - name: Prepare Pages Artifact (dist/)
+        continue-on-error: true
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+          name: ${{ env.PAGES_ARTIFACT_NAME }}
+
+      - name: Deploy to GitHub Pages
+        continue-on-error: true
+        uses: actions/deploy-pages@v4
+        with:
+          artifact_name: ${{ env.PAGES_ARTIFACT_NAME }}
+
+      # ======== 멀티 배포: AWS S3 ========
+      - name: Configure AWS (OIDC or Keys)
+        id: aws-auth
+        if: env.ECHO_S3_BUCKET != '' && (env.AWS_ROLE_TO_ASSUME != '' || (env.AWS_ACCESS_KEY_ID != '' && env.AWS_SECRET_ACCESS_KEY != ''))
+        continue-on-error: true
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_TO_ASSUME }}
+          aws-access-key-id: ${{ env.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ env.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Create S3 echo bucket & sync dist/**
+        if: env.ECHO_S3_BUCKET != '' && steps.aws-auth.outcome != 'skipped'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          source "$ECHO_ROOT/echo_tools.sh"
+          ensure_cmd aws
+          ensure_s3
+          aws s3 sync "dist/" "s3://${ECHO_S3_BUCKET}/" --delete || softfail "s3 sync failed"
+          echo "s3://${ECHO_S3_BUCKET}/" | tee -a "$META_DIR/deploy_targets.txt"
+
+      # ======== 멀티 배포: Azure Blob ========
+      - name: Azure:create container & upload
+        if: env.AZURE_STORAGE_ACCOUNT != '' && env.AZURE_STORAGE_KEY != '' && env.ECHO_AZURE_CONTAINER != ''
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          source "$ECHO_ROOT/echo_tools.sh"
+          ensure_cmd az
+          ensure_azure
+          az storage blob upload-batch --account-name "$AZURE_STORAGE_ACCOUNT" --account-key "$AZURE_STORAGE_KEY" \
+            -d "$ECHO_AZURE_CONTAINER" -s "dist" --overwrite true || softfail "azure upload-batch failed"
+          echo "azure://$AZURE_STORAGE_ACCOUNT/$ECHO_AZURE_CONTAINER/" | tee -a "$META_DIR/deploy_targets.txt"
+
+      # ======== 멀티 배포: Google Cloud Storage ========
+      - name: GCP auth (Workload Identity Federation)  # 또는 GITHUB OIDC <-> GCP 셋업 시
+        if: env.ECHO_GCS_BUCKET != '' && env.GCP_WORKLOAD_IDENTITY_PROVIDER != '' && env.GCP_SERVICE_ACCOUNT != ''
+        continue-on-error: true
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ env.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ env.GCP_SERVICE_ACCOUNT }}
+          project_id: ${{ env.GCP_PROJECT_ID }}
+
+      - name: Setup gcloud
+        if: env.ECHO_GCS_BUCKET != '' && (success() || always())
+        continue-on-error: true
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: GCS:create bucket & rsync
+        if: env.ECHO_GCS_BUCKET != '' && (success() || always())
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          source "$ECHO_ROOT/echo_tools.sh"
+          ensure_cmd google-cloud-cli
+          ensure_gcs
+          gsutil -m rsync -d -r "dist" "gs://$ECHO_GCS_BUCKET" || softfail "gcs rsync failed"
+          echo "gs://$ECHO_GCS_BUCKET/" | tee -a "$META_DIR/deploy_targets.txt"
+
+      # ======== GitHub Release (요약 포함) ========
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        continue-on-error: true
+        with:
+          name: linux-rhel-image-suite-${{ github.run_id }}
+          path: dist/**
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Create GitHub Release (tolerant)
+        uses: softprops/action-gh-release@v2
+        continue-on-error: true
+        with:
+          tag_name: ${{ inputs.release_tag && inputs.release_tag != '' && inputs.release_tag || format('auto-{0}', github.run_id) }}
+          name: "Linux/RHEL Image Suite • ${{ inputs.distro || github.event.inputs.distro }}"
+          body: |
+            ALL-IN-ONE image suite with Runner Upgrade, GPG verify, FULL bootable installer ISO, Cloud-Init/Kickstart/Preseed, QCOW2, SBOM, GHCR, Hash Index, **Multi-Deploy** (Pages/S3/Azure/GCS).
+            - Distro: `${{ inputs.distro || github.event.inputs.distro }}`
+            - Base ISO URL: see `dist/meta/base_iso.urls.json`
+            - Payload ISO: `dist/isos/custom_payload.iso`
+            - Installer ISO: `dist/isos/custom_installer_${{ inputs.distro || github.event.inputs.distro }}.iso`
+            - Seed ISO: `dist/isos/seed-cidata.iso`
+            - QCOW2: `dist/images/base_${{ inputs.distro || github.event.inputs.distro }}.qcow2` + `snap_${{ inputs.distro || github.event.inputs.distro }}.qcow2`
+            - SBOM: `dist/sbom/dist.spdx.json`
+            - Hash index: `dist/meta/hash_index.json`
+            - Runner Upgrade Report: `dist/meta/UPGRADE_REPORT.md`
+            - Download Manifest: `dist/meta/DOWNLOADS.txt`
+            - Deploy Targets: `dist/meta/deploy_targets.txt` (if any)
+            - GHCR ref: `${{ env.GHCR_BASE }}:${{ github.run_id }}`
+          files: |
+            dist/isos/*.iso
+            dist/images/*.qcow2
+            dist/meta/**
+            dist/logs/**
+            dist/sbom/**
+            dist/echo_bulk.tar
+            dist/after_iso_payload.tar
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

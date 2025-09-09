@@ -11,6 +11,20 @@ permissions:
 
 jobs:
   dependabot:
+name: Dependabot Proxy Build
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+    branches: [ main ]
+    paths:
+      - '**/pom.xml'
+      - '.github/**'
+  workflow_dispatch:
+
+jobs:
+  build:
+    if: ${{ github.actor == 'dependabot[bot]' }}
     runs-on: ubuntu-latest
     env:
       HTTP_PROXY: ${{ secrets.HTTP_PROXY }}
@@ -43,3 +57,26 @@ jobs:
             -v "${{ github.workspace }}":/home/dependabot/app \
             ghcr.io/dependabot/dependabot-core update \
             docker /home/dependabot/app
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Setup Java
+        uses: actions/setup-java@v3
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Build with Maven
+        run: mvn -B package --file pom.xml
+
+      - name: Build Docker image
+        run: docker build -t myapp:latest .
+
+      - name: Install system packages via proxy
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl
+        env:
+          http_proxy: ${{ env.HTTP_PROXY }}
+          https_proxy: ${{ env.HTTPS_PROXY }}
