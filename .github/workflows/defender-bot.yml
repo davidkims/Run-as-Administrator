@@ -1,15 +1,110 @@
-name: Defender Bot Setup
+name: Dependabot Updates via Proxy
 
 on:
+  schedule:
+    - cron: '0 0 * * 1'
   workflow_dispatch:
+  pull_request:
+    types: [opened, reopened, synchronize]
+    branches: [main]
+    paths:
+      - '**/pom.xml'
+      - '.github/**'
+
+permissions:
+  contents: write
+  pull-requests: write
+
+# 전역 프록시(대문자만). 소문자는 런타임에 주입.
+env:
+  HTTP_PROXY: ${{ secrets.HTTP_PROXY }}
+  HTTPS_PROXY: ${{ secrets.HTTPS_PROXY }}
+  NO_PROXY: ${{ secrets.NO_PROXY }}
 
 jobs:
-  setup:
+  run-dependabot:
+    if: ${{ github.event_name != 'pull_request' }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - name: Download dependencies
-        env:
-          PROXY_URL: ${{ secrets.PROXY_URL }}
+      - name: Configure apt proxy (system-wide)
         run: |
-          bash scripts/defender-bot.sh --proxy "$PROXY_URL"
+          if [ -n "${HTTP_PROXY}" ]; then
+            echo "Acquire::http::Proxy \"${HTTP_PROXY}\";" | sudo tee /etc/apt/apt.conf.d/99proxy
+          fi
+          if [ -n "${HTTPS_PROXY}" ]; then
+            echo "Acquire::https::Proxy \"${HTTPS_PROXY}\";" | sudo tee -a /etc/apt/apt.conf.d/99proxy
+          fi
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Export lowercase & JVM/Maven proxy env
+        run: |
+          # 소문자 프록시
+          echo "http_proxy=${HTTP_PROXY}"  >> "$GITHUB_ENV"
+          echo "https_proxy=${HTTPS_PROXY}" >> "$GITHUB_ENV"
+          echo "no_proxy=${NO_PROXY}"       >> "$GITHUB_ENV"
+          # JVM / Maven 프록시
+          echo "MAVEN_OPTS=-Dhttp.proxyHost=${{ secrets.PROXY_HOST }} -Dhttp.proxyPort=${{ secrets.PROXY_PORT }} -Dhttps.proxyHost=${{ secrets.PROXY_HOST }} -Dhttps.proxyPort=${{ secrets.PROXY_PORT }}" >> "$GITHUB_ENV"
+          echo "JAVA_TOOL_OPTIONS=-Dhttp.proxyHost=${{ secrets.PROXY_HOST }} -Dhttp.proxyPort=${{ secrets.PROXY_PORT }} -Dhttps.proxyHost=${{ secrets.PROXY_HOST }} -Dhttps.proxyPort=${{ secrets.PROXY_PORT }}" >> "$GITHUB_ENV"
+
+      - name: Run Dependabot for Maven (via proxy)
+        run: |
+          docker run --rm \
+            -e GITHUB_ACCESS_TOKEN=${{ secrets.GITHUB_TOKEN }} \
+            -e HTTP_PROXY="${HTTP_PROXY}" \
+            -e HTTPS_PROXY="${HTTPS_PROXY}" \
+            -e NO_PROXY="${NO_PROXY}" \
+            -v "${{ github.workspace }}":/home/dependabot/app \
+            ghcr.io/dependabot/dependabot-core update maven /home/dependabot/app
+
+      - name: Run Dependabot for Docker (via proxy)
+        run: |
+          docker run --rm \
+            -e GITHUB_ACCESS_TOKEN=${{ secrets.GITHUB_TOKEN }} \
+            -e HTTP_PROXY="${HTTP_PROXY}" \
+            -e HTTPS_PROXY="${HTTPS_PROXY}" \
+            -e NO_PROXY="${NO_PROXY}" \
+            -v "${{ github.workspace }}":/home/dependabot/app \
+            ghcr.io/dependabot/dependabot-core update docker /home/dependabot/app
+
+  validate-pr:
+    if: ${{ github.event_name == 'pull_request' && github.actor == 'dependabot[bot]' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure apt proxy (system-wide)
+        run: |
+          if [ -n "${HTTP_PROXY}" ]; then
+            echo "Acquire::http::Proxy \"${HTTP_PROXY}\";" | sudo tee /etc/apt/apt.conf.d/99proxy
+          fi
+          if [ -n "${HTTPS_PROXY}" ]; then
+            echo "Acquire::https::Proxy \"${HTTPS_PROXY}\";" | sudo tee -a /etc/apt/apt.conf.d/99proxy
+          fi
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Export lowercase & JVM/Maven proxy env
+        run: |
+          echo "http_proxy=${HTTP_PROXY}"   >> "$GITHUB_ENV"
+          echo "https_proxy=${HTTPS_PROXY}" >> "$GITHUB_ENV"
+          echo "no_proxy=${NO_PROXY}"       >> "$GITHUB_ENV"
+          echo "MAVEN_OPTS=-Dhttp.proxyHost=${{ secrets.PROXY_HOST }} -Dhttp.proxyPort=${{ secrets.PROXY_PORT }} -Dhttps.proxyHost=${{ secrets.PROXY_HOST }} -Dhttps.proxyPort=${{ secrets.PROXY_PORT }}" >> "$GITHUB_ENV"
+          echo "JAVA_TOOL_OPTIONS=-Dhttp.proxyHost=${{ secrets.PROXY_HOST }} -Dhttp.proxyPort=${{ secrets.PROXY_PORT }} -Dhttps.proxyHost=${{ secrets.PROXY_HOST }} -Dhttps.proxyPort=${{ secrets.PROXY_PORT }}" >> "$GITHUB_ENV"
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Build with Maven
+        run: mvn -B -V -e -DskipTests package
+
+      - name: Build Docker image
+        run: docker build -t myapp:latest .
+
+      - name: Install system packages via proxy (example)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl
