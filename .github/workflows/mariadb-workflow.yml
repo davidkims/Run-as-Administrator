@@ -1,0 +1,29 @@
+name: MariaDB automation
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 3 * * *'
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Update and upgrade packages
+        run: |
+          sudo apt-get update
+          sudo apt-get -y upgrade
+      - name: Install MariaDB and required packages
+        run: |
+          sudo apt-get install -y mariadb-server curl
+      - name: Create file with permissions
+        run: |
+          sudo bash -c 'echo "Workflow executed on $(date)" > /tmp/workflow.log'
+          sudo chmod 644 /tmp/workflow.log
+          sudo chown $USER:$USER /tmp/workflow.log
+      - name: Start MariaDB service
+        run: |
+          sudo systemctl start mariadb
+          sudo systemctl status mariadb --no-pager
