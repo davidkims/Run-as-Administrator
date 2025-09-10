@@ -1,31 +1,428 @@
-name: Defender Bot Linux ISO Update
+name: "🏦 FinOps + EchoOps: Docker Install/Upgrade + TD-Sim + 재무제표 시뮬 + 이미지"
 
 on:
-  schedule:
-    - cron: '0 0 * * 0'
   workflow_dispatch:
+    inputs:
+      rows:
+        description: "시뮬레이션 거래 건수(예: 1000)"
+        required: true
+        default: "1000"
+      commit_changes:
+        description: "에코 산출물 커밋/푸시 (true/false)"
+        required: true
+        default: "true"
+      create_release:
+        description: "GitHub Release 생성 (true/false)"
+        required: true
+        default: "false"
+      enable_teradata:
+        description: "Teradata 컨테이너 시도 (true/false) - 토큰/라이선스 필요"
+        required: true
+        default: "false"
+      run_kafka:
+        description: "Kafka/ZooKeeper 실행 (true/false)"
+        required: true
+        default: "false"
+      teradata_token:
+        description: "Teradata Docker 토큰(선택) - enable_teradata=true일 때 권장"
+        required: false
+        default: ""
 
 permissions:
   contents: write
+  packages: read
+
+concurrency:
+  group: finops-echoops-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  update-linux-iso:
+  finops:
     runs-on: ubuntu-latest
+    timeout-minutes: 120
+
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Update Linux ISO info
-        run: bash ./scripts/update-linux-iso-info.sh
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
-      - name: Commit changes
+      - name: Echo helpers + Directories
+        shell: bash
         run: |
-          if [[ -n "$(git status --porcelain)" ]]; then
-            git config user.name "github-actions[bot]"
-            git config user.email "github-actions[bot]@users.noreply.github.com"
-            git add linux-iso-info.txt
-            git commit -m "Update Linux ISO info"
-            git push
-          else
-            echo "No changes to commit"
+          set -Eeuo pipefail
+          TS(){ date +"%Y-%m-%d %H:%M:%S%z"; }
+          echoe(){ echo "[$(TS)] [ECHO] $*"; }
+          warn(){ echo "[$(TS)] [WARN] $*" >&2; }
+          fail(){ echo "[$(TS)] [FAIL] $*" >&2; exit 1; }
+
+          echoe "대량 디렉토리 생성"
+          mkdir -p .github/echo/{logs,sql,bin,configs,imgs,reports} \
+                   .github/echo_db/{ddl,dml,seed} \
+                   .github/echo_td/{sim,docs} \
+                   site/{reports,imgs,logs,sql} \
+                   artifacts
+
+          echoe "에코 상태 파일 생성"
+          printf "%s\n" "started: $(TS)" "actor: $GITHUB_ACTOR" "rows: ${{ inputs.rows }}" > .github/echo/logs/run.meta
+
+      - name: Install/Upgrade Docker (with fallback)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          TS(){ date +"%Y-%m-%d %H:%M:%S%z"; }
+          echoe(){ echo "[$(TS)] [ECHO] $*"; }
+
+          echoe "Docker 버전 확인(사전)"
+          docker --version || true
+
+          echoe "APT 업데이트 및 필수 패키지"
+          sudo apt-get update -y
+          sudo apt-get install -y apt-transport-https ca-certificates curl gnupg lsb-release jq
+
+          echoe "Docker 공식 GPG 키 및 레포지토리"
+          curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --yes --dearmor -o /usr/share/keyrings/docker.gpg
+          echo \
+            "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
+            $(. /etc/os-release && echo $VERSION_CODENAME) stable" | \
+            sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+
+          echoe "Docker 최신 설치/업그레이드"
+          sudo apt-get update -y
+          sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+
+          echoe "Docker 버전 확인(설치 후)"
+          docker --version
+          docker compose version || true
+
+          echoe "현재 사용자 도커 그룹 추가(세션 반영은 다음 런에 적용될 수 있음)"
+          sudo usermod -aG docker $USER || true
+
+      - name: Start Core Containers (PostgreSQL + MinIO + Adminer)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          TS(){ date +"%Y-%m-%d %H:%M:%S%z"; }
+          echoe(){ echo "[$(TS)] [ECHO] $*"; }
+          NET="finops_net"
+
+          echoe "도커 네트워크 생성"
+          docker network inspect "$NET" >/dev/null 2>&1 || docker network create "$NET"
+
+          echoe "PostgreSQL 기동(finops-db)"
+          docker rm -f finops-db >/dev/null 2>&1 || true
+          docker run -d --name finops-db --network "$NET" \
+            -e POSTGRES_PASSWORD=finops \
+            -e POSTGRES_USER=finops \
+            -e POSTGRES_DB=finops \
+            -p 5432:5432 \
+            postgres:16
+
+          echoe "Adminer 기동(DB UI)"
+          docker rm -f finops-adminer >/dev/null 2>&1 || true
+          docker run -d --name finops-adminer --network "$NET" \
+            -e ADMINER_DEFAULT_SERVER=finops-db \
+            -p 8080:8080 \
+            adminer:4
+
+          echoe "MinIO 기동(object storage)"
+          docker rm -f finops-minio >/dev/null 2>&1 || true
+          docker run -d --name finops-minio --network "$NET" \
+            -e MINIO_ROOT_USER=admin -e MINIO_ROOT_PASSWORD=admin12345 \
+            -p 9000:9000 -p 9001:9001 \
+            minio/minio server /data --console-address ":9001"
+
+          echoe "컨테이너 상태"
+          docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}'
+
+      - name: (Optional) Kafka + ZooKeeper
+        if: ${{ inputs.run_kafka == 'true' }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          TS(){ date +"%Y-%m-%d %H:%M:%S%z"; }
+          echoe(){ echo "[$(TS)] [ECHO] $*"; }
+          NET="finops_net"
+
+          echoe "ZooKeeper"
+          docker rm -f finops-zk >/dev/null 2>&1 || true
+          docker run -d --name finops-zk --network "$NET" -p 2181:2181 \
+            -e ALLOW_ANONYMOUS_LOGIN=yes bitnami/zookeeper:3.9
+
+          echoe "Kafka"
+          docker rm -f finops-kafka >/dev/null 2>&1 || true
+          docker run -d --name finops-kafka --network "$NET" -p 9092:9092 \
+            -e KAFKA_BROKER_ID=1 \
+            -e KAFKA_CFG_ZOOKEEPER_CONNECT=finops-zk:2181 \
+            -e ALLOW_PLAINTEXT_LISTENER=yes \
+            -e KAFKA_CFG_LISTENERS=PLAINTEXT://:9092 \
+            -e KAFKA_CFG_ADVERTISED_LISTENERS=PLAINTEXT://localhost:9092 \
+            bitnami/kafka:3.7
+
+          docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}'
+
+      - name: (Optional) Teradata Container Attempt (skips if not permitted)
+        if: ${{ inputs.enable_teradata == 'true' }}
+        shell: bash
+        env:
+          TD_TOKEN: ${{ inputs.teradata_token }}
+        run: |
+          set -Eeuo pipefail
+          TS(){ date +"%Y-%m-%d %H:%M:%S%z"; }
+          echoe(){ echo "[$(TS)] [ECHO] $*"; }
+          warn(){ echo "[$(TS)] [WARN] $*" >&2; }
+
+          echoe "Teradata 컨테이너는 라이선스/토큰/동의가 필요합니다."
+          if [ -z "${TD_TOKEN:-}" ]; then
+            warn "teradata_token 미제공: 공식 이미지 풀/실행을 건너뜁니다. TD-Sim(PostgreSQL)로 대체합니다."
+            exit 0
           fi
+
+          # 실제 Teradata 이미지는 공개적으로 접근 불가(권한/계약 필요). 아래는 자리표시자 예시입니다.
+          # 사용자는 Teradata에서 제공하는 레지스트리/토큰/이미지명을 문서에 따라 교체하세요.
+          warn "다음은 샘플 명령어 템플릿입니다(실행 시 실패 가능):"
+          echo "docker login <teradata-registry> -u token -p ${TD_TOKEN}" | tee .github/echo/logs/teradata.login.txt
+          echo "docker pull <teradata-registry>/teradata:latest" | tee -a .github/echo/logs/teradata.login.txt
+          echo "docker run -d --name teradata --network finops_net <teradata-registry>/teradata:latest" | tee -a .github/echo/logs/teradata.login.txt
+
+      - name: Generate DDL (Balance Sheet / Income Statement / Journal / Accounts)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          echo '# DDL' > .github/echo_db/ddl/README.md
+
+          cat > .github/echo_db/ddl/001_core.sql <<'SQL'
+          create table if not exists accounts (
+              account_id      bigserial primary key,
+              account_no      varchar(32) unique not null,
+              holder_name     varchar(128) not null,
+              opened_at       timestamptz not null default now(),
+              status          varchar(16) not null default 'ACTIVE'
+          );
+          create table if not exists journal_entries (
+              je_id           bigserial primary key,
+              ts              timestamptz not null default now(),
+              account_no      varchar(32) not null,
+              type            varchar(8) not null check (type in ('DEBIT','CREDIT')),
+              amount          numeric(18,2) not null check (amount>=0),
+              currency        varchar(8) not null default 'KRW',
+              memo            text
+          );
+          create index if not exists ix_journal_account_ts on journal_entries(account_no, ts);
+
+          create table if not exists transactions (
+              txn_id          bigserial primary key,
+              ts              timestamptz not null default now(),
+              account_no      varchar(32) not null,
+              direction       varchar(8) not null check (direction in ('IN','OUT')),
+              amount          numeric(18,2) not null check (amount>=0),
+              balance_after   numeric(18,2) not null,
+              ref             varchar(64),
+              note            text
+          );
+          create index if not exists ix_txn_account_ts on transactions(account_no, ts);
+
+          create table if not exists balances (
+              account_no      varchar(32) primary key,
+              balance         numeric(18,2) not null default 0
+          );
+
+          -- 재무제표 집계용 뷰(간단 모델)
+          create or replace view v_income_statement as
+          select
+             date_trunc('day', ts) as d,
+             sum(case when direction='IN'  then amount else 0 end) as revenue,
+             sum(case when direction='OUT' then amount else 0 end) as expense,
+             sum(case when direction='IN'  then amount else -amount end) as profit
+          from transactions
+          group by 1
+          order by 1;
+
+          create or replace view v_balance_sheet as
+          select
+             sum(balance) as total_assets
+          from balances;
+          SQL
+
+      - name: Apply DDL to PostgreSQL
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          PGPASSWORD=finops psql -h 127.0.0.1 -U finops -d finops -f .github/echo_db/ddl/001_core.sql
+
+      - name: Seed virtual accounts
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cat > .github/echo_db/seed/accounts.sql <<'SQL'
+          do $$
+          declare
+            i int;
+          begin
+            for i in 1..50 loop
+              insert into accounts(account_no, holder_name)
+              values ( 'V' || to_char(i, 'FM000000'), 'User ' || i )
+              on conflict (account_no) do nothing;
+              insert into balances(account_no, balance) values ('V' || to_char(i,'FM000000'), 0)
+              on conflict (account_no) do nothing;
+            end loop;
+          end$$;
+          SQL
+          PGPASSWORD=finops psql -h 127.0.0.1 -U finops -d finops -f .github/echo_db/seed/accounts.sql
+
+      - name: Generate simulation script (Python)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cat > .github/echo/bin/simulate.py <<'PY'
+          import os, random, csv, math, time
+          from datetime import datetime, timedelta
+          import psycopg2
+          import matplotlib.pyplot as plt
+
+          ROWS = int(os.getenv("ROWS", "1000"))
+          PGHOST=os.getenv("PGHOST","127.0.0.1")
+          PGUSER=os.getenv("PGUSER","finops")
+          PGPASSWORD=os.getenv("PGPASSWORD","finops")
+          PGDB=os.getenv("PGDB","finops")
+
+          # 계좌 풀
+          accts = [f"V{str(i).zfill(6)}" for i in range(1,51)]
+
+          conn = psycopg2.connect(host=PGHOST, user=PGUSER, password=PGPASSWORD, dbname=PGDB)
+          cur = conn.cursor()
+
+          # 시뮬레이션 시작 시각 (과거 7일 분산)
+          base = datetime.utcnow() - timedelta(days=7)
+
+          # 거래 생성
+          rows = []
+          for i in range(ROWS):
+            acc = random.choice(accts)
+            ts = base + timedelta(seconds=i* (7*24*3600/ROWS))
+            direction = random.choice(["IN","OUT"])
+            amount = round(random.uniform(10, 500000), 2)
+
+            # 잔액 조회
+            cur.execute("select balance from balances where account_no=%s", (acc,))
+            bal = cur.fetchone()
+            bal = float(bal[0]) if bal else 0.0
+            new_bal = bal + amount if direction == "IN" else max(0.0, bal - amount)
+
+            # 트랜잭션 기록
+            cur.execute("""insert into transactions(account_no, direction, amount, balance_after, ref, note, ts)
+                           values(%s,%s,%s,%s,%s,%s,%s) returning txn_id""",
+                        (acc, direction, amount, new_bal, f"REF{i}", "sim", ts))
+            # 저널(간소)
+            jtype = "DEBIT" if direction=="IN" else "CREDIT"
+            cur.execute("""insert into journal_entries(account_no, type, amount, ts, memo)
+                           values(%s,%s,%s,%s,%s)""", (acc, jtype, amount, ts, "sim"))
+
+            # 잔액 갱신
+            cur.execute("""insert into balances(account_no, balance)
+                           values(%s,%s) on conflict (account_no) do update set balance=excluded.balance""",
+                        (acc, new_bal))
+            rows.append((ts, acc, direction, amount, new_bal))
+
+            if i % 200 == 0:
+              conn.commit()
+          conn.commit()
+
+          # CSV 저장
+          os.makedirs("site/reports", exist_ok=True)
+          with open("site/reports/transactions.csv","w",newline="",encoding="utf-8") as f:
+            w=csv.writer(f)
+            w.writerow(["ts","account_no","direction","amount","balance_after"])
+            w.writerows(rows)
+
+          # 이미지(재무제표 요약 차트) 생성
+          # 수익/비용/이익 라인 차트
+          cur.execute("select d,revenue,expense,profit from v_income_statement order by d;")
+          data = cur.fetchall()
+          d = [r[0] for r in data]
+          rev = [float(r[1]) for r in data]
+          exp = [float(r[2]) for r in data]
+          prof= [float(r[3]) for r in data]
+
+          plt.figure()
+          plt.plot(d, rev, label="Revenue")
+          plt.plot(d, exp, label="Expense")
+          plt.plot(d, prof, label="Profit")
+          plt.legend()
+          plt.title("Income Statement (Daily)")
+          plt.xlabel("Date"); plt.ylabel("Amount")
+          plt.tight_layout()
+          plt.savefig("site/imgs/income_statement.png")
+
+          # 자산 총액 막대
+          cur.execute("select total_assets from v_balance_sheet;")
+          total_assets = float(cur.fetchone()[0] or 0)
+
+          plt.figure()
+          plt.bar(["Assets"], [total_assets])
+          plt.title("Balance Sheet (Total Assets)")
+          plt.tight_layout()
+          plt.savefig("site/imgs/balance_sheet.png")
+
+          cur.close(); conn.close()
+          PY
+
+          echo "psycopg2-binary" > .github/echo/requirements.txt
+          echo "matplotlib" >> .github/echo/requirements.txt
+
+      - name: Install Python deps & Run simulation
+        shell: bash
+        env:
+          ROWS: ${{ inputs.rows }}
+          PGHOST: 127.0.0.1
+          PGUSER: finops
+          PGPASSWORD: finops
+          PGDB: finops
+        run: |
+          set -Eeuo pipefail
+          python -m pip install --upgrade pip
+          pip install -r .github/echo/requirements.txt
+          python .github/echo/bin/simulate.py
+
+      - name: Copy outputs to artifacts
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cp -a .github/echo_db/ddl site/sql/
+          cp -a .github/echo_db/seed site/sql/
+          cp -a site/imgs artifacts/
+          cp -a site/reports artifacts/
+          cp -a site/sql artifacts/
+          ls -R artifacts | tee .github/echo/logs/artifacts.tree
+
+      - name: Commit & Push (optional)
+        if: ${{ inputs.commit_changes == 'true' }}
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "[ECHO] FinOps+EchoOps outputs (images,csv,sql) rows=${{ inputs.rows }}"
+          branch: ${{ github.ref_name }}
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: finops-echoops-artifacts
+          path: |
+            artifacts/**
+            site/**
+            .github/echo/**
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Create Release (optional)
+        if: ${{ inputs.create_release == 'true' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: finops-echoops-${{ github.run_number }}
+          name: "FinOps EchoOps Run #${{ github.run_number }}"
+          draft: false
+          prerelease: false
+          files: |
+            artifacts/**/*
