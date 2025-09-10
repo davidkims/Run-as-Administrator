@@ -153,7 +153,7 @@ jobs:
 
       # 1) 첫 Java 설정(캐시 없이) → 캐시 미스/경로 오류 방지
       - name: ☕ Setup Java (no cache yet)
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: ${{ matrix.java }}
@@ -269,7 +269,7 @@ jobs:
 
       # 4) (이 시점에) Maven 캐시 활성화 — 이제 pom.xml 존재
       - name: ☕ Enable Maven cache (now projects exist)
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: ${{ matrix.java }}
