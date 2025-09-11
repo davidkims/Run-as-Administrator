@@ -1,0 +1,286 @@
+name: "🔐 AWS KeyOps: Create/Rotate/Show/Revoke + Encrypted Download"
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "작업 유형"
+        type: choice
+        required: true
+        default: "create"
+        options: ["create", "rotate", "show", "revoke"]
+      iam_user:
+        description: "대상 IAM User 이름 (예: ci-bot)"
+        required: true
+        default: "ci-bot"
+      encrypt_mode:
+        description: "다운로드 암호화 모드"
+        type: choice
+        required: true
+        default: "pgp"
+        options: ["pgp", "password", "none"]
+      pgp_public_key:
+        description: "(선택) PGP 공개키(ASCII armor). encrypt_mode=pgp 에서 사용"
+        required: false
+        default: ""
+      download_password:
+        description: "(선택) 비밀번호. encrypt_mode=password 에서 사용(비워두면 랜덤 생성)"
+        required: false
+        default: ""
+      create_inactive:
+        description: "(선택) create 시 비활성 상태로 만들고 검증 후 활성화"
+        type: boolean
+        default: false
+      rotate_deactivate_old:
+        description: "(선택) rotate 시 이전 키 비활성"
+        type: boolean
+        default: true
+      rotate_delete_old:
+        description: "(선택) rotate 시 이전 키 삭제"
+        type: boolean
+        default: false
+      artifact_retention_days:
+        description: "아티팩트 보관일"
+        required: true
+        default: "3"
+
+permissions:
+  id-token: write   # OIDC용
+  contents: read
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  # (권장) OIDC 사용 시: role-to-assume 필요
+  AWS_ROLE_TO_ASSUME: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+  # (비권장) 키로 실행 시(관리 계정): 아래 두 값 제공
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+jobs:
+  keyops:
+    name: "AWS KeyOps"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ---- 자격 구성: OIDC 우선, 없으면 기존 키 사용 ----
+      - name: Configure AWS via OIDC (preferred)
+        id: aws-oidc
+        if: env.AWS_ROLE_TO_ASSUME != ''
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Fallback to static creds (NOT recommended)
+        if: steps.aws-oidc.outcome == 'skipped' && env.AWS_ACCESS_KEY_ID != '' && env.AWS_SECRET_ACCESS_KEY != ''
+        run: |
+          echo "Using static AWS keys (not recommended)."
+          test -n "${AWS_REGION:-}" || echo "AWS_REGION not set; defaulting to us-east-1" && echo "AWS_REGION=us-east-1" >> $GITHUB_ENV
+
+      - name: Abort if no AWS auth
+        if: steps.aws-oidc.outcome == 'skipped' && env.AWS_ACCESS_KEY_ID == ''
+        run: |
+          echo "::error::No AWS auth configured. Set AWS_ROLE_TO_ASSUME (OIDC) or temporary static keys."
+          exit 1
+
+      - name: Install tooling
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y
+          sudo apt-get install -y jq gnupg zip
+          python3 -m pip install --upgrade --user awscli >/dev/null 2>&1 || true
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Guardrails (prevent root-user ops)
+        id: guard
+        run: |
+          set -euo pipefail
+          CURR_ARN="$(aws sts get-caller-identity --query Arn --output text)"
+          echo "caller_arn=$CURR_ARN" >> $GITHUB_OUTPUT
+          if echo "$CURR_ARN" | grep -qE ':root$'; then
+            echo "::error::Refusing to manage access keys for root account."
+            exit 1
+          fi
+          echo "OK: $CURR_ARN"
+
+      - name: Resolve target IAM user
+        id: user
+        run: |
+          set -euo pipefail
+          USER="${{ inputs.iam_user }}"
+          # 존재 확인 또는 안내
+          if ! aws iam get-user --user-name "$USER" >/dev/null 2>&1; then
+            echo "::warning::User '$USER' does not exist. Creating..."
+            aws iam create-user --user-name "$USER" >/dev/null
+          fi
+          # 루트 방지 (방어)
+          if [ "$USER" = "root" ] || [ "$USER" = "/" ]; then
+            echo "::error::Invalid IAM user."
+            exit 1
+          fi
+          echo "name=$USER" >> $GITHUB_OUTPUT
+
+      - name: Execute action
+        id: keyop
+        env:
+          ACTION: ${{ inputs.action }}
+          USERNAME: ${{ steps.user.outputs.name }}
+          CREATE_INACTIVE: ${{ inputs.create_inactive }}
+          ROTATE_DEACTIVATE_OLD: ${{ inputs.rotate_deactivate_old }}
+          ROTATE_DELETE_OLD: ${{ inputs.rotate_delete_old }}
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          action="${ACTION}"
+          user="${USERNAME}"
+
+          list_keys() {
+            aws iam list-access-keys --user-name "$user" --query 'AccessKeyMetadata' --output json
+          }
+
+          case "$action" in
+            show)
+              list_keys > out/keys.json
+              ;;
+
+            create)
+              # (선택) 비활성으로 생성하려면: 먼저 생성 후 update-access-key로 Inactive 전환
+              RES="$(aws iam create-access-key --user-name "$user")"
+              echo "$RES" | jq '.' > out/new_key_raw.json
+
+              AKID="$(echo "$RES" | jq -r '.AccessKey.AccessKeyId')"
+              SECRET="$(echo "$RES" | jq -r '.AccessKey.SecretAccessKey')"
+
+              # 마스킹
+              echo "::add-mask::$AKID"
+              echo "::add-mask::$SECRET"
+
+              if [ "${CREATE_INACTIVE}" = "true" ]; then
+                aws iam update-access-key --user-name "$user" --access-key-id "$AKID" --status Inactive
+                STATUS="Inactive"
+              else
+                STATUS="Active"
+              fi
+
+              jq -n \
+                --arg user "$user" \
+                --arg access_key_id "$AKID" \
+                --arg secret_access_key "$SECRET" \
+                --arg status "$STATUS" \
+                --arg created "$(date -u +%FT%TZ)" \
+                '{user:$user, access_key_id:$access_key_id, secret_access_key:$secret_access_key, status:$status, created:$created}' \
+                > out/keybundle.json
+              ;;
+
+            rotate)
+              # 1) 새 키 생성
+              RES="$(aws iam create-access-key --user-name "$user")"
+              echo "$RES" | jq '.' > out/rotate_new_raw.json
+              NEW_AKID="$(echo "$RES" | jq -r '.AccessKey.AccessKeyId')"
+              NEW_SECRET="$(echo "$RES" | jq -r '.AccessKey.SecretAccessKey')"
+              echo "::add-mask::$NEW_AKID"
+              echo "::add-mask::$NEW_SECRET"
+
+              # 2) 기존 키들 조회 후 정책에 따라 처리(이전 키 1개 기준)
+              OLD_META="$(aws iam list-access-keys --user-name "$user" --query 'AccessKeyMetadata' --output json)"
+              echo "$OLD_META" > out/rotate_old_list.json
+              OLD_AKID="$(echo "$OLD_META" | jq -r '.[0].AccessKeyId // empty')"
+
+              if [ -n "$OLD_AKID" ]; then
+                if [ "${ROTATE_DEACTIVATE_OLD}" = "true" ]; then
+                  aws iam update-access-key --user-name "$user" --access-key-id "$OLD_AKID" --status Inactive || true
+                fi
+                if [ "${ROTATE_DELETE_OLD}" = "true" ]; then
+                  aws iam delete-access-key --user-name "$user" --access-key-id "$OLD_AKID" || true
+                fi
+              fi
+
+              jq -n \
+                --arg user "$user" \
+                --arg new_access_key_id "$NEW_AKID" \
+                --arg new_secret_access_key "$NEW_SECRET" \
+                --arg rotated_at "$(date -u +%FT%TZ)" \
+                --arg deactivated_old "${ROTATE_DEACTIVATE_OLD}" \
+                --arg deleted_old "${ROTATE_DELETE_OLD}" \
+                '{user:$user,new_access_key_id:$new_access_key_id,new_secret_access_key:$new_secret_access_key,rotated_at:$rotated_at,deactivated_old:$deactivated_old,deleted_old:$deleted_old}' \
+                > out/keybundle.json
+              ;;
+
+            revoke)
+              # 모든 키 비활성→삭제 (필요 시 정책 조정)
+              META="$(aws iam list-access-keys --user-name "$user" --query 'AccessKeyMetadata' --output json)"
+              echo "$META" > out/revoke_before.json
+              COUNT="$(echo "$META" | jq 'length')"
+              if [ "$COUNT" -gt 0 ]; then
+                for id in $(echo "$META" | jq -r '.[].AccessKeyId'); do
+                  aws iam update-access-key --user-name "$user" --access-key-id "$id" --status Inactive || true
+                  aws iam delete-access-key --user-name "$user" --access-key-id "$id" || true
+                done
+              fi
+              list_keys > out/revoke_after.json
+              jq -n --arg user "$user" --arg revoked_at "$(date -u +%FT%TZ)" '{user:$user,revoked_at:$revoked_at}' > out/keybundle.json
+              ;;
+
+            *)
+              echo "::error::Unknown action: $action"
+              exit 1
+              ;;
+          esac
+
+      # ---- 암호화 & 패키징 ----
+      - name: Encrypt output (PGP/password/none)
+        id: pack
+        env:
+          MODE: ${{ inputs.encrypt_mode }}
+          PGP_KEY: ${{ inputs.pgp_public_key }}
+          PASS_IN: ${{ inputs.download_password }}
+        run: |
+          set -euo pipefail
+          cd out
+          # 기본 산출물: keybundle.json (create/rotate/revoke), keys.json(show)
+          FILES=(*.json)
+          ARCH="aws-keybundle-$(date -u +%Y%m%dT%H%M%SZ).zip"
+          zip -9 "$ARCH" "${FILES[@]}" >/dev/null
+
+          if [ "$MODE" = "pgp" ]; then
+            echo "$PGP_KEY" > pub.asc
+            gpg --batch --import pub.asc
+            RECIP="$(gpg --with-colons --list-keys | awk -F: '/^pub/ {print $5; exit}')"
+            [ -z "$RECIP" ] && { echo "::error::Invalid PGP public key"; exit 1; }
+            gpg --batch --yes --trust-model always -r "$RECIP" -o "$ARCH.gpg" --encrypt "$ARCH"
+            rm -f "$ARCH"
+            echo "artifact=$ARCH.gpg" >> $GITHUB_OUTPUT
+
+          elif [ "$MODE" = "password" ]; then
+            PASS="$PASS_IN"
+            if [ -z "$PASS" ]; then
+              PASS="$(openssl rand -base64 24)"
+              echo "::notice title=Generated Password::${PASS}"
+            fi
+            # 비밀번호는 서머리에만 노출(로그 마스킹)
+            echo "::add-mask::$PASS"
+            echo "### 🔑 Download Password\n\`\`\`\n$PASS\n\`\`\`" >> $GITHUB_STEP_SUMMARY
+            openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt -in "$ARCH" -out "$ARCH.enc" -k "$PASS"
+            rm -f "$ARCH"
+            echo "artifact=$ARCH.enc" >> $GITHUB_OUTPUT
+
+          else
+            echo "artifact=$ARCH" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Upload encrypted artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: aws-keys-${{ github.run_id }}
+          path: out/${{ steps.pack.outputs.artifact }}
+          if-no-files-found: error
+          retention-days: ${{ inputs.artifact_retention_days }}
+
+      - name: Summaries
+        run: |
+          echo "## ✅ AWS KeyOps Done" >> $GITHUB_STEP_SUMMARY
+          echo "- Action: ${{ inputs.action }}" >> $GITHUB_STEP_SUMMARY
+          echo "- User: ${{ inputs.iam_user }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Artifact: aws-keys-${{ github.run_id }}" >> $GITHUB_STEP_SUMMARY
