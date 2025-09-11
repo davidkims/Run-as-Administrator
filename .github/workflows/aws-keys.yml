@@ -29,20 +29,16 @@ on:
         required: true
         default: "spring-boot"
         options: ["spring-boot","tomcat"]
-      jvm_xms:
-        description: "JVM Xms (예: 1024m)"
+      jvm_heap:
+        description: "JVM Heap (Xms,Xmx) (예: 1024m,2048m)"
         required: true
-        default: "1024m"
-      jvm_xmx:
-        description: "JVM Xmx (예: 2048m)"
-        required: true
-        default: "2048m"
+        default: "1024m,2048m"
       app_jar_path:
         description: "[spring-boot] JAR 경로 (예: target/app.jar)"
         required: false
         default: "target/app.jar"
       tomcat_base:
-        description: "[tomcat] TОМCAT_BASE 경로 (예: /opt/tomcat)"
+        description: "[tomcat] TOMCAT_BASE 경로 (예: /opt/tomcat)"
         required: false
         default: "/opt/tomcat"
       commit_changes:
@@ -91,26 +87,20 @@ jobs:
           SIZE_GB="${{ github.event.inputs.fs_size_gb }}"
           LABEL="${{ github.event.inputs.fs_label }}"
           IMG="wasdata.img"
-
           echo "[INFO] Creating mount point: ${MP}"
           sudo mkdir -p "${MP}"
-
           echo "[INFO] Allocating loopback file (${SIZE_GB}G) -> ${IMG}"
           # fallocate is fast; fallback to dd if needed
           if ! fallocate -l "${SIZE_GB}G" "${IMG}"; then
             echo "[WARN] fallocate failed, using dd (this can take time)"
             dd if=/dev/zero of="${IMG}" bs=1G count="${SIZE_GB}" status=progress
           fi
-
           echo "[INFO] Formatting ext4 with label ${LABEL}"
           sudo mkfs.ext4 -F -L "${LABEL}" "${IMG}"
-
           echo "[INFO] Mounting to ${MP}"
           sudo mount -o loop "${IMG}" "${MP}"
-
           echo "[INFO] Mounted:"
           df -h "${MP}"
-
           echo "image_path=${IMG}" >> "$GITHUB_OUTPUT"
 
       - name: Create directories and set permissions
@@ -147,14 +137,14 @@ jobs:
         id: jvm
         run: |
           set -Eeuo pipefail
-          XMS="${{ github.event.inputs.jvm_xms }}"
-          XMX="${{ github.event.inputs.jvm_xmx }}"
+          # 콤마로 구분된 jvm_heap 값을 XMS와 XMX로 분리
+          JVM_HEAP="${{ github.event.inputs.jvm_heap }}"
+          XMS=$(echo "$JVM_HEAP" | cut -d',' -f1)
+          XMX=$(echo "$JVM_HEAP" | cut -d',' -f2)
           APP="${{ github.event.inputs.app_type }}"
-
           echo "[INFO] Writing JVM opts for ${APP} (Xms=${XMS}, Xmx=${XMX})"
           echo "JAVA_TOOL_OPTIONS=\"-Xms${XMS} -Xmx${XMX} -XX:+UseG1GC -XX:MaxGCPauseMillis=200 -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=${{ github.event.inputs.mount_point }}/heapdump.hprof\"" > .java-memory.env
           cat .java-memory.env
-
           if [ "${APP}" = "tomcat" ]; then
             echo 'CATALINA_OPTS="${JAVA_TOOL_OPTIONS} ${CATALINA_OPTS}"' > .tomcat-opts.env
             cat .tomcat-opts.env
@@ -167,7 +157,6 @@ jobs:
           APP="${{ github.event.inputs.app_type }}"
           MP="${{ github.event.inputs.mount_point }}"
           source .java-memory.env
-
           if [ "${APP}" = "spring-boot" ]; then
             JAR="${{ github.event.inputs.app_jar_path }}"
             if [ -f "${JAR}" ]; then
@@ -228,7 +217,6 @@ jobs:
             [ -f .tomcat-opts.env ] && cat .tomcat-opts.env || true
             echo '```'
           } > was_expansion_report.md
-
           # 마운트/트리 정보
           sudo bash -c "df -h > mount_report.txt"
           sudo bash -c "du -sh ${MP}/* 2>/dev/null | sort -h > usage_report.txt" || true
