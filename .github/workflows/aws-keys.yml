@@ -36,15 +36,6 @@ on:
       rotate_delete_old:
         type: boolean
         default: false
-      # --- 인증 보강용 입력 ---
-      aws_account_id:
-        description: "(선택) OIDC 진단용 AWS Account ID (예: 123456789012)"
-        required: false
-        default: ""
-      role_name:
-        description: "(선택) OIDC 진단용 Role 이름 (예: GitHubActionsOIDC)"
-        required: false
-        default: ""
       aws_keys_b64:
         description: "(선택) Base64(AccessKeyId:SecretAccessKey:SessionToken) — 세션키 1회성 입력"
         required: false
@@ -60,10 +51,8 @@ permissions:
 
 env:
   AWS_REGION: ${{ secrets.AWS_REGION }}
-  # OIDC (권장): 신뢰정책이 잡힌 Role ARN
-  AWS_ROLE_TO_ASSUME: ${{ secrets.AWS_ROLE_TO_ASSUME }}
-  # 정적/임시 키 (비권장): 없으면 자동 스킵
-  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  AWS_ROLE_TO_ASSUME: ${{ secrets.AWS_ROLE_TO_ASSUME }} # OIDC 권장
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}    # (비권장) 정적/임시 키
   AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
 
 jobs:
@@ -81,19 +70,17 @@ jobs:
           python3 -m pip install --upgrade --user awscli >/dev/null 2>&1 || true
           echo "$HOME/.local/bin" >> $GITHUB_PATH
 
-      # ── OIDC 토큰 획득(진단/신뢰정책 도움용) ──
+      # OIDC 토큰 진단(요약에 표시)
       - name: Pull GitHub OIDC token (diagnostic)
         id: oidc-diag
         env:
           OIDC_AUD: "sts.amazonaws.com"
         run: |
           set -euo pipefail
-          # GitHub OIDC 토큰 취득 (Aud=sts.amazonaws.com)
           TOKEN="$(curl -sSL -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
             "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${OIDC_AUD}" | jq -r '.value')"
           if [ -n "$TOKEN" ] && [ "$TOKEN" != "null" ]; then
             echo "has_token=true" >> $GITHUB_OUTPUT
-            # 디코드(헤더/클레임) — 신뢰정책 설계에 도움
             H="$(echo "$TOKEN" | cut -d. -f1 | base64 -d 2>/dev/null || true)"
             C="$(echo "$TOKEN" | cut -d. -f2 | base64 -d 2>/dev/null || true)"
             echo "### OIDC Diagnostics" >> $GITHUB_STEP_SUMMARY
@@ -103,7 +90,7 @@ jobs:
             echo "has_token=false" >> $GITHUB_OUTPUT
           fi
 
-      # ── 1) OIDC (권장) ──
+      # 1) OIDC (권장)
       - name: Configure AWS via OIDC (preferred)
         id: aws-oidc
         if: env.AWS_ROLE_TO_ASSUME != ''
@@ -112,7 +99,7 @@ jobs:
           role-to-assume: ${{ env.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ env.AWS_REGION }}
 
-      # ── 2) 정적/임시 키(Secrets) ──
+      # 2) 정적/임시 키(Secrets)
       - name: Configure via static creds (fallback)
         id: aws-static
         if: steps.aws-oidc.outcome == 'skipped' && env.AWS_ACCESS_KEY_ID != '' && env.AWS_SECRET_ACCESS_KEY != ''
@@ -120,7 +107,7 @@ jobs:
           echo "Using static AWS credentials (fallback)."
           test -n "${AWS_REGION:-}" || echo "AWS_REGION=us-east-1" >> $GITHUB_ENV
 
-      # ── 3) 런타임 입력 B64 세션키 ──
+      # 3) 런타임 입력 B64 세션키
       - name: Configure via runtime B64 session keys (second fallback)
         id: aws-b64
         if: steps.aws-oidc.outcome == 'skipped' && steps.aws-static.outcome == 'skipped' && inputs.aws_keys_b64 != ''
@@ -133,15 +120,16 @@ jobs:
           SKEY="$(printf '%s' "$DEC" | cut -d: -f2)"
           STOK="$(printf '%s' "$DEC" | cut -d: -f3-)"
           test -n "$AKID" && test -n "$SKEY" && test -n "$STOK" || { echo "::error::Invalid aws_keys_b64"; exit 1; }
-          echo "AWS_ACCESS_KEY_ID=$AKID" >> $GITHUB_ENV
-          echo "AWS_SECRET_ACCESS_KEY=$SKEY" >> $GITHUB_ENV
-          echo "AWS_SESSION_TOKEN=$STOK" >> $GITHUB_ENV
-          echo "AWS_REGION=${AWS_REGION:-us-east-1}" >> $GITHUB_ENV
+          {
+            echo "AWS_ACCESS_KEY_ID=$AKID"
+            echo "AWS_SECRET_ACCESS_KEY=$SKEY"
+            echo "AWS_SESSION_TOKEN=$STOK"
+            echo "AWS_REGION=${AWS_REGION:-us-east-1}"
+          } >> $GITHUB_ENV
           echo "::add-mask::$AKID"; echo "::add-mask::$SKEY"; echo "::add-mask::$STOK"
           echo "Configured from runtime B64 session keys."
 
-      # ── 인증 최종 확인 + OIDC 신뢰정책 가이드 ──
-      - name: Verify AWS auth or print exact fix
+      - name: Verify AWS auth (or explain fix)
         id: verify-auth
         run: |
           set -euo pipefail
@@ -150,68 +138,14 @@ jobs:
             echo "### ✅ AWS Auth OK" >> $GITHUB_STEP_SUMMARY
             echo "\`\`\`json" >> $GITHUB_STEP_SUMMARY
             cat auth_identity.json >> $GITHUB_STEP_SUMMARY
-            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
-            exit 0
-          fi
-
-          echo "### ❌ AWS Auth NOT configured" >> $GITHUB_STEP_SUMMARY
-
-          # OIDC 도움말(Trust Policy)
-          ACC="${{ inputs.aws_account_id }}"
-          RN="${{ inputs.role_name }}"
-          if [ -n "$ACC" ] && [ -n "$RN" ] && [ "${{ steps.oidc-diag.outputs.has_token }}" = "true" ]; then
-            cat > trust-policy.json <<'JSON'
-            {
-              "Version": "2012-10-17",
-              "Statement": [
-                {
-                  "Effect": "Allow",
-                  "Principal": { "Federated": "arn:aws:iam::ACCOUNT_ID:oidc-provider/token.actions.githubusercontent.com" },
-                  "Action": "sts:AssumeRoleWithWebIdentity",
-                  "Condition": {
-                    "StringEquals": {
-                      "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
-                    },
-                    "StringLike": {
-                      "token.actions.githubusercontent.com:sub": "repo:${REPO}:ref:refs/heads/*"
-                    }
-                  }
-                }
-              ]
-            }
-            JSON
-            # 변수 치환
-            sed -i "s/ACCOUNT_ID/$ACC/g" trust-policy.json
-            sed -i "s|\${REPO}|${{ github.repository }}|g" trust-policy.json
-
-            echo "### 🔧 Create this role in AWS then set secret AWS_ROLE_TO_ASSUME" >> $GITHUB_STEP_SUMMARY
-            echo "- Role ARN: \`arn:aws:iam::$ACC:role/$RN\`" >> $GITHUB_STEP_SUMMARY
-            echo "- Trust policy (save as trust-policy.json):" >> $GITHUB_STEP_SUMMARY
-            echo "\`\`\`json" >> $GITHUB_STEP_SUMMARY
-            cat trust-policy.json >> $GITHUB_STEP_SUMMARY
-            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
-            echo "- Minimal inline policy (manage user keys):" >> $GITHUB_STEP_SUMMARY
-            cat > keyops-policy.json <<'JSON'
-            {
-              "Version": "2012-10-17",
-              "Statement": [
-                { "Effect": "Allow", "Action": ["iam:GetUser","iam:CreateUser"], "Resource": "arn:aws:iam::*:user/*" },
-                { "Effect": "Allow", "Action": ["iam:ListAccessKeys","iam:CreateAccessKey","iam:UpdateAccessKey","iam:DeleteAccessKey"], "Resource": "arn:aws:iam::*:user/*" },
-                { "Effect": "Allow", "Action": ["sts:GetCallerIdentity"], "Resource": "*" }
-              ]
-            }
-            JSON
-            echo "\`\`\`json" >> $GITHUB_STEP_SUMMARY
-            cat keyops-policy.json >> $GITHUB_STEP_SUMMARY
             echo "\`\`\`"
-            echo "::error::No AWS auth configured. Provide AWS_ROLE_TO_ASSUME (OIDC), or secrets AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY, or input aws_keys_b64."
-            exit 1
           else
-            echo "::error::No AWS auth configured. Provide AWS_ROLE_TO_ASSUME (OIDC), or secrets AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY, or input aws_keys_b64."
+            echo "### ❌ AWS Auth NOT configured" >> $GITHUB_STEP_SUMMARY
+            echo "- Set repo secret **AWS_ROLE_TO_ASSUME** (OIDC) *or* **AWS_ACCESS_KEY_ID/SECRET_ACCESS_KEY** *or* input **aws_keys_b64**." >> $GITHUB_STEP_SUMMARY
+            echo "- Trust policy example and minimal permissions are in the previous message or docs." >> $GITHUB_STEP_SUMMARY
             exit 1
           fi
 
-      # ── 루트 금지 가드 ──
       - name: Guardrails (prevent root-user ops)
         id: guard
         run: |
@@ -223,7 +157,6 @@ jobs:
           fi
           echo "caller_arn=$CURR_ARN" >> $GITHUB_OUTPUT
 
-      # ── 대상 사용자 확인/생성 ──
       - name: Ensure IAM User
         id: user
         run: |
@@ -232,7 +165,6 @@ jobs:
           aws iam get-user --user-name "$USER" >/dev/null 2>&1 || aws iam create-user --user-name "$USER" >/dev/null
           echo "name=$USER" >> $GITHUB_OUTPUT
 
-      # ── 키 작업 ──
       - name: Execute Key Action
         id: keyop
         env:
@@ -246,16 +178,11 @@ jobs:
           mkdir -p out
           action="${ACTION}"
           user="${USERNAME}"
-
-          list_keys() {
-            aws iam list-access-keys --user-name "$user" --query 'AccessKeyMetadata' --output json
-          }
-
+          list_keys() { aws iam list-access-keys --user-name "$user" --query 'AccessKeyMetadata' --output json; }
           case "$action" in
             show)
               list_keys > out/keys.json
               ;;
-
             create)
               RES="$(aws iam create-access-key --user-name "$user")"
               echo "$RES" | jq '.' > out/new_key_raw.json
@@ -270,7 +197,6 @@ jobs:
               jq -n --arg user "$user" --arg access_key_id "$AKID" --arg secret_access_key "$SECRET" --arg status "$STATUS" --arg created "$(date -u +%FT%TZ)" \
                 '{user:$user, access_key_id:$access_key_id, secret_access_key:$secret_access_key, status:$status, created:$created}' > out/keybundle.json
               ;;
-
             rotate)
               RES="$(aws iam create-access-key --user-name "$user")"
               echo "$RES" | jq '.' > out/rotate_new_raw.json
@@ -287,7 +213,6 @@ jobs:
               jq -n --arg user "$user" --arg new_access_key_id "$NEW_AKID" --arg new_secret_access_key "$NEW_SECRET" --arg rotated_at "$(date -u +%FT%TZ)" --arg deactivated_old "${ROTATE_DEACTIVATE_OLD}" --arg deleted_old "${ROTATE_DELETE_OLD}" \
                 '{user:$user,new_access_key_id:$new_access_key_id,new_secret_access_key:$new_secret_access_key,rotated_at:$rotated_at,deactivated_old:$deactivated_old,deleted_old:$deleted_old}' > out/keybundle.json
               ;;
-
             revoke)
               META="$(aws iam list-access-keys --user-name "$user" --query 'AccessKeyMetadata' --output json)"
               echo "$META" > out/revoke_before.json
@@ -298,11 +223,9 @@ jobs:
               list_keys > out/revoke_after.json
               jq -n --arg user "$user" --arg revoked_at "$(date -u +%FT%TZ)" '{user:$user,revoked_at:$revoked_at}' > out/keybundle.json
               ;;
-
             *) echo "::error::Unknown action: $action"; exit 1 ;;
           esac
 
-      # ── 암호화 & 업로드 ──
       - name: Encrypt output
         id: pack
         env:
@@ -315,7 +238,6 @@ jobs:
           FILES=(*.json)
           ARCH="aws-keybundle-$(date -u +%Y%m%dT%H%M%SZ).zip"
           zip -9 "$ARCH" "${FILES[@]}" >/dev/null
-
           if [ "$MODE" = "pgp" ]; then
             echo "$PGP_KEY" > pub.asc
             gpg --batch --import pub.asc
@@ -325,8 +247,7 @@ jobs:
             rm -f "$ARCH"
             echo "artifact=$ARCH.gpg" >> $GITHUB_OUTPUT
           elif [ "$MODE" = "password" ]; then
-            PASS="$PASS_IN"
-            if [ -z "$PASS" ]; then PASS="$(openssl rand -base64 24)"; fi
+            PASS="$PASS_IN"; if [ -z "$PASS" ]; then PASS="$(openssl rand -base64 24)"; fi
             echo "::add-mask::$PASS"
             echo "### 🔑 Download Password\n\`\`\`\n$PASS\n\`\`\`" >> $GITHUB_STEP_SUMMARY
             openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt -in "$ARCH" -out "$ARCH.enc" -k "$PASS"
