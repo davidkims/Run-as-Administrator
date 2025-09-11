@@ -1,0 +1,11 @@
+/mnt/was_data
+/mnt/was_data/assets
+/mnt/was_data/backups
+/mnt/was_data/cache
+/mnt/was_data/conf
+/mnt/was_data/logs
+/mnt/was_data/lost+found
+/mnt/was_data/sessions
+/mnt/was_data/static
+/mnt/was_data/temp
+/mnt/was_data/uploads
