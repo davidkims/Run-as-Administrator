@@ -1,4 +1,4 @@
-name: "🐧 Linux/RHEL Image Suite (ALL-IN-ONE + Upgrade + GPG + Bootable Installer ISO + Cloud-Init/Kickstart/Preseed + QCOW2 + SBOM + GHCR + Hash Index + Multi-Deploy)"
+name: "🐧 Linux/RHEL Image Suite (ALL-IN-ONE + Upgrade + GPG + Bootable Installer ISO + Cloud-Init/Kickstart/Preseed + QCOW2 + SBOM + GHCR + Hash Index + Multi-Deploy + Anti-OOM-Storage)"
 
 on:
   workflow_dispatch:
@@ -35,7 +35,7 @@ concurrency:
 
 jobs:
   image-suite:
-    name: "ALL-IN-ONE: Upgrade + Build + Verify + Bootable ISO + QCOW2 + SBOM + Hash + Test Server + Multi-Deploy"
+    name: "ALL-IN-ONE: Upgrade + Build + Verify + Bootable ISO + QCOW2 + SBOM + Hash + Test Server + Multi-Deploy (No-Space-Safe)"
     runs-on: ubuntu-latest
     env:
       ECHO_ROOT: .github/echo_linux
@@ -46,16 +46,21 @@ jobs:
       META_DIR: dist/meta
       SEED_DIR: dist/seed
       WORK_DIR: dist/work
+      TMP_DIR: dist/tmp
       GHCR_BASE: ghcr.io/${{ github.repository }}/image-suite
 
+      # ===== 디스크/안전 임계치 설정 =====
+      FREE_TARGET_GB: "20"           # 러너의 남는 공간 목표 (GB). 부족하면 적극 정리/업로드/삭제
+      HIGH_WATER_PCT: "85"           # 사용률 85% 초과 시 강제 spill
+      SPILL_PRIORITY: "oras,s3,azure,gcs"  # 업로드 우선순위
+      KEEP_LOCAL_AFTER_SPILL: "false"      # true면 업로드 후 보관, false면 삭제
+
       # =====(선택) 멀티 배포용 공통 환경 =====
-      # GitHub Pages 캐시/아티팩트
       PAGES_ARTIFACT_NAME: image-suite-pages-${{ github.run_id }}
 
-      # AWS S3 (옵션: 값이 존재할 때만 동작)
+      # AWS S3 (옵션)
       AWS_REGION: ${{ secrets.AWS_REGION }}
       ECHO_S3_BUCKET: ${{ secrets.ECHO_S3_BUCKET }}
-      # 자격: AWS OIDC 또는 액세스키(둘 중 하나) — 둘 다 없으면 스킵
       AWS_ROLE_TO_ASSUME: ${{ secrets.AWS_ROLE_TO_ASSUME }}
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
@@ -75,15 +80,34 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Pre-clean huge preinstalled toolchains (free tens of GB)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          sudo rm -rf /usr/local/lib/android \
+                      /usr/share/dotnet \
+                      /opt/ghc \
+                      /usr/local/.ghcup \
+                      /opt/hostedtoolcache/CodeQL \
+                      /opt/hostedtoolcache/go || true
+          sudo docker system prune -af || true
+          sudo apt-get clean || true
+          sudo rm -rf /var/lib/apt/lists/* || true
+          mkdir -p dist/tmp
+          echo "TMPDIR=$PWD/dist/tmp" >> "$GITHUB_ENV"
+          echo "TMP=$PWD/dist/tmp" >> "$GITHUB_ENV"
+          echo "TEMP=$PWD/dist/tmp" >> "$GITHUB_ENV"
+          df -h
+
       - name: Init dirs
         run: |
           set -Eeuo pipefail
           mkdir -p "$ECHO_ROOT"/{linux,rhel}/bulk \
                    "$DIST_DIR" "$ISO_DIR" "$IMG_DIR" "$LOG_DIR" "$META_DIR" \
-                   "$SEED_DIR"/{cloud-init,preseed,kickstart} "$WORK_DIR"
+                   "$SEED_DIR"/{cloud-init,preseed,kickstart} "$WORK_DIR" "$TMP_DIR"
           printf '[%s] INIT: dirs ready\n' "$(date -u +'%F %T')"
 
-      - name: Echo tools (functions)
+      - name: Echo tools (functions + disk/ spill utilities)
         id: echo-tools
         shell: bash
         run: |
@@ -97,26 +121,28 @@ jobs:
           tryrun(){ bash -lc "$*" || { softfail "Step failed: $*"; return 0; }; }
           fail(){ echoe "::error::$*"; exit 1; }
 
-          runner_upgrade(){
-            sudo apt-get update -y || softfail "apt update failed"
-            apt list --upgradable 2>/dev/null | tee "dist/meta/upgradable_before.txt" >/dev/null || true
-            sudo DEBIAN_FRONTEND=noninteractive apt-get -y upgrade || softfail "apt upgrade failed"
-            sudo DEBIAN_FRONTEND=noninteractive apt-get -y dist-upgrade || softfail "apt dist-upgrade failed"
-            sudo apt-get -y autoremove || true
-            apt list --upgradable 2>/dev/null | tee "dist/meta/upgradable_after.txt" >/dev/null || true
-            {
-              echo "# Runner Upgrade Report"
-              echo "- Timestamp: $(TS)"
-              echo "## Upgradable BEFORE"; echo '```'; cat dist/meta/upgradable_before.txt 2>/dev/null || echo "(none)"; echo '```'
-              echo "## Upgradable AFTER";  echo '```'; cat dist/meta/upgradable_after.txt  2>/dev/null || echo "(none)"; echo '```'
-            } > dist/meta/UPGRADE_REPORT.md
+          df_info(){ df -hT . || true; }
+          disk_free_gb(){
+            df -PB1G . | awk 'NR==2{print $4}' | sed 's/[^0-9]//g'
+          }
+          disk_used_pct(){
+            df -P . | awk 'NR==2{gsub("%","",$5); print $5}'
+          }
+
+          reclaim_space(){
+            echoe "Reclaiming disk space…"
+            sudo docker system prune -af || true
+            sudo apt-get clean || true
+            sudo rm -rf /var/lib/apt/lists/* || true
+            rm -rf dist/tmp/* 2>/dev/null || true
+            df_info
           }
 
           ensure_cmd(){
             local cmd="$1"
             if ! command -v "$cmd" >/dev/null 2>&1; then
               echoe "installing: $cmd"
-              sudo apt-get update -y
+              sudo apt-get update -y || true
               case "$cmd" in
                 mkisofs) sudo apt-get install -y genisoimage ;;
                 xorriso) sudo apt-get install -y xorriso ;;
@@ -131,11 +157,12 @@ jobs:
                 python3-pip) sudo apt-get install -y python3-pip ;;
                 aws) sudo apt-get install -y python3-pip && sudo pip3 install --no-cache-dir awscli || true ;;
                 az) curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash || true ;;
-                google-cloud-cli) \
+                google-cloud-cli)
                   echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] http://packages.cloud.google.com/apt cloud-sdk main" | \
-                  sudo tee /etc/apt/sources.list.d/google-cloud-sdk.list >/dev/null && \
-                  curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | sudo gpg --yes --dearmor -o /usr/share/keyrings/cloud.google.gpg && \
-                  sudo apt-get update -y && sudo apt-get install -y google-cloud-cli ;;
+                  sudo tee /etc/apt/sources.list.d/google-cloud-sdk.list >/dev/null
+                  curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | sudo gpg --yes --dearmor -o /usr/share/keyrings/cloud.google.gpg
+                  sudo apt-get update -y && sudo apt-get install -y google-cloud-cli
+                  ;;
                 oras)
                   ensure_cmd curl; ensure_cmd jq
                   arch="$(uname -m)"; case "$arch" in x86_64|amd64) goarch="amd64";; aarch64|arm64) goarch="arm64";; s390x) goarch="s390x";; ppc64le) goarch="ppc64le";; *) goarch="amd64";; esac
@@ -163,7 +190,92 @@ jobs:
             fi
           }
 
-          # 공식 ISO/체크섬/서명 주소
+          # Space guard: ensure we have enough free space; if not, spill or reclaim.
+          ensure_space(){
+            local target_gb="\${FREE_TARGET_GB:-20}"
+            local high_pct="\${HIGH_WATER_PCT:-85}"
+            local free="$(disk_free_gb)"
+            local used_pct="$(disk_used_pct)"
+            echoe "SPACE CHECK: free=\${free}GB, used=\${used_pct}% (target free \${target_gb}GB, high water \${high_pct}%)"
+            if [ "\${used_pct}" -ge "\${high_pct}" ] || [ "\${free}" -lt "\${target_gb}" ]; then
+              echoe "SPACE LOW → attempting spill and reclaim"
+              # try reclaim basic first
+              reclaim_space
+            fi
+          }
+
+          # Decide first available remote according to SPILL_PRIORITY
+          pick_remote(){
+            IFS=',' read -ra pri <<< "${SPILL_PRIORITY:-oras,s3,azure,gcs}"
+            for p in "${pri[@]}"; do
+              case "$p" in
+                oras) if command -v oras >/dev/null 2>&1; then echo "oras"; return; fi ;;
+                s3)   if [ -n "${ECHO_S3_BUCKET:-}" ]; then echo "s3"; return; fi ;;
+                azure) if [ -n "${AZURE_STORAGE_ACCOUNT:-}" ] && [ -n "${AZURE_STORAGE_KEY:-}" ] && [ -n "${ECHO_AZURE_CONTAINER:-}" ]; then echo "azure"; return; fi ;;
+                gcs) if [ -n "${ECHO_GCS_BUCKET:-}" ]; then echo "gcs"; return; fi ;;
+              esac
+            done
+            echo ""
+          }
+
+          oras_login(){
+            [ -z "${GH_TOKEN:-}" ] && return 1
+            echo "${GH_TOKEN}" | oras login ghcr.io -u "${GH_USER:-github-actions}" --password-stdin
+          }
+
+          spill_file(){
+            local f="$1"
+            [ ! -f "$f" ] && { softfail "spill_file: not found $f"; return 0; }
+            ensure_space
+            local remote="$(pick_remote)"
+            [ -z "$remote" ] && { notify "No remote available for spill; keeping local"; return 0; }
+
+            case "$remote" in
+              oras)
+                ensure_cmd oras
+                oras_login || { softfail "oras login failed"; return 0; }
+                local base_lc="$(echo "${GHCR_BASE}" | tr '[:upper:]' '[:lower:]')"
+                local ref="${base_lc}:${GITHUB_RUN_ID:-manual}"
+                local mt="application/octet-stream"
+                case "$f" in *.json) mt="application/json" ;; *.spdx.json) mt="application/spdx+json" ;; *.txt|*.log|*.md) mt="text/plain" ;; *.tar) mt="application/x-tar" ;; *.iso) mt="application/x-cd-image" ;; *.qcow2) mt="application/x-qemu-disk" ;; esac
+                tryrun "oras push '${ref}' '${f}:${mt}' --artifact-type application/vnd.echo.bundle"
+                ;;
+              s3)
+                ensure_cmd aws
+                tryrun "aws s3 cp '${f}' 's3://${ECHO_S3_BUCKET}/$(basename "$f")'"
+                ;;
+              azure)
+                ensure_cmd az
+                tryrun "az storage blob upload --account-name '$AZURE_STORAGE_ACCOUNT' --account-key '$AZURE_STORAGE_KEY' -f '${f}' -c '$ECHO_AZURE_CONTAINER' -n '$(basename "$f")' --overwrite true"
+                ;;
+              gcs)
+                ensure_cmd google-cloud-cli
+                tryrun "gsutil cp '${f}' 'gs://${ECHO_GCS_BUCKET}/'"
+                ;;
+            esac
+
+            if [ "${KEEP_LOCAL_AFTER_SPILL:-false}" != "true" ]; then
+              rm -f "${f}" || true
+              echoe "Spilled & removed: ${f}"
+            fi
+            ensure_space
+          }
+
+          spill_dir(){
+            local d="$1"
+            [ ! -d "$d" ] && { softfail "spill_dir: not found $d"; return 0; }
+            # tar then spill the tar to reduce object counts
+            local tarpath="${d%/}.tar"
+            tryrun "tar -C '$(dirname "$d")' -cf '${tarpath}' '$(basename "$d")'"
+            spill_file "${tarpath}"
+            # remove original if spilled
+            if [ "${KEEP_LOCAL_AFTER_SPILL:-false}" != "true" ]; then
+              rm -rf "$d" || true
+            fi
+            ensure_space
+          }
+
+          # --- existing helpers (ISO source, verify, S3/Azure/GCS ensure) ---
           set_official_iso_vars(){
             local d="$1"
             case "$d" in
@@ -254,11 +366,9 @@ jobs:
 
           record_download(){ echo "$1 -> $2" >> "dist/meta/DOWNLOADS.txt"; }
 
-          # ===== Echo 리소스(대상별) 생성 유틸 =====
           ensure_s3(){
             [ -z "${ECHO_S3_BUCKET:-}" ] && return 0
             ensure_cmd aws
-            # 버킷 없으면 생성
             aws s3api head-bucket --bucket "$ECHO_S3_BUCKET" 2>/dev/null || \
               aws s3api create-bucket --bucket "$ECHO_S3_BUCKET" --region "${AWS_REGION:-us-east-1}" \
                 $( [ "${AWS_REGION:-us-east-1}" != "us-east-1" ] && echo --create-bucket-configuration LocationConstraint="${AWS_REGION:-us-east-1}" ) \
@@ -267,8 +377,7 @@ jobs:
           ensure_azure(){
             [ -z "${AZURE_STORAGE_ACCOUNT:-}" ] || [ -z "${ECHO_AZURE_CONTAINER:-}" ] && return 0
             ensure_cmd az
-            AZURE_STORAGE_KEY="${AZURE_STORAGE_KEY:-}"
-            if [ -n "$AZURE_STORAGE_KEY" ]; then
+            if [ -n "${AZURE_STORAGE_KEY:-}" ]; then
               az storage container create --account-name "$AZURE_STORAGE_ACCOUNT" --account-key "$AZURE_STORAGE_KEY" --name "$ECHO_AZURE_CONTAINER" --public-access blob >/dev/null 2>&1 || softfail "Azure container create failed"
             else
               softfail "AZURE_STORAGE_KEY missing; skipping container creation"
@@ -279,10 +388,24 @@ jobs:
             ensure_cmd google-cloud-cli
             gsutil ls -b "gs://$ECHO_GCS_BUCKET" >/dev/null 2>&1 || gsutil mb -p "${GCP_PROJECT_ID:-}" -l us "gs://$ECHO_GCS_BUCKET" || softfail "GCS bucket create failed"
           }
+
+          runner_upgrade(){
+            sudo apt-get update -y || softfail "apt update failed"
+            apt list --upgradable 2>/dev/null | tee "dist/meta/upgradable_before.txt" >/dev/null || true
+            sudo DEBIAN_FRONTEND=noninteractive apt-get -y upgrade || softfail "apt upgrade failed"
+            sudo DEBIAN_FRONTEND=noninteractive apt-get -y dist-upgrade || softfail "apt dist-upgrade failed"
+            sudo apt-get -y autoremove || true
+            apt list --upgradable 2>/dev/null | tee "dist/meta/upgradable_after.txt" >/dev/null || true
+            {
+              echo "# Runner Upgrade Report"
+              echo "- Timestamp: $(TS)"
+              echo "## Upgradable BEFORE"; echo '```'; cat dist/meta/upgradable_before.txt 2>/dev/null || echo "(none)"; echo '```'
+              echo "## Upgradable AFTER";  echo '```'; cat dist/meta/upgradable_after.txt  2>/dev/null || echo "(none)"; echo '```'
+            } > dist/meta/UPGRADE_REPORT.md
+          }
           EOS
           chmod +x "$ECHO_ROOT/echo_tools.sh"
 
-      # ==== Upgrade & Build (기존 ALL-IN-ONE 흐름, 실패시 계속) ====
       - name: Runner upgrade (safe) + report
         continue-on-error: true
         shell: bash
@@ -291,16 +414,18 @@ jobs:
           source "$ECHO_ROOT/echo_tools.sh"
           mkdir -p "$LOG_DIR" "$META_DIR"
           runner_upgrade
+          ensure_space
 
-      - name: Bulk dirs/files
+      - name: Bulk dirs/files (tar & spill after)
         continue-on-error: true
         shell: bash
         run: |
           set -Eeuo pipefail
           source "$ECHO_ROOT/echo_tools.sh"
-          SPEC_FILE="$META_DIR/dir_spec.txt"
-          echo "linux:100,rhel:100" > "$SPEC_FILE"
-          while read -r PREFIX COUNT; do
+          echo "linux:80 rhel:80" | tr ' ' '\n' > "$META_DIR/dir_spec.txt"
+          while read -r LINE; do
+            PREFIX="$(echo "$LINE" | cut -d: -f1)"; COUNT="$(echo "$LINE" | cut -d: -f2)"
+            [ -z "$PREFIX" ] && continue
             echoe "Generating prefix=$PREFIX count=$COUNT"
             BASE="$ECHO_ROOT/$PREFIX/bulk"
             for ((i=1;i<=COUNT;i++)); do
@@ -308,11 +433,15 @@ jobs:
               tryrun "mkdir -p '$D/sub1' '$D/sub2'"
               echo "sample file for $PREFIX #$i" > "$D/README.txt" || true
               printf '{"prefix":"%s","index":%d,"ts":"%s"}\n' "$PREFIX" "$i" "$(date -u +'%F %T')" > "$D/meta.json" || true
+              if (( i % 20 == 0 )); then ensure_space; fi
             done
-          done < "$SPEC_FILE"
+          done < "$META_DIR/dir_spec.txt"
+          ensure_space
           tryrun "tar -C '$ECHO_ROOT' -cf '$DIST_DIR/echo_bulk.tar' ."
+          # spill large tar immediately
+          bash -lc "source '$ECHO_ROOT/echo_tools.sh'; spill_file '$DIST_DIR/echo_bulk.tar'"
 
-      - name: Download base ISO + GPG verify
+      - name: Download base ISO + GPG verify (spill base ISO list if needed)
         continue-on-error: true
         shell: bash
         run: |
@@ -329,7 +458,8 @@ jobs:
             '{base_iso_url:$url, checksum_url:$sumurl, signature_url:$sigurl, checksum_type:$sumtype, note:$note}' \
             | tee "$META_DIR/base_iso.urls.json" >/dev/null
           OUT="$ISO_DIR/$FILE_NAME"
-          tryrun "curl -fL '$ISO_URL' -o '$OUT'"
+          ensure_space
+          tryrun "curl -fL --progress-bar '$ISO_URL' -o '$OUT'"
           [ -f "$OUT" ] && record_download "$ISO_URL" "$OUT"
           if [ -f "$OUT" ]; then
             file "$OUT" | tee "$META_DIR/base_iso.file.txt" >/dev/null
@@ -345,9 +475,10 @@ jobs:
               [ -f "$SIG" ] && verify_gpg "${SUM_TYPE:-sha256}" "$LIST" "$SIG" "$D"
             fi
             verify_sum "$OUT" "${SUM_TYPE:-sha256}" "${LIST:-}"
+            ensure_space
           fi
 
-      - name: Custom payload ISO (snapshot of ECHO_ROOT)
+      - name: Custom payload ISO (snapshot) → spill
         continue-on-error: true
         shell: bash
         run: |
@@ -362,8 +493,9 @@ jobs:
             tryrun "xorriso -as mkisofs -V '$LABEL' -J -R -o '$ISO_OUT' '$ECHO_ROOT'"
           fi
           [ -f "$ISO_OUT" ] && sha256sum "$ISO_OUT" | tee "$META_DIR/custom_payload.sha256.txt" >/dev/null || true
+          bash -lc "source '$ECHO_ROOT/echo_tools.sh'; spill_file '$ISO_OUT'"
 
-      - name: Seed ISOs (Cloud-Init/Kickstart/Preseed)
+      - name: Seed ISOs (Cloud-Init/Kickstart/Preseed) → spill
         continue-on-error: true
         shell: bash
         run: |
@@ -386,7 +518,6 @@ jobs:
             - [ bash, -lc, "echo 'hello from cloud-init' > /root/hello.txt" ]
           UD
           echo "instance-id: iid-echo; local-hostname: echo-host" > "$SEED_DIR/cloud-init/meta-data"
-
           cat > "$SEED_DIR/kickstart/ks.cfg" <<'KS'
           #version=RHEL9
           text
@@ -408,7 +539,6 @@ jobs:
           echo "hello from kickstart" > /root/ks_hello.txt
           %end
           KS
-
           cat > "$SEED_DIR/preseed/preseed.cfg" <<'PS'
           d-i debian-installer/locale string en_US
           d-i keyboard-configuration/layoutcode string us
@@ -420,7 +550,6 @@ jobs:
           d-i passwd/user-password-again password echo1234
           d-i pkgsel/include string vim curl
           PS
-
           CIDATA="$ISO_DIR/seed-cidata.iso"
           if command -v mkisofs >/dev/null 2>&1; then
             tryrun "mkisofs -V CIDATA -J -R -o '$CIDATA' '$SEED_DIR/cloud-init'"
@@ -428,8 +557,9 @@ jobs:
             tryrun "xorriso -as mkisofs -V CIDATA -J -R -o '$CIDATA' '$SEED_DIR/cloud-init'"
           fi
           [ -f "$CIDATA" ] && sha256sum "$CIDATA" | tee "$META_DIR/seed_cidata.sha256.txt" >/dev/null || true
+          bash -lc "source '$ECHO_ROOT/echo_tools.sh'; spill_file '$CIDATA'"
 
-      - name: Full bootable custom installer ISO (UEFI/BIOS)
+      - name: Full bootable custom installer ISO (UEFI/BIOS) → spill & remove base ISO
         continue-on-error: true
         shell: bash
         run: |
@@ -437,9 +567,7 @@ jobs:
           source "$ECHO_ROOT/echo_tools.sh"
           ensure_cmd xorriso; ensure_cmd isohybrid || true; ensure_cmd isohdpfx.bin || true
           D="${{ inputs.distro || github.event.inputs.distro }}"
-          BASE_ISO="$ISO_DIR/$(
-            jq -r '.base_iso_url' "$META_DIR/base_iso.urls.json" 2>/dev/null | awk -F/ '{print $NF}'
-          )"
+          BASE_ISO="$ISO_DIR/$(jq -r '.base_iso_url' "$META_DIR/base_iso.urls.json" 2>/dev/null | awk -F/ '{print $NF}')"
           [[ -z "$BASE_ISO" || ! -f "$BASE_ISO" ]] && BASE_ISO="$ISO_DIR/$(ls -1 "$ISO_DIR" 2>/dev/null | grep -E '\.iso$' | head -n1 || true)"
           [[ -z "$BASE_ISO" || ! -f "$BASE_ISO" ]] && { softfail "Base ISO not found"; exit 0; }
           WORK="$WORK_DIR/root"
@@ -505,8 +633,12 @@ jobs:
             softfail "Boot images not found"
           fi
           [ -f "$OUT" ] && sha256sum "$OUT" | tee "$META_DIR/custom_installer.sha256.txt" >/dev/null || true
+          # Spill the big installer ISO and delete base ISO to free space
+          bash -lc "source '$ECHO_ROOT/echo_tools.sh'; spill_file '$OUT'"
+          rm -f "$BASE_ISO" || true
+          ensure_space
 
-      - name: Post-ISO:extra bulk & MOVE
+      - name: Post-ISO:extra bulk & MOVE → spill
         continue-on-error: true
         shell: bash
         run: |
@@ -514,9 +646,10 @@ jobs:
           source "$ECHO_ROOT/echo_tools.sh"
           EXTRA="$ECHO_ROOT/after_iso_payload"
           mkdir -p "$EXTRA/bulk_extra"
-          for i in $(seq 1 50); do
+          for i in $(seq 1 40); do
             tryrun "mkdir -p '$EXTRA/bulk_extra/extra_${i}/subA' '$EXTRA/bulk_extra/extra_${i}/subB'"
             echo "extra payload $i" > "$EXTRA/bulk_extra/extra_${i}/README.txt" || true
+            if (( i % 10 == 0 )); then ensure_space; fi
           done
           if [ -d "$ECHO_ROOT/linux/bulk" ]; then
             mkdir -p "$EXTRA/bulk_from_linux"
@@ -526,9 +659,10 @@ jobs:
             mkdir -p "$EXTRA/bulk_from_rhel"
             find "$ECHO_ROOT/rhel/bulk" -mindepth 1 -maxdepth 1 -type d -print0 | xargs -0 -I{} mv "{}" "$EXTRA/bulk_from_rhel"/ || softfail "move rhel bulk failed"
           fi
-          tryrun "tar -C '$EXTRA' -cf '$DIST_DIR/after_iso_payload.tar' ."
+          ensure_space
+          bash -lc "source '$ECHO_ROOT/echo_tools.sh'; spill_dir '$EXTRA'"
 
-      - name: QCOW2 base & snapshot
+      - name: QCOW2 base & snapshot → info spill
         continue-on-error: true
         shell: bash
         run: |
@@ -547,8 +681,11 @@ jobs:
           [ -f "$SNAP" ] && qemu-img info --output=json "$SNAP" | tee "$META_DIR/qcow2_snap.info.json" >/dev/null || true
           tryrun "qemu-img check '$SNAP' | tee '$LOG_DIR/qcow2_snap.check.log'"
           popd >/dev/null
+          # QCOW2는 매우 큼 → 즉시 spill
+          bash -lc "source '$ECHO_ROOT/echo_tools.sh'; spill_file '$IMG_DIR/$BASE'"
+          bash -lc "source '$ECHO_ROOT/echo_tools.sh'; spill_file '$IMG_DIR/$SNAP'"
 
-      - name: SBOM (SPDX-JSON)
+      - name: SBOM (SPDX-JSON) for dist/metadata only (small footprint)
         continue-on-error: true
         shell: bash
         run: |
@@ -557,9 +694,12 @@ jobs:
           ensure_cmd syft
           mkdir -p "$DIST_DIR/sbom"
           syft version || true
+          # 대용량 바이너리는 이미 spill되었으므로 meta/isos 목록에 대해서만 SBOM 생성
+          # dist 잔여 파일 전체를 타겟하되, 실패 허용
           tryrun "syft dir:'$DIST_DIR' -o spdx-json > '$DIST_DIR/sbom/dist.spdx.json'"
+          bash -lc "source '$ECHO_ROOT/echo_tools.sh'; spill_file '$DIST_DIR/sbom/dist.spdx.json'"
 
-      - name: Hash catalog & index
+      - name: Hash catalog & index (remaining dist)
         continue-on-error: true
         shell: bash
         run: |
@@ -578,7 +718,7 @@ jobs:
           done < <(find dist -type f -print0)
           echo "]" >> "$HASH_JSON"
 
-      - name: Test server (serve dist/) & health check
+      - name: Lightweight HTTP test server (serve dist/) & health check
         continue-on-error: true
         shell: bash
         run: |
@@ -588,9 +728,10 @@ jobs:
           ( python3 -m http.server "$PORT" --directory "$DIST_DIR" > "$LOG" 2>&1 & echo $! > "$LOG_DIR/test_server.pid" )
           sleep 2
           tryrun "curl -sSf http://127.0.0.1:${PORT}/ | head -n 5"
+          ensure_space
 
-      # ======== 멀티 배포: GHCR (ORAS) ========
-      - name: GHCR upload via ORAS (dynamic files)
+      # ======== GHCR (ORAS) 추가 업로드: 남은 dist/** 정리 ========
+      - name: GHCR upload via ORAS (remaining small files)
         continue-on-error: true
         env:
           ORAS_TAG: ${{ github.run_id }}
@@ -601,22 +742,22 @@ jobs:
           set -Eeuo pipefail
           source "$ECHO_ROOT/echo_tools.sh"
           ensure_cmd oras
-          echo "$GH_TOKEN" | oras login ghcr.io -u "$GH_USER" --password-stdin || { softfail "oras login failed"; exit 0; }
+          oras_login || { softfail "oras login failed"; exit 0; }
           BASE_LC="$(echo "${GHCR_BASE}" | tr '[:upper:]' '[:lower:]')"
           REF="${BASE_LC}:${ORAS_TAG}"
           declare -a files=()
-          while IFS= read -r -d '' f; do files+=("$f"); done < <(find "$ISO_DIR" "$IMG_DIR" "$DIST_DIR/sbom" "$META_DIR" -type f -print0 2>/dev/null || true)
-          for f in "$DIST_DIR/echo_bulk.tar" "$DIST_DIR/after_iso_payload.tar"; do [ -f "$f" ] && files+=("$f"); done
+          while IFS= read -r -d '' f; do files+=("$f"); done < <(find "$DIST_DIR" -type f -maxdepth 3 -print0 2>/dev/null || true)
           [ ${#files[@]} -eq 0 ] && { softfail "No files to push to ORAS"; exit 0; }
           args=(push "$REF" --artifact-type application/vnd.echo.bundle)
           for f in "${files[@]}"; do
+            [ -f "$f" ] || continue
             mt="application/octet-stream"
-            case "$f" in *.json) mt="application/json" ;; *.spdx.json) mt="application/spdx+json" ;; *.txt|*.log|*.md) mt="text/plain" ;; *.tar) mt="application/x-tar" ;; esac
+            case "$f" in *.json) mt="application/json" ;; *.spdx.json) mt="application/spdx+json" ;; *.txt|*.log|*.md) mt="text/plain" ;; *.tar) mt="application/x-tar" ;; *.iso) mt="application/x-cd-image" ;; *.qcow2) mt="application/x-qemu-disk" ;; esac
             args+=("$f:$mt")
           done
           tryrun "${args[@]}"
 
-      # ======== 멀티 배포: GitHub Pages ========
+      # ======== GitHub Pages (남은 dist/) ========
       - name: Prepare Pages Artifact (dist/)
         continue-on-error: true
         uses: actions/upload-pages-artifact@v3
@@ -630,7 +771,7 @@ jobs:
         with:
           artifact_name: ${{ env.PAGES_ARTIFACT_NAME }}
 
-      # ======== 멀티 배포: AWS S3 ========
+      # ======== AWS S3 ========
       - name: Configure AWS (OIDC or Keys)
         id: aws-auth
         if: env.ECHO_S3_BUCKET != '' && (env.AWS_ROLE_TO_ASSUME != '' || (env.AWS_ACCESS_KEY_ID != '' && env.AWS_SECRET_ACCESS_KEY != ''))
@@ -654,7 +795,7 @@ jobs:
           aws s3 sync "dist/" "s3://${ECHO_S3_BUCKET}/" --delete || softfail "s3 sync failed"
           echo "s3://${ECHO_S3_BUCKET}/" | tee -a "$META_DIR/deploy_targets.txt"
 
-      # ======== 멀티 배포: Azure Blob ========
+      # ======== Azure Blob ========
       - name: Azure:create container & upload
         if: env.AZURE_STORAGE_ACCOUNT != '' && env.AZURE_STORAGE_KEY != '' && env.ECHO_AZURE_CONTAINER != ''
         continue-on-error: true
@@ -668,8 +809,8 @@ jobs:
             -d "$ECHO_AZURE_CONTAINER" -s "dist" --overwrite true || softfail "azure upload-batch failed"
           echo "azure://$AZURE_STORAGE_ACCOUNT/$ECHO_AZURE_CONTAINER/" | tee -a "$META_DIR/deploy_targets.txt"
 
-      # ======== 멀티 배포: Google Cloud Storage ========
-      - name: GCP auth (Workload Identity Federation)  # 또는 GITHUB OIDC <-> GCP 셋업 시
+      # ======== GCS ========
+      - name: GCP auth (Workload Identity Federation)
         if: env.ECHO_GCS_BUCKET != '' && env.GCP_WORKLOAD_IDENTITY_PROVIDER != '' && env.GCP_SERVICE_ACCOUNT != ''
         continue-on-error: true
         uses: google-github-actions/auth@v2
@@ -695,8 +836,7 @@ jobs:
           gsutil -m rsync -d -r "dist" "gs://$ECHO_GCS_BUCKET" || softfail "gcs rsync failed"
           echo "gs://$ECHO_GCS_BUCKET/" | tee -a "$META_DIR/deploy_targets.txt"
 
-      # ======== GitHub Release (요약 포함) ========
-      - name: Upload artifacts
+      - name: Upload remaining small artifacts (not spilled)
         uses: actions/upload-artifact@v4
         continue-on-error: true
         with:
@@ -715,11 +855,10 @@ jobs:
             ALL-IN-ONE image suite with Runner Upgrade, GPG verify, FULL bootable installer ISO, Cloud-Init/Kickstart/Preseed, QCOW2, SBOM, GHCR, Hash Index, **Multi-Deploy** (Pages/S3/Azure/GCS).
             - Distro: `${{ inputs.distro || github.event.inputs.distro }}`
             - Base ISO URL: see `dist/meta/base_iso.urls.json`
-            - Payload ISO: `dist/isos/custom_payload.iso`
-            - Installer ISO: `dist/isos/custom_installer_${{ inputs.distro || github.event.inputs.distro }}.iso`
-            - Seed ISO: `dist/isos/seed-cidata.iso`
-            - QCOW2: `dist/images/base_${{ inputs.distro || github.event.inputs.distro }}.qcow2` + `snap_${{ inputs.distro || github.event.inputs.distro }}.qcow2`
-            - SBOM: `dist/sbom/dist.spdx.json`
+            - Payload ISO: `dist/isos/custom_payload.iso` (spilled to remote if present)
+            - Installer ISO: `dist/isos/custom_installer_${{ inputs.distro || github.event.inputs.distro }}.iso` (spilled to remote if present)
+            - QCOW2: `dist/images/base_*.qcow2` + `snap_*.qcow2` (spilled to remote if present)
+            - SBOM: `dist/sbom/dist.spdx.json` (may be remote)
             - Hash index: `dist/meta/hash_index.json`
             - Runner Upgrade Report: `dist/meta/UPGRADE_REPORT.md`
             - Download Manifest: `dist/meta/DOWNLOADS.txt`
