@@ -1,333 +1,261 @@
-name: "🔐 AWS KeyOps (Bulk Users · OIDC→Static→B64 · Encrypted Download)"
+name: "🧱 WAS FS/Dir + Memory Expansion (Loopback+Swap+JVM)"
 
 on:
   workflow_dispatch:
     inputs:
-      action:
-        description: "작업 유형"
+      fs_size_gb:
+        description: "루프백 디스크 크기(GB)"
+        required: true
+        default: "10"
+      mount_point:
+        description: "마운트 지점"
+        required: true
+        default: "/mnt/was_data"
+      fs_label:
+        description: "파일시스템 라벨"
+        required: true
+        default: "WASDATA"
+      dir_list:
+        description: "생성할 디렉토리(콤마 구분)"
+        required: true
+        default: "logs,temp,uploads,cache,sessions,backups,conf,static,assets"
+      swap_size_gb:
+        description: "추가 SWAP 크기(GB, 0이면 생략)"
+        required: true
+        default: "4"
+      app_type:
+        description: "WAS 타입"
         type: choice
         required: true
-        default: "create"
-        options: ["create", "rotate", "show", "revoke"]
-      user_list:
-        description: "대상 사용자 목록 (줄바꿈/쉼표 구분)"
+        default: "spring-boot"
+        options: ["spring-boot","tomcat"]
+      jvm_xms:
+        description: "JVM Xms (예: 1024m)"
         required: true
-        default: "ci-bot"
-      encrypt_mode:
-        description: "다운로드 암호화"
-        type: choice
+        default: "1024m"
+      jvm_xmx:
+        description: "JVM Xmx (예: 2048m)"
         required: true
-        default: "pgp"
-        options: ["pgp", "password", "none"]
-      pgp_public_key:
-        description: "(선택) PGP 공개키(ASCII armor)"
+        default: "2048m"
+      app_jar_path:
+        description: "[spring-boot] JAR 경로 (예: target/app.jar)"
         required: false
-        default: ""
-      download_password:
-        description: "(선택) 비밀번호 (password 모드)"
+        default: "target/app.jar"
+      tomcat_base:
+        description: "[tomcat] TОМCAT_BASE 경로 (예: /opt/tomcat)"
         required: false
-        default: ""
-      create_inactive:
-        type: boolean
-        default: false
-      rotate_deactivate_old:
-        type: boolean
-        default: true
-      rotate_delete_old:
-        type: boolean
-        default: false
-      aws_keys_b64:
-        description: "(선택) Base64(AccessKeyId:SecretAccessKey:SessionToken)"
-        required: false
-        default: ""
-      artifact_retention_days:
-        description: "아티팩트 보관일"
+        default: "/opt/tomcat"
+      commit_changes:
+        description: "에코 산출물 커밋/푸시 (true/false)"
         required: true
-        default: "3"
+        default: "false"
 
 permissions:
-  id-token: write
-  contents: read
-
-env:
-  AWS_REGION: ${{ secrets.AWS_REGION }}
-  AWS_ROLE_TO_ASSUME: ${{ secrets.AWS_ROLE_TO_ASSUME }}     # 권장: OIDC
-  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}       # (비권장) 정적키
-  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-  # 사용자당 키 2개 초과 시 동작 제어(레포 시크릿로 설정 가능): error | deactivate_oldest | delete_oldest
-  KEYOPS_ON_TWO_KEYS: ${{ secrets.KEYOPS_ON_TWO_KEYS }}
+  contents: write
 
 jobs:
-  keyops:
+  was-expand:
     runs-on: ubuntu-latest
-    name: "Bulk KeyOps"
+    timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - name: Tooling
+      - name: Show runner info
         run: |
-          set -euo pipefail
-          sudo apt-get update -y
-          sudo apt-get install -y jq gnupg zip curl
-          python3 -m pip install --upgrade --user awscli >/dev/null 2>&1 || true
-          echo "$HOME/.local/bin" >> $GITHUB_PATH
+          set -Eeuo pipefail
+          echo "[INFO] Kernel: $(uname -a)"
+          echo "[INFO] Disk (df -h):"
+          df -h
+          echo "[INFO] Memory (free -h):"
+          free -h
+          echo "[INFO] Block devices (lsblk):"
+          lsblk || true
 
-      - name: OIDC token diagnostic (summary only)
-        id: oidc-diag
-        env:
-          OIDC_AUD: "sts.amazonaws.com"
+      - name: Reclaim disk space (optional)
         run: |
-          set -euo pipefail
-          TOKEN="$(curl -sSL -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${OIDC_AUD}" | jq -r '.value')"
-          if [ -n "$TOKEN" ] && [ "$TOKEN" != "null" ]; then
-            H="$(echo "$TOKEN" | cut -d. -f1 | base64 -d 2>/dev/null || true)"
-            C="$(echo "$TOKEN" | cut -d. -f2 | base64 -d 2>/dev/null || true)"
-            echo "### OIDC Diagnostics" >> $GITHUB_STEP_SUMMARY
-            echo "- header: \`$(echo "$H" | tr -d '\n' | head -c 180)...\`" >> $GITHUB_STEP_SUMMARY
-            echo "- claims: \`$(echo "$C" | jq -c '{iss,sub,repository,ref,event_name,actor,workflow} // .')\`" >> $GITHUB_STEP_SUMMARY
+          set -Eeuo pipefail
+          echo "[INFO] Reclaiming disk... (docker prune, apt cache clean)"
+          docker system prune -af || true
+          sudo rm -rf /usr/local/lib/android || true
+          sudo rm -rf /opt/ghc || true
+          sudo rm -rf /usr/local/.ghcup || true
+          sudo apt-get clean || true
+          df -h
+
+      - name: Create loopback ext4 volume and mount
+        id: loopfs
+        run: |
+          set -Eeuo pipefail
+          MP="${{ github.event.inputs.mount_point }}"
+          SIZE_GB="${{ github.event.inputs.fs_size_gb }}"
+          LABEL="${{ github.event.inputs.fs_label }}"
+          IMG="wasdata.img"
+
+          echo "[INFO] Creating mount point: ${MP}"
+          sudo mkdir -p "${MP}"
+
+          echo "[INFO] Allocating loopback file (${SIZE_GB}G) -> ${IMG}"
+          # fallocate is fast; fallback to dd if needed
+          if ! fallocate -l "${SIZE_GB}G" "${IMG}"; then
+            echo "[WARN] fallocate failed, using dd (this can take time)"
+            dd if=/dev/zero of="${IMG}" bs=1G count="${SIZE_GB}" status=progress
           fi
 
-      # 1) OIDC
-      - name: Configure AWS via OIDC
-        id: aws-oidc
-        if: env.AWS_ROLE_TO_ASSUME != ''
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ env.AWS_ROLE_TO_ASSUME }}
-          aws-region: ${{ env.AWS_REGION }}
+          echo "[INFO] Formatting ext4 with label ${LABEL}"
+          sudo mkfs.ext4 -F -L "${LABEL}" "${IMG}"
 
-      # 2) 정적/임시 키
-      - name: Configure via static creds
-        id: aws-static
-        if: steps.aws-oidc.outcome == 'skipped' && env.AWS_ACCESS_KEY_ID != '' && env.AWS_SECRET_ACCESS_KEY != ''
-        run: |
-          echo "Using static AWS credentials (fallback)."
-          test -n "${AWS_REGION:-}" || echo "AWS_REGION=us-east-1" >> $GITHUB_ENV
+          echo "[INFO] Mounting to ${MP}"
+          sudo mount -o loop "${IMG}" "${MP}"
 
-      # 3) 런타임 B64 세션키
-      - name: Configure via runtime B64 session keys
-        id: aws-b64
-        if: steps.aws-oidc.outcome == 'skipped' && steps.aws-static.outcome == 'skipped' && inputs.aws_keys_b64 != ''
-        env:
-          B64: ${{ inputs.aws_keys_b64 }}
-        run: |
-          set -euo pipefail
-          DEC="$(printf '%s' "$B64" | base64 -d)"
-          AKID="$(printf '%s' "$DEC" | cut -d: -f1)"
-          SKEY="$(printf '%s' "$DEC" | cut -d: -f2)"
-          STOK="$(printf '%s' "$DEC" | cut -d: -f3-)"
-          test -n "$AKID" && test -n "$SKEY" && test -n "$STOK" || { echo "::error::Invalid aws_keys_b64"; exit 1; }
-          {
-            echo "AWS_ACCESS_KEY_ID=$AKID"
-            echo "AWS_SECRET_ACCESS_KEY=$SKEY"
-            echo "AWS_SESSION_TOKEN=$STOK"
-            echo "AWS_REGION=${AWS_REGION:-us-east-1}"
-          } >> $GITHUB_ENV
-          echo "::add-mask::$AKID"; echo "::add-mask::$SKEY"; echo "::add-mask::$STOK"
-          echo "Configured from runtime B64 session keys."
+          echo "[INFO] Mounted:"
+          df -h "${MP}"
 
-      - name: Verify AWS auth (or explain fix)
+          echo "image_path=${IMG}" >> "$GITHUB_OUTPUT"
+
+      - name: Create directories and set permissions
         run: |
-          set -euo pipefail
-          if aws sts get-caller-identity --output json >/dev/null 2>&1; then
-            aws sts get-caller-identity --output json | tee auth_identity.json
-            echo "### ✅ AWS Auth OK" >> $GITHUB_STEP_SUMMARY
-            echo "\`\`\`json" >> $GITHUB_STEP_SUMMARY
-            cat auth_identity.json >> $GITHUB_STEP_SUMMARY
-            echo "\`\`\`"
-          else
-            echo "### ❌ AWS Auth NOT configured" >> $GITHUB_STEP_SUMMARY
-            echo "- Set secret **AWS_ROLE_TO_ASSUME**(OIDC) 또는 **AWS_ACCESS_KEY_ID/SECRET_ACCESS_KEY**, 또는 입력 **aws_keys_b64**." >> $GITHUB_STEP_SUMMARY
-            exit 1
+          set -Eeuo pipefail
+          MP="${{ github.event.inputs.mount_point }}"
+          IFS=',' read -r -a DIRS <<< "${{ github.event.inputs.dir_list }}"
+          echo "[INFO] Creating directories under ${MP}"
+          for d in "${DIRS[@]}"; do
+            d_trim="$(echo "$d" | xargs)"
+            [ -z "$d_trim" ] && continue
+            sudo mkdir -p "${MP}/${d_trim}"
+            sudo chmod 2775 "${MP}/${d_trim}"
+          done
+          echo "[INFO] Directory tree sample:"
+          sudo find "${MP}" -maxdepth 2 -type d | sort | sed "s#${MP}#<MP>#"
+
+      - name: Configure SWAP (optional)
+        if: ${{ github.event.inputs.swap_size_gb != '0' && github.event.inputs.swap_size_gb != '' }}
+        run: |
+          set -Eeuo pipefail
+          SWAP_GB="${{ github.event.inputs.swap_size_gb }}"
+          SWAPF="swapfile_${SWAP_GB}G"
+          echo "[INFO] Creating ${SWAP_GB}G swap file..."
+          sudo fallocate -l "${SWAP_GB}G" "/${SWAPF}" || sudo dd if=/dev/zero of="/${SWAPF}" bs=1G count="${SWAP_GB}" status=progress
+          sudo chmod 600 "/${SWAPF}"
+          sudo mkswap "/${SWAPF}"
+          sudo swapon "/${SWAPF}"
+          echo "[INFO] SWAP enabled:"
+          swapon --show
+          free -h
+
+      - name: Write JVM memory settings
+        id: jvm
+        run: |
+          set -Eeuo pipefail
+          XMS="${{ github.event.inputs.jvm_xms }}"
+          XMX="${{ github.event.inputs.jvm_xmx }}"
+          APP="${{ github.event.inputs.app_type }}"
+
+          echo "[INFO] Writing JVM opts for ${APP} (Xms=${XMS}, Xmx=${XMX})"
+          echo "JAVA_TOOL_OPTIONS=\"-Xms${XMS} -Xmx${XMX} -XX:+UseG1GC -XX:MaxGCPauseMillis=200 -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=${{ github.event.inputs.mount_point }}/heapdump.hprof\"" > .java-memory.env
+          cat .java-memory.env
+
+          if [ "${APP}" = "tomcat" ]; then
+            echo 'CATALINA_OPTS="${JAVA_TOOL_OPTIONS} ${CATALINA_OPTS}"' > .tomcat-opts.env
+            cat .tomcat-opts.env
           fi
 
-      - name: Parse user list
-        id: users
+      - name: Sample run (Spring Boot or Tomcat)
+        if: ${{ always() }}
         run: |
-          set -euo pipefail
-          mkdir -p out
-          RAW="${{ inputs.user_list }}"
-          # 쉼표/공백/줄바꿈 → 줄바꿈 통일 → 공백 트리밍 → 중복 제거
-          printf "%s\n" "$RAW" | tr ',;' '\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | awk 'NF' | sort -u > out/users.txt
-          COUNT="$(wc -l < out/users.txt | tr -d ' ')"
-          echo "count=$COUNT" >> $GITHUB_OUTPUT
-          echo "### Users to process: $COUNT" >> $GITHUB_STEP_SUMMARY
-          cat out/users.txt >> $GITHUB_STEP_SUMMARY
+          set -Eeuo pipefail
+          APP="${{ github.event.inputs.app_type }}"
+          MP="${{ github.event.inputs.mount_point }}"
+          source .java-memory.env
 
-      - name: Execute bulk action
-        id: bulk
-        env:
-          ACTION: ${{ inputs.action }}
-          CREATE_INACTIVE: ${{ inputs.create_inactive }}
-          ROTATE_DEACTIVATE_OLD: ${{ inputs.rotate_deactivate_old }}
-          ROTATE_DELETE_OLD: ${{ inputs.rotate_delete_old }}
-          ON_TWO: ${{ env.KEYOPS_ON_TWO_KEYS }}
-        run: |
-          set -euo pipefail
-          mkdir -p out/json out/csv
-          echo "user,action,status,access_key_id,secret_access_key,detail,timestamp" > out/csv/result.csv
-
-          process_user() {
-            local user="$1"
-            # 사용자 존재 보장
-            aws iam get-user --user-name "$user" >/dev/null 2>&1 || aws iam create-user --user-name "$user" >/dev/null
-
-            list_meta() {
-              aws iam list-access-keys --user-name "$user" --query 'AccessKeyMetadata' --output json
-            }
-
-            mask() {
-              [ -n "$1" ] && echo "::add-mask::$1"
-            }
-
-            now="$(date -u +%FT%TZ)"
-
-            case "$ACTION" in
-              show)
-                META="$(list_meta)"; echo "$META" | jq '.' > "out/json/${user}_show.json"
-                echo "$user,show,ok,,,"",""$now" >> out/csv/result.csv
-                ;;
-
-              revoke)
-                META="$(list_meta)" || META="[]"
-                echo "$META" > "out/json/${user}_revoke_before.json"
-                echo "$META" | jq -r '.[].AccessKeyId' | while read -r id; do
-                  aws iam update-access-key --user-name "$user" --access-key-id "$id" --status Inactive || true
-                  aws iam delete-access-key --user-name "$user" --access-key-id "$id" || true
-                done
-                AFTER="$(list_meta)"; echo "$AFTER" > "out/json/${user}_revoke_after.json"
-                echo "$user,revoke,ok,,,all keys removed,$now" >> out/csv/result.csv
-                ;;
-
-              rotate)
-                # 새 키 생성
-                RES="$(aws iam create-access-key --user-name "$user")" || { echo "$user,rotate,error,,,'create-access-key failed',$now" >> out/csv/result.csv; return; }
-                echo "$RES" | jq '.' > "out/json/${user}_rotate_new.json"
-                NEW_AKID="$(echo "$RES"   | jq -r '.AccessKey.AccessKeyId')"
-                NEW_SECRET="$(echo "$RES" | jq -r '.AccessKey.SecretAccessKey')"
-                mask "$NEW_AKID"; mask "$NEW_SECRET"
-                META="$(list_meta)"; echo "$META" > "out/json/${user}_rotate_old_list.json"
-                OLD_AKID="$(echo "$META" | jq -r '([.[].AccessKeyId] - ["'"$NEW_AKID"'"])[0] // empty')"
-                if [ -n "$OLD_AKID" ]; then
-                  [ "${ROTATE_DEACTIVATE_OLD}" = "true" ] && aws iam update-access-key --user-name "$user" --access-key-id "$OLD_AKID" --status Inactive || true
-                  [ "${ROTATE_DELETE_OLD}" = "true" ] && aws iam delete-access-key --user-name "$user" --access-key-id "$OLD_AKID" || true
-                fi
-                jq -n --arg user "$user" --arg new_access_key_id "$NEW_AKID" --arg new_secret_access_key "$NEW_SECRET" --arg rotated_at "$now" \
-                  '{user:$user,new_access_key_id:$new_access_key_id,new_secret_access_key:$new_secret_access_key,rotated_at:$rotated_at}' > "out/json/${user}_rotate_bundle.json"
-                echo "$user,rotate,ok,$NEW_AKID,$NEW_SECRET,,${now}" >> out/csv/result.csv
-                ;;
-
-              create)
-                META="$(list_meta)" || META="[]"
-                COUNT="$(echo "$META" | jq 'length')"
-                if [ "$COUNT" -ge 2 ]; then
-                  case "${ON_TWO:-skip}" in
-                    error)
-                      echo "$user,create,error,,,'already has 2 keys',${now}" >> out/csv/result.csv
-                      return
-                      ;;
-                    deactivate_oldest|delete_oldest)
-                      # 가장 오래된 키
-                      OLDEST="$(echo "$META" | jq -r 'min_by(.CreateDate).AccessKeyId')"
-                      if [ "$ON_TWO" = "deactivate_oldest" ]; then
-                        aws iam update-access-key --user-name "$user" --access-key-id "$OLDEST" --status Inactive || true
-                      else
-                        aws iam delete-access-key --user-name "$user" --access-key-id "$OLDEST" || true
-                      fi
-                      ;;
-                    *) # skip (default)
-                      echo "$user,create,skipped,,,'already has 2 keys (set KEYOPS_ON_TWO_KEYS to handle)',${now}" >> out/csv/result.csv
-                      return
-                      ;;
-                  esac
-                fi
-                RES="$(aws iam create-access-key --user-name "$user")" || { echo "$user,create,error,,,'create-access-key failed',$now" >> out/csv/result.csv; return; }
-                echo "$RES" | jq '.' > "out/json/${user}_create_raw.json"
-                AKID="$(echo "$RES" | jq -r '.AccessKey.AccessKeyId')"
-                SECRET="$(echo "$RES" | jq -r '.AccessKey.SecretAccessKey')"
-                mask "$AKID"; mask "$SECRET"
-                STATUS="Active"
-                if [ "${CREATE_INACTIVE}" = "true" ]; then
-                  aws iam update-access-key --user-name "$user" --access-key-id "$AKID" --status Inactive
-                  STATUS="Inactive"
-                fi
-                jq -n --arg user "$user" --arg access_key_id "$AKID" --arg secret_access_key "$SECRET" --arg status "$STATUS" --arg created "$now" \
-                  '{user:$user, access_key_id:$access_key_id, secret_access_key:$secret_access_key, status:$status, created:$created}' > "out/json/${user}_create_bundle.json"
-                echo "$user,create,ok,$AKID,$SECRET,$STATUS,$now" >> out/csv/result.csv
-                ;;
-            esac
-          }
-
-          export -f process_user
-          while read -r U; do
-            process_user "$U"
-          done < out/users.txt
-
-          # 합본 산출물
-          jq -s '.' out/json/*_bundle.json 2>/dev/null > out/all_keybundles.json || echo "[]" > out/all_keybundles.json
-
-      - name: Encrypt & upload artifacts
-        id: pack
-        env:
-          MODE: ${{ inputs.encrypt_mode }}
-          PGP_KEY: ${{ inputs.pgp_public_key }}
-          PASS_IN: ${{ inputs.download_password }}
-        run: |
-          set -euo pipefail
-          cd out
-          # 공개/민감 파일 분리
-          zip -9 public_reports.zip csv/result.csv json/*_show.json json/*_revoke_*.json 2>/dev/null || true
-          zip -9 secrets_raw.zip all_keybundles.json json/*_create_raw.json json/*_rotate_new.json json/*_create_bundle.json json/*_rotate_bundle.json 2>/dev/null || true
-
-          # 민감 압축(secrets.zip[.gpg|.enc])
-          if [ -s secrets_raw.zip ]; then
-            if [ "${MODE}" = "pgp" ]; then
-              echo "$PGP_KEY" > pub.asc
-              gpg --batch --import pub.asc
-              RECIP="$(gpg --with-colons --list-keys | awk -F: '/^pub/ {print $5; exit}')"
-              [ -z "$RECIP" ] && { echo "::error::Invalid PGP public key"; exit 1; }
-              gpg --batch --yes --trust-model always -r "$RECIP" -o secrets.zip.gpg --encrypt secrets_raw.zip
-              ART1="secrets.zip.gpg"
-            elif [ "${MODE}" = "password" ]; then
-              PASS="${PASS_IN:-}"; [ -z "$PASS" ] && PASS="$(openssl rand -base64 24)"
-              echo "::add-mask::$PASS"
-              echo "### 🔑 Download Password\n\`\`\`\n$PASS\n\`\`\`" >> $GITHUB_STEP_SUMMARY
-              openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt -in secrets_raw.zip -out secrets.zip.enc -k "$PASS"
-              ART1="secrets.zip.enc"
+          if [ "${APP}" = "spring-boot" ]; then
+            JAR="${{ github.event.inputs.app_jar_path }}"
+            if [ -f "${JAR}" ]; then
+              echo "[INFO] Running Spring Boot: ${JAR}"
+              nohup bash -c "JAVA_TOOL_OPTIONS='${JAVA_TOOL_OPTIONS}' java -jar ${JAR} --logging.file.name=${MP}/logs/app.log --spring.servlet.multipart.location=${MP}/temp" >/tmp/sb.out 2>&1 &
+              sleep 3
+              echo "[INFO] Spring Boot launched (background)."
             else
-              mv secrets_raw.zip secrets.zip
-              ART1="secrets.zip"
+              echo "[WARN] ${JAR} not found; skip launching."
+            fi
+          else
+            TBASE="${{ github.event.inputs.tomcat_base }}"
+            if [ -x "${TBASE}/bin/catalina.sh" ]; then
+              echo "[INFO] Running Tomcat at ${TBASE}"
+              source .tomcat-opts.env || true
+              nohup bash -c "export CATALINA_BASE='${TBASE}'; export CATALINA_OPTS='${CATALINA_OPTS}'; ${TBASE}/bin/catalina.sh start" >/tmp/tc.out 2>&1 &
+              sleep 3
+              echo "[INFO] Tomcat launched (background)."
+              # 예시: 로그 디렉토리를 증설 볼륨으로 교체(심볼릭 링크)
+              if [ -d "${TBASE}/logs" ]; then
+                sudo mkdir -p "${MP}/tomcat-logs"
+                sudo rm -rf "${TBASE}/logs"
+                sudo ln -s "${MP}/tomcat-logs" "${TBASE}/logs"
+                echo "[INFO] Tomcat logs redirected to ${MP}/tomcat-logs"
+              fi
+            else
+              echo "[WARN] ${TBASE}/bin/catalina.sh not found; skip launching."
             fi
           fi
 
-          # 공개 리포트(민감정보 없음)
-          ART2=""
-          if [ -s public_reports.zip ]; then
-            ART2="public_reports.zip"
-          fi
-
-          echo "art1=${ART1:-}" >> $GITHUB_OUTPUT
-          echo "art2=${ART2:-}" >> $GITHUB_OUTPUT
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: aws-keys-secret-${{ github.run_id }}
-          path: out/${{ steps.pack.outputs.art1 }}
-          if-no-files-found: ignore
-          retention-days: ${{ inputs.artifact_retention_days }}
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: aws-keys-report-${{ github.run_id }}
-          path: out/${{ steps.pack.outputs.art2 }}
-          if-no-files-found: ignore
-          retention-days: ${{ inputs.artifact_retention_days }}
-
-      - name: Summary
+      - name: Generate reports
         run: |
-          echo "## ✅ AWS Bulk KeyOps Completed" >> $GITHUB_STEP_SUMMARY
-          echo "- Action: ${{ inputs.action }}" >> $GITHUB_STEP_SUMMARY
-          echo "- Users: ${{ steps.users.outputs.count }}" >> $GITHUB_STEP_SUMMARY
-          echo "- Secrets Artifact: aws-keys-secret-${{ github.run_id }}" >> $GITHUB_STEP_SUMMARY
-          echo "- Report Artifact:  aws-keys-report-${{ github.run_id }}" >> $GITHUB_STEP_SUMMARY
+          set -Eeuo pipefail
+          MP="${{ github.event.inputs.mount_point }}"
+          {
+            echo "# WAS Expansion Report"
+            echo
+            echo "## Filesystem"
+            echo "- Mount point: ${MP}"
+            echo "- Label: ${{ github.event.inputs.fs_label }}"
+            echo "- Size(GB): ${{ github.event.inputs.fs_size_gb }}"
+            echo
+            echo "### df -h ${MP}"
+            df -h "${MP}" || true
+            echo
+            echo "## Directories"
+            echo "${{ github.event.inputs.dir_list }}"
+            echo
+            echo "## Memory (free -h)"
+            free -h || true
+            echo
+            echo "## Swap"
+            swapon --show || true
+            echo
+            echo "## JVM"
+            echo '```'
+            cat .java-memory.env
+            [ -f .tomcat-opts.env ] && cat .tomcat-opts.env || true
+            echo '```'
+          } > was_expansion_report.md
+
+          # 마운트/트리 정보
+          sudo bash -c "df -h > mount_report.txt"
+          sudo bash -c "du -sh ${MP}/* 2>/dev/null | sort -h > usage_report.txt" || true
+          sudo bash -c "find ${MP} -maxdepth 2 -type d | sort > dir_tree.txt" || true
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: was-expansion-artifacts
+          path: |
+            was_expansion_report.md
+            mount_report.txt
+            usage_report.txt
+            dir_tree.txt
+            ${{ steps.loopfs.outputs.image_path }}
+            .java-memory.env
+            .tomcat-opts.env
+
+      - name: Commit & push reports (optional)
+        if: ${{ github.event.inputs.commit_changes == 'true' }}
+        run: |
+          set -Eeuo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          mkdir -p .github/echo_was
+          cp -f was_expansion_report.md .github/echo_was/
+          cp -f mount_report.txt usage_report.txt dir_tree.txt .github/echo_was/ || true
+          git add .github/echo_was || true
+          git commit -m "[ECHO][WAS] FS/Dir/Mem expansion reports" || echo "[INFO] Nothing to commit"
+          git push || echo "[WARN] Push skipped (no changes or missing permissions)"
