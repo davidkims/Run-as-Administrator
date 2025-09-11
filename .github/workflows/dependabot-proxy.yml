@@ -2,8 +2,14 @@ name: Dependabot Updates via Proxy
 
 on:
   schedule:
-    - cron: '0 0 * * 1'
+    - cron: '0 0 * * 1' # Runs weekly on Monday at midnight
   workflow_dispatch:
+  pull_request:
+    types: [opened, reopened, synchronize]
+    branches: [main]
+    paths:
+      - '**/pom.xml'
+      - '.github/**'
 
 permissions:
   contents: write
@@ -11,20 +17,7 @@ permissions:
 
 jobs:
   dependabot:
-name: Dependabot Proxy Build
-
-on:
-  pull_request:
-    types: [opened, reopened, synchronize]
-    branches: [ main ]
-    paths:
-      - '**/pom.xml'
-      - '.github/**'
-  workflow_dispatch:
-
-jobs:
-  build:
-    if: ${{ github.actor == 'dependabot[bot]' }}
+    if: ${{ github.actor == 'dependabot[bot]' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     env:
       HTTP_PROXY: ${{ secrets.HTTP_PROXY }}
@@ -35,45 +28,44 @@ jobs:
     steps:
       - name: Configure Linux proxy
         run: |
-          echo "Acquire::http::Proxy \"${HTTP_PROXY}\";" | sudo tee /etc/apt/apt.conf.d/99proxy
-          echo "Acquire::https::Proxy \"${HTTPS_PROXY}\";" | sudo tee -a /etc/apt/apt.conf.d/99proxy
+          echo "Acquire::http::Proxy \"${{ env.HTTP_PROXY }}\";" | sudo tee /etc/apt/apt.conf.d/99proxy
+          echo "Acquire::https::Proxy \"${{ env.HTTPS_PROXY }}\";" | sudo tee -a /etc/apt/apt.conf.d/99proxy
       - name: Checkout repository
         uses: actions/checkout@v4
       - name: Run Dependabot for Maven
+        if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
         run: |
           docker run --rm \
             -e GITHUB_ACCESS_TOKEN=${{ secrets.GITHUB_TOKEN }} \
-            -e HTTP_PROXY=${HTTP_PROXY} \
-            -e HTTPS_PROXY=${HTTPS_PROXY} \
+            -e HTTP_PROXY=${{ env.HTTP_PROXY }} \
+            -e HTTPS_PROXY=${{ env.HTTPS_PROXY }} \
             -v "${{ github.workspace }}":/home/dependabot/app \
             ghcr.io/dependabot/dependabot-core update \
             maven /home/dependabot/app
       - name: Run Dependabot for Docker
+        if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
         run: |
           docker run --rm \
             -e GITHUB_ACCESS_TOKEN=${{ secrets.GITHUB_TOKEN }} \
-            -e HTTP_PROXY=${HTTP_PROXY} \
-            -e HTTPS_PROXY=${HTTPS_PROXY} \
+            -e HTTP_PROXY=${{ env.HTTP_PROXY }} \
+            -e HTTPS_PROXY=${{ env.HTTPS_PROXY }} \
             -v "${{ github.workspace }}":/home/dependabot/app \
             ghcr.io/dependabot/dependabot-core update \
             docker /home/dependabot/app
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v3
-
       - name: Setup Java
+        if: ${{ github.event_name == 'pull_request' }}
         uses: actions/setup-java@v5
         with:
           distribution: 'temurin'
           java-version: '17'
-
       - name: Build with Maven
+        if: ${{ github.event_name == 'pull_request' }}
         run: mvn -B package --file pom.xml
-
       - name: Build Docker image
+        if: ${{ github.event_name == 'pull_request' }}
         run: docker build -t myapp:latest .
-
       - name: Install system packages via proxy
+        if: ${{ github.event_name == 'pull_request' }}
         run: |
           sudo apt-get update
           sudo apt-get install -y curl
