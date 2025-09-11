@@ -619,7 +619,7 @@ jobs:
       # ======== 멀티 배포: GitHub Pages ========
       - name: Prepare Pages Artifact (dist/)
         continue-on-error: true
-        uses: actions/upload-pages-artifact@v3
+        uses: actions/upload-pages-artifact@v4
         with:
           path: dist
           name: ${{ env.PAGES_ARTIFACT_NAME }}
