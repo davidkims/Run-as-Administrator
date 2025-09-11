@@ -1,0 +1,266 @@
+name: Dependabot Updates via Proxy + Full Scan & Servers
+
+on:
+  schedule:
+    - cron: '0 0 * * 1'   # 매주 월요일 00:00
+  workflow_dispatch:
+  pull_request:
+    types: [opened, reopened, synchronize]
+    branches: [main]
+    paths:
+      - '**/pom.xml'
+      - '.github/**'
+      - 'Dockerfile'
+      - '**/Dockerfile'
+
+permissions:
+  contents: write
+  pull-requests: write
+  security-events: write  # (선택) Code scanning 업로드 시 필요
+
+# 전역 프록시(대문자만)
+env:
+  HTTP_PROXY: ${{ secrets.HTTP_PROXY }}
+  HTTPS_PROXY: ${{ secrets.HTTPS_PROXY }}
+  NO_PROXY: ${{ secrets.NO_PROXY }}
+  PROXY_HOST: ${{ secrets.PROXY_HOST }}
+  PROXY_PORT: ${{ secrets.PROXY_PORT }}
+
+jobs:
+  run-dependabot:
+    name: Run Dependabot via Proxy (Maven & Docker)
+    if: ${{ github.event_name != 'pull_request' }}  # 스케줄/수동 실행에서만
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure apt proxy (system-wide)
+        run: |
+          if [ -n "${HTTP_PROXY}" ]; then
+            echo "Acquire::http::Proxy \"${HTTP_PROXY}\";" | sudo tee /etc/apt/apt.conf.d/99proxy
+          fi
+          if [ -n "${HTTPS_PROXY}" ]; then
+            echo "Acquire::https::Proxy \"${HTTPS_PROXY}\";" | sudo tee -a /etc/apt/apt.conf.d/99proxy
+          fi
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Export JVM/Maven proxy to $GITHUB_ENV
+        run: |
+          echo "MAVEN_OPTS=-Dhttp.proxyHost=${PROXY_HOST} -Dhttp.proxyPort=${PROXY_PORT} -Dhttps.proxyHost=${PROXY_HOST} -Dhttps.proxyPort=${PROXY_PORT}" >> "$GITHUB_ENV"
+          echo "JAVA_TOOL_OPTIONS=-Dhttp.proxyHost=${PROXY_HOST} -Dhttp.proxyPort=${PROXY_PORT} -Dhttps.proxyHost=${PROXY_HOST} -Dhttps.proxyPort=${PROXY_PORT}" >> "$GITHUB_ENV"
+
+      - name: Dependabot for Maven (via proxy)
+        run: |
+          docker run --rm \
+            -e GITHUB_ACCESS_TOKEN=${{ secrets.GITHUB_TOKEN }} \
+            -e HTTP_PROXY="${HTTP_PROXY}" \
+            -e HTTPS_PROXY="${HTTPS_PROXY}" \
+            -e NO_PROXY="${NO_PROXY}" \
+            -v "${{ github.workspace }}":/home/dependabot/app \
+            ghcr.io/dependabot/dependabot-core update maven /home/dependabot/app
+
+      - name: Dependabot for Docker (via proxy)
+        run: |
+          docker run --rm \
+            -e GITHUB_ACCESS_TOKEN=${{ secrets.GITHUB_TOKEN }} \
+            -e HTTP_PROXY="${HTTP_PROXY}" \
+            -e HTTPS_PROXY="${HTTPS_PROXY}" \
+            -e NO_PROXY="${NO_PROXY}" \
+            -v "${{ github.workspace }}":/home/dependabot/app \
+            ghcr.io/dependabot/dependabot-core update docker /home/dependabot/app
+
+  validate-pr:
+    name: Validate Dependabot PR (Build & Image)
+    if: ${{ github.event_name == 'pull_request' && github.actor == 'dependabot[bot]' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure apt proxy (system-wide)
+        run: |
+          if [ -n "${HTTP_PROXY}" ]; then
+            echo "Acquire::http::Proxy \"${HTTP_PROXY}\";" | sudo tee /etc/apt/apt.conf.d/99proxy
+          fi
+          if [ -n "${HTTPS_PROXY}" ]; then
+            echo "Acquire::https::Proxy \"${HTTPS_PROXY}\";" | sudo tee -a /etc/apt/apt.conf.d/99proxy
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Export JVM/Maven proxy to $GITHUB_ENV
+        run: |
+          echo "MAVEN_OPTS=-Dhttp.proxyHost=${PROXY_HOST} -Dhttp.proxyPort=${PROXY_PORT} -Dhttps.proxyHost=${PROXY_HOST} -Dhttps.proxyPort=${PROXY_PORT}" >> "$GITHUB_ENV"
+          echo "JAVA_TOOL_OPTIONS=-Dhttp.proxyHost=${PROXY_HOST} -Dhttp.proxyPort=${PROXY_PORT} -Dhttps.proxyHost=${PROXY_HOST} -Dhttps.proxyPort=${PROXY_PORT}" >> "$GITHUB_ENV"
+
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Build with Maven
+        run: mvn -B -V -e -DskipTests package
+
+      - name: Build Docker image (if Dockerfile exists)
+        run: |
+          if ls Dockerfile */Dockerfile >/dev/null 2>&1; then
+            docker build -t myapp:latest .
+          else
+            echo "No Dockerfile found, skipping image build."
+          fi
+
+  security-scans:
+    name: Full Security Scans (Gitleaks + SBOM + Trivy)
+    runs-on: ubuntu-latest
+    needs: [validate-pr]
+    steps:
+      - name: Configure apt proxy (system-wide)
+        run: |
+          if [ -n "${HTTP_PROXY}" ]; then
+            echo "Acquire::http::Proxy \"${HTTP_PROXY}\";" | sudo tee /etc/apt/apt.conf.d/99proxy
+          fi
+          if [ -n "${HTTPS_PROXY}" ]; then
+            echo "Acquire::https::Proxy \"${HTTPS_PROXY}\";" | sudo tee -a /etc/apt/apt.conf.d/99proxy
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare dirs
+        run: |
+          mkdir -p dist/reports dist/sbom
+
+      - name: Gitleaks (secrets scan)
+        uses: gitleaks/gitleaks-action@v2
+        with:
+          # 기본 detect; 실패 시 워크플로우 실패 방지하려면 args: "--no-banner --redact --exit-code 0"
+          # 여기서는 실패 시 알리기 위해 기본 설정 유지
+          args: --redact -v
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Syft (SBOM)
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/anchore/sbom-action/main/install.sh | bash -s -- -b /usr/local/bin v1.31.0
+          syft version
+
+      - name: Build Docker image for scanning (if missing)
+        run: |
+          if ! docker image inspect myapp:latest >/dev/null 2>&1; then
+            if ls Dockerfile */Dockerfile >/dev/null 2>&1; then
+              docker build -t myapp:latest .
+            fi
+          fi
+
+      - name: Generate SBOM (image or dir)
+        run: |
+          if docker image inspect myapp:latest >/dev/null 2>&1; then
+            syft scan "docker:myapp:latest" -o spdx-json > dist/sbom/sbom-image.spdx.json
+          else
+            syft packages dir:. -o spdx-json > dist/sbom/sbom-source.spdx.json
+          fi
+
+      - name: Install Trivy
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wget
+          wget -qO- https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh
+          ./bin/trivy --version
+
+      - name: Trivy (FS scan)
+        run: |
+          ./bin/trivy fs --no-progress --format sarif --output dist/reports/trivy-fs.sarif .
+
+      - name: Trivy (Image scan, if built)
+        run: |
+          if docker image inspect myapp:latest >/dev/null 2>&1; then
+            ./bin/trivy image --no-progress --format sarif --output dist/reports/trivy-image.sarif myapp:latest
+          else
+            echo "Image not built; skipping Trivy image scan."
+          fi
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-reports
+          path: |
+            dist/reports/**
+            dist/sbom/**
+
+  servers:
+    name: Spin-up Test Servers (nginx + MySQL via containers)
+    runs-on: ubuntu-latest
+    needs: [run-dependabot, security-scans]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Create example files (configs, health pages)
+        run: |
+          mkdir -p dist/site
+          echo "<h1>Echo Test OK - $(date -u +'%Y-%m-%dT%H:%M:%SZ')</h1>" > dist/site/index.html
+          cat > dist/site/health.json << 'JSON'
+          { "status": "ok", "ts": "__TS__" }
+          JSON
+          sed -i "s/__TS__/$(date -u +'%Y-%m-%dT%H:%M:%SZ')/" dist/site/health.json
+
+      - name: Run nginx container (serving ./dist/site at :8080)
+        run: |
+          docker run -d --rm --name echo_nginx \
+            -p 8080:80 \
+            -v "${{ github.workspace }}/dist/site":/usr/share/nginx/html:ro \
+            nginx:alpine
+          sleep 3
+          curl -sSf http://127.0.0.1:8080/ | head -n1
+
+      - name: Run MySQL container (:3306) & simple health
+        env:
+          MYSQL_ROOT_PASSWORD: rootpass
+        run: |
+          docker run -d --rm --name echo_mysql \
+            -e MYSQL_ROOT_PASSWORD="${MYSQL_ROOT_PASSWORD}" \
+            -e MYSQL_DATABASE=echo_db \
+            -p 3306:3306 \
+            --health-cmd="mysqladmin ping -h 127.0.0.1 -p${MYSQL_ROOT_PASSWORD} --silent" \
+            --health-interval=10s --health-timeout=5s --health-retries=6 \
+            mysql:8.0
+          # 대기
+          for i in $(seq 1 30); do
+            if docker inspect --format='{{.State.Health.Status}}' echo_mysql 2>/dev/null | grep -q healthy; then
+              echo "MySQL healthy"; break
+            fi
+            echo "Waiting MySQL ($i/30)"; sleep 3
+          done
+
+      - name: Create MySQL init SQL & run
+        run: |
+          mkdir -p dist/sql
+          cat > dist/sql/init.sql <<'SQL'
+          CREATE TABLE IF NOT EXISTS accounts(
+            id INT PRIMARY KEY AUTO_INCREMENT,
+            owner VARCHAR(64),
+            balance DECIMAL(18,2),
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+          );
+          INSERT INTO accounts(owner, balance) VALUES ('alice', 1000.00), ('bob', 500.50);
+          SQL
+          docker exec -i echo_mysql sh -lc 'mysql -uroot -p"$MYSQL_ROOT_PASSWORD" echo_db' < dist/sql/init.sql
+          docker exec -i echo_mysql sh -lc 'mysql -uroot -p"$MYSQL_ROOT_PASSWORD" -e "SELECT * FROM echo_db.accounts;"' | tee dist/sql/select_accounts.txt
+
+      - name: Curl health endpoints & save
+        run: |
+          curl -sSf http://127.0.0.1:8080/ > dist/site/index_check.html
+          echo "OK $(date -u +'%Y-%m-%dT%H:%M:%SZ')" > dist/site/server_status.txt
+
+      - name: Upload server artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: server-outputs
+          path: |
+            dist/site/**
+            dist/sql/**
+
+      - name: Teardown containers
+        if: always()
+        run: |
+          docker rm -f echo_nginx 2>/dev/null || true
+          docker rm -f echo_mysql 2>/dev/null || true

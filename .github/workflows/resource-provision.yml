@@ -1,0 +1,29 @@
+name: Increase Disk and Memory
+
+on:
+  workflow_dispatch:
+
+jobs:
+  expand:
+    runs-on: ubuntu-latest
+    timeout-minutes: 1800
+    steps:
+      - name: 🧹 Free Disk Space
+        run: |
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo docker system prune -af || true
+          df -h
+      - name: 🧮 Add Swap for Memory
+        run: |
+          sudo fallocate -l 10G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          free -h
+      - name: ⏳ Keep Runner Alive
+        run: |
+          echo "Sleeping for up to 30 hours to keep the runner active"
+          sleep 108000
+

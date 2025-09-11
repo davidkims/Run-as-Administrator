@@ -1,0 +1,4 @@
+Latest Ubuntu Version: 25.04
+ISO File: ubuntu-25.04-desktop-amd64.iso
+Download URL: https://releases.ubuntu.com/25.04/ubuntu-25.04-desktop-amd64.iso
+Last Checked: Tue Sep  9 12:50:43 UTC 2025

@@ -1,0 +1,7 @@
+[2025-09-10 13:22:22 UTC] 2.9KiB STANDARD echo/bin/simulate.py
+[2025-09-10 13:22:22 UTC]    59B STANDARD echo/logs/run.meta
+[2025-09-10 13:22:22 UTC]    27B STANDARD echo/requirements.txt
+[2025-09-10 13:22:22 UTC]  14KiB STANDARD site/imgs/balance_sheet.png
+[2025-09-10 13:22:22 UTC]  40KiB STANDARD site/imgs/income_statement.png
+[2025-09-10 13:22:22 UTC]  14KiB STANDARD site/imgs/td_sim_daily_txn.png
+[2025-09-10 13:22:22 UTC] 116KiB STANDARD site/reports/transactions.csv

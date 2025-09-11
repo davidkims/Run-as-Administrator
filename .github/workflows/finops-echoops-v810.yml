@@ -1,0 +1,580 @@
+name: "🏦 FinOps + EchoOps v8.1.0 (Docker+TD-Sim+Kafka+Obs+Vault+Backup+SBOM+Scan)"
+
+on:
+  workflow_dispatch:
+    inputs:
+      rows:
+        description: "시뮬레이션 거래 건수"
+        required: true
+        default: "2000"
+      commit_changes:
+        description: "에코 산출물 커밋/푸시 (true/false)"
+        required: true
+        default: "true"
+      create_release:
+        description: "GitHub Release 생성 (true/false)"
+        required: true
+        default: "false"
+      enable_teradata:
+        description: "Teradata 컨테이너 시도 (true/false)"
+        required: true
+        default: "false"
+      teradata_token:
+        description: "Teradata Docker 토큰(선택)"
+        required: false
+        default: ""
+      run_kafka:
+        description: "Kafka/ZK + 스트리밍 파이프라인 실행 (true/false)"
+        required: true
+        default: "false"
+      encrypt_outputs:
+        description: "산출물 AES-256 암호화(zip.enc) (true/false)"
+        required: true
+        default: "true"
+      enc_pass:
+        description: "암호화 비밀번호(선택, 미지정시 랜덤)"
+        required: false
+        default: ""
+      extra_accounts:
+        description: "추가 가상계좌 수(기본 50 + N)"
+        required: true
+        default: "150"
+
+permissions:
+  contents: write
+  packages: read
+
+concurrency:
+  group: finops-echoops-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  finops:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Toolchain (Python 3.11)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Echo helpers + Massive Directories
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          TS(){ date +"%Y-%m-%d %H:%M:%S%z"; }
+          echoe(){ echo "[$(TS)] [ECHO] $*"; }
+          warn(){ echo "[$(TS)] [WARN] $*" >&2; }
+
+          echoe "대량 디렉토리 생성"
+          mkdir -p \
+            .github/echo/{logs,sql,bin,configs,imgs,reports,tmp,crypto,mass,monitoring} \
+            .github/echo_db/{ddl,dml,seed,views,backup} \
+            .github/echo_td/{sim,docs,logs} \
+            site/{reports,imgs,logs,sql,docs} \
+            artifacts/{imgs,reports,sql,logs,zip,db,sbom,scan}
+
+          for d in $(seq 1 20); do mkdir -p ".github/echo/mass/dir_$d/sub_$d"; done
+          printf "%s\n" "started=$(TS)" "actor=$GITHUB_ACTOR" "rows=${{ inputs.rows }}" > .github/echo/logs/run.meta
+
+      - name: Install/Upgrade Docker (official repo)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          TS(){ date +"%Y-%m-%d %H:%M:%S%z"; }
+          echoe(){ echo "[$(TS)] [ECHO] $*"; }
+
+          echoe "Docker 버전(사전)"; docker --version || true
+          sudo apt-get update -y
+          sudo apt-get install -y apt-transport-https ca-certificates curl gnupg lsb-release jq unzip zip
+          curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --yes --dearmor -o /usr/share/keyrings/docker.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo $VERSION_CODENAME) stable" \
+            | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+          sudo apt-get update -y
+          sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+          echoe "Docker 버전(설치 후)"; docker --version; docker compose version || true
+
+      - name: Start Core DB & Tools (Postgres + Adminer + MinIO)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          NET="finops_net"; docker network inspect "$NET" >/dev/null 2>&1 || docker network create "$NET"
+
+          docker rm -f finops-db finops-adminer finops-minio >/dev/null 2>&1 || true
+
+          docker run -d --name finops-db --network "$NET" \
+            -e POSTGRES_PASSWORD=finops -e POSTGRES_USER=finops -e POSTGRES_DB=finops \
+            -p 5432:5432 postgres:16
+
+          docker run -d --name finops-adminer --network "$NET" \
+            -e ADMINER_DEFAULT_SERVER=finops-db -p 8080:8080 adminer:4
+
+          docker run -d --name finops-minio --network "$NET" \
+            -e MINIO_ROOT_USER=admin -e MINIO_ROOT_PASSWORD=admin12345 \
+            -p 9000:9000 -p 9001:9001 minio/minio server /data --console-address ":9001"
+
+          docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}'
+
+      - name: Observability Stack (Prometheus + Grafana + Loki + Promtail + cAdvisor + node-exporter)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          NET="finops_net"
+          mkdir -p .github/echo/monitoring
+
+          # Prometheus config
+          cat > .github/echo/monitoring/prometheus.yml <<'YML'
+          global:
+            scrape_interval: 15s
+          scrape_configs:
+            - job_name: 'prometheus'
+              static_configs: [{ targets: ['prometheus:9090'] }]
+            - job_name: 'node'
+              static_configs: [{ targets: ['node-exporter:9100'] }]
+            - job_name: 'cadvisor'
+              static_configs: [{ targets: ['cadvisor:8080'] }]
+          YML
+
+          # Promtail config (container logs)
+          cat > .github/echo/monitoring/promtail-config.yml <<'YML'
+          server:
+            http_listen_port: 9080
+            grpc_listen_port: 0
+          positions:
+            filename: /tmp/positions.yaml
+          clients:
+            - url: http://loki:3100/loki/api/v1/push
+          scrape_configs:
+            - job_name: docker-logs
+              static_configs:
+                - targets: [localhost]
+                  labels:
+                    job: docker
+                    __path__: /var/lib/docker/containers/*/*-json.log
+          YML
+
+          docker rm -f prometheus grafana loki promtail cadvisor node-exporter >/dev/null 2>&1 || true
+
+          docker run -d --name prometheus --network "$NET" -p 9090:9090 \
+            -v "$PWD/.github/echo/monitoring/prometheus.yml":/etc/prometheus/prometheus.yml \
+            prom/prometheus
+
+          docker run -d --name grafana --network "$NET" -p 3000:3000 \
+            -e GF_SECURITY_ADMIN_PASSWORD=admin \
+            grafana/grafana
+
+          docker run -d --name loki --network "$NET" -p 3100:3100 grafana/loki:2.9.4
+
+          docker run -d --name promtail --network "$NET" -v /var/lib/docker/containers:/var/lib/docker/containers:ro \
+            -v "$PWD/.github/echo/monitoring/promtail-config.yml":/etc/promtail/config.yml \
+            -p 9080:9080 grafana/promtail:2.9.4 -config.file=/etc/promtail/config.yml
+
+          docker run -d --name cadvisor --network "$NET" -p 8081:8080 \
+            --privileged \
+            -v /:/rootfs:ro -v /var/run:/var/run:ro -v /sys:/sys:ro \
+            -v /var/lib/docker/:/var/lib/docker:ro gcr.io/cadvisor/cadvisor:v0.47.2
+
+          docker run -d --name node-exporter --network "$NET" -p 9100:9100 quay.io/prometheus/node-exporter
+
+      - name: Vault (dev) – store enc_pass (optional use)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          NET="finops_net"; docker rm -f finops-vault >/dev/null 2>&1 || true
+          docker run -d --name finops-vault --network "$NET" -p 8200:8200 \
+            -e VAULT_DEV_ROOT_TOKEN_ID=root -e VAULT_ADDR=http://0.0.0.0:8200 vault:1.15
+          # 예시: enc_pass를 저장(필요시 활용). dev 모드는 보안용 아님(데모용).
+          PASS_FILE=".github/echo/crypto/enc.pass"
+          test -f "$PASS_FILE" && docker exec finops-vault sh -lc "apk add --no-cache curl >/dev/null 2>&1 || true; \
+            curl -s --header 'X-Vault-Token: root' --request POST \
+            --data @- http://127.0.0.1:8200/v1/secret/data/finops_enc <<EOF
+            {\"data\":{\"enc_pass\":\"$(sed -n 's/^enc_pass=//p' $PASS_FILE | head -n1)\"}}
+          EOF"
+
+      - name: (Optional) Kafka + ZooKeeper + Topics
+        if: ${{ inputs.run_kafka == 'true' }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          NET="finops_net"
+          docker rm -f finops-zk finops-kafka >/dev/null 2>&1 || true
+          docker run -d --name finops-zk --network "$NET" -p 2181:2181 \
+            -e ALLOW_ANONYMOUS_LOGIN=yes bitnami/zookeeper:3.9
+          docker run -d --name finops-kafka --network "$NET" -p 9092:9092 \
+            -e KAFKA_BROKER_ID=1 \
+            -e KAFKA_CFG_ZOOKEEPER_CONNECT=finops-zk:2181 \
+            -e ALLOW_PLAINTEXT_LISTENER=yes \
+            -e KAFKA_CFG_LISTENERS=PLAINTEXT://:9092 \
+            -e KAFKA_CFG_ADVERTISED_LISTENERS=PLAINTEXT://localhost:9092 \
+            bitnami/kafka:3.7
+          # 토픽 생성 (transactions)
+          for i in $(seq 1 20); do # 대기
+            docker exec finops-kafka /opt/bitnami/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null 2>&1 && break
+            sleep 3
+          done
+          docker exec finops-kafka /opt/bitnami/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --create --if-not-exists --topic transactions --replication-factor 1 --partitions 3
+
+      - name: Wait for Postgres (health check with retry)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          for i in $(seq 1 40); do
+            if docker exec finops-db pg_isready -U finops -d finops >/dev/null 2>&1; then
+              echo "[ECHO] Postgres ready"; break
+            fi
+            echo "[ECHO] waiting postgres...($i)"; sleep 3
+          done
+          docker exec finops-db pg_isready -U finops -d finops
+
+      - name: (Optional) Teradata Attempt (logs only if no token)
+        if: ${{ inputs.enable_teradata == 'true' }}
+        shell: bash
+        env:
+          TD_TOKEN: ${{ inputs.teradata_token }}
+        run: |
+          set -Eeuo pipefail
+          TS(){ date +"%Y-%m-%d %H:%M:%S%z"; }
+          echoe(){ echo "[$(TS)] [ECHO] $*"; }
+          warn(){ echo "[$(TS)] [WARN] $*" >&2; }
+
+          echoe "Teradata 컨테이너는 라이선스/토큰/동의가 필요합니다."
+          if [ -z "${TD_TOKEN:-}" ]; then
+            warn "teradata_token 미제공: 공식 이미지 풀/실행 건너뜀 → TD-Sim(PostgreSQL)로 진행."
+            exit 0
+          fi
+
+          warn "샘플 템플릿(실제 레지스트리/이미지명은 계약 문서 참조)"
+          {
+            echo "docker login <teradata-registry> -u token -p ${TD_TOKEN}"
+            echo "docker pull <teradata-registry>/teradata:latest"
+            echo "docker run -d --name teradata --network finops_net <teradata-registry>/teradata:latest"
+          } | tee .github/echo/logs/teradata.login.txt
+
+      - name: Generate DDL/Views (BS/IS/Journal/Txn + TD-Sim Views)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cat > .github/echo_db/ddl/001_core.sql <<'SQL'
+          create table if not exists accounts (
+            account_id bigserial primary key,
+            account_no varchar(32) unique not null,
+            holder_name varchar(128) not null,
+            opened_at timestamptz not null default now(),
+            status varchar(16) not null default 'ACTIVE'
+          );
+          create table if not exists journal_entries (
+            je_id bigserial primary key,
+            ts timestamptz not null default now(),
+            account_no varchar(32) not null,
+            type varchar(8) not null check (type in ('DEBIT','CREDIT')),
+            amount numeric(18,2) not null check (amount>=0),
+            currency varchar(8) not null default 'KRW',
+            memo text
+          );
+          create index if not exists ix_journal_account_ts on journal_entries(account_no, ts);
+
+          create table if not exists transactions (
+            txn_id bigserial primary key,
+            ts timestamptz not null default now(),
+            account_no varchar(32) not null,
+            direction varchar(8) not null check (direction in ('IN','OUT')),
+            amount numeric(18,2) not null check (amount>=0),
+            balance_after numeric(18,2) not null,
+            ref varchar(64),
+            note text
+          );
+          create index if not exists ix_txn_account_ts on transactions(account_no, ts);
+
+          create table if not exists balances (
+            account_no varchar(32) primary key,
+            balance numeric(18,2) not null default 0
+          );
+          SQL
+
+          cat > .github/echo_db/views/100_views.sql <<'SQL'
+          create or replace view v_income_statement as
+          select date_trunc('day', ts) as d,
+                 sum(case when direction='IN'  then amount else 0 end) as revenue,
+                 sum(case when direction='OUT' then amount else 0 end) as expense,
+                 sum(case when direction='IN'  then amount else -amount end) as profit
+          from transactions
+          group by 1
+          order by 1;
+
+          create or replace view v_balance_sheet as
+          select sum(balance) as total_assets
+          from balances;
+
+          -- TD-Sim: Teradata 스타일 요약 뷰(간단)
+          create or replace view td_sim_daily as
+          select date_trunc('day', ts) as d,
+                 count(*) as txn_cnt,
+                 sum(amount) filter (where direction='IN') as sum_in,
+                 sum(amount) filter (where direction='OUT') as sum_out
+          from transactions
+          group by 1
+          order by 1;
+          SQL
+
+      - name: Apply Schema (PostgreSQL)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          PGPASSWORD=finops psql -h 127.0.0.1 -U finops -d finops -f .github/echo_db/ddl/001_core.sql
+          PGPASSWORD=finops psql -h 127.0.0.1 -U finops -d finops -f .github/echo_db/views/100_views.sql
+
+      - name: Seed Accounts (50 + extra) via generate_series
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          ACC=$((50 + ${{ inputs.extra_accounts }}))
+          cat > .github/echo_db/seed/accounts.sql <<'SQL'
+          \set ACC :ACC
+          with s as (select generate_series(1, :ACC) as i)
+          insert into accounts(account_no, holder_name)
+          select 'V' || to_char(i,'FM000000'), 'User ' || i from s
+          on conflict (account_no) do nothing;
+
+          with s as (select generate_series(1, :ACC) as i)
+          insert into balances(account_no, balance)
+          select 'V' || to_char(i,'FM000000'), 0 from s
+          on conflict (account_no) do nothing;
+          SQL
+          PGPASSWORD=finops psql -h 127.0.0.1 -U finops -d finops -v ACC="$ACC" -f .github/echo_db/seed/accounts.sql
+
+      - name: Write Simulators (direct DB & Kafka streaming)
+        if: ${{ inputs.run_kafka == 'true' }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          echo "kafka-python" > .github/echo/requirements-extra.txt
+          cat > .github/echo/bin/kafka_producer.py <<'PY'
+          import os, json, random, time
+          from datetime import datetime, timedelta
+          from kafka import KafkaProducer
+          ROWS=int(os.getenv("ROWS","2000"))
+          producer=KafkaProducer(bootstrap_servers="localhost:9092", value_serializer=lambda v: json.dumps(v, default=str).encode())
+          # 간단: 계좌번호 범위만 송신 (DB에 이미 생성됨)
+          accts=[f"V{str(i).zfill(6)}" for i in range(1, 50+int(os.getenv("EXTRA","150"))+1)]
+          base=datetime.utcnow()-timedelta(days=3)
+          for i in range(ROWS):
+            msg={
+              "ts": (base+timedelta(seconds=i*(3*24*3600/ROWS))).isoformat(),
+              "account_no": random.choice(accts),
+              "direction": random.choice(["IN","OUT"]),
+              "amount": round(random.uniform(10, 500000),2),
+              "ref": f"KAFKA{i}"
+            }
+            producer.send("transactions", msg)
+            if i%500==0: producer.flush()
+          producer.flush()
+          PY
+          cat > .github/echo/bin/kafka_consumer.py <<'PY'
+          import os, json, psycopg2
+          from kafka import KafkaConsumer
+          consumer=KafkaConsumer("transactions", bootstrap_servers="localhost:9092", value_deserializer=lambda m: json.loads(m.decode()))
+          conn=psycopg2.connect(host="127.0.0.1", user="finops", password="finops", dbname="finops")
+          cur=conn.cursor()
+          for msg in consumer:
+            r=msg.value
+            acc=r["account_no"]; direction=r["direction"]; amount=float(r["amount"]); ts=r["ts"]
+            cur.execute("select balance from balances where account_no=%s",(acc,))
+            row=cur.fetchone(); bal=float(row[0]) if row else 0.0
+            new_bal=bal+amount if direction=="IN" else max(0.0, bal-amount)
+            cur.execute("""insert into transactions(account_no,direction,amount,balance_after,ref,note,ts)
+                           values(%s,%s,%s,%s,%s,%s,%s)""",(acc,direction,amount,new_bal,r.get("ref","kafka"),"kafka",ts))
+            jtype="DEBIT" if direction=="IN" else "CREDIT"
+            cur.execute("""insert into journal_entries(account_no,type,amount,ts,memo)
+                           values(%s,%s,%s,%s,%s)""",(acc,jtype,amount,ts,"kafka"))
+            cur.execute("""insert into balances(account_no,balance)
+                           values(%s,%s)
+                           on conflict (account_no) do update set balance=excluded.balance""",(acc,new_bal))
+            conn.commit()
+          PY
+
+      - name: Write Simulator (direct DB fallback if no Kafka)
+        if: ${{ inputs.run_kafka != 'true' }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cat > .github/echo/requirements.txt <<'PIP'
+          psycopg2-binary
+          matplotlib
+          PIP
+          cat > .github/echo/bin/simulate.py <<'PY'
+          import os, random, csv
+          from datetime import datetime, timedelta
+          import psycopg2, matplotlib.pyplot as plt
+          ROWS=int(os.getenv("ROWS","2000"))
+          conn=psycopg2.connect(host="127.0.0.1",user="finops",password="finops",dbname="finops")
+          cur=conn.cursor()
+          cur.execute("select account_no from accounts order by account_no;")
+          accts=[r[0] for r in cur.fetchall()]
+          base=datetime.utcnow()-timedelta(days=10)
+          rows=[]
+          for i in range(ROWS):
+            acc=random.choice(accts)
+            ts=base+timedelta(seconds=i*(10*24*3600/ROWS))
+            direction=random.choice(["IN","OUT"])
+            amount=round(random.uniform(10, 800000),2)
+            cur.execute("select balance from balances where account_no=%s",(acc,))
+            row=cur.fetchone(); bal=float(row[0]) if row else 0.0
+            new_bal=bal+amount if direction=="IN" else max(0.0, bal-amount)
+            cur.execute("""insert into transactions(account_no,direction,amount,balance_after,ref,note,ts)
+                           values(%s,%s,%s,%s,%s,%s,%s)""",(acc,direction,amount,new_bal,f"REF{i}","sim",ts))
+            jtype="DEBIT" if direction=="IN" else "CREDIT"
+            cur.execute("""insert into journal_entries(account_no,type,amount,ts,memo)
+                           values(%s,%s,%s,%s,%s)""",(acc,jtype,amount,ts,"sim"))
+            cur.execute("""insert into balances(account_no,balance)
+                           values(%s,%s)
+                           on conflict (account_no) do update set balance=excluded.balance""",(acc,new_bal))
+            rows.append((ts,acc,direction,amount,new_bal))
+            if i%500==0: conn.commit()
+          conn.commit()
+          # charts
+          import matplotlib.pyplot as plt
+          cur.execute("select d,revenue,expense,profit from v_income_statement order by d;")
+          D=[(r[0],float(r[1]),float(r[2]),float(r[3])) for r in cur.fetchall()]
+          dates=[r[0] for r in D]; rev=[r[1] for r in D]; exp=[r[2] for r in D]; prof=[r[3] for r in D]
+          plt.figure(); plt.plot(dates,rev,label="Revenue"); plt.plot(dates,exp,label="Expense"); plt.plot(dates,prof,label="Profit"); plt.legend(); plt.tight_layout()
+          os.makedirs("site/imgs",exist_ok=True); plt.savefig("site/imgs/income_statement.png")
+          cur.execute("select total_assets from v_balance_sheet;"); assets=float(cur.fetchone()[0] or 0)
+          plt.figure(); plt.bar(["Assets"],[assets]); plt.tight_layout(); plt.savefig("site/imgs/balance_sheet.png")
+          cur.close(); conn.close()
+          with open("site/reports/transactions.csv","w",newline="",encoding="utf-8") as f:
+            import csv; w=csv.writer(f); w.writerow(["ts","account_no","direction","amount","balance_after"]); w.writerows(rows)
+          PY
+
+      - name: Install Python deps & Run Simulation / Streaming
+        shell: bash
+        env:
+          ROWS: ${{ inputs.rows }}
+        run: |
+          set -Eeuo pipefail
+          python -m pip install --upgrade pip
+          # 공통 의존성
+          echo "psycopg2-binary" > .github/echo/requirements-common.txt
+          echo "matplotlib" >> .github/echo/requirements-common.txt
+          pip install -r .github/echo/requirements-common.txt || true
+          if [ "${{ inputs.run_kafka }}" = "true" ]; then
+            pip install -r .github/echo/requirements-extra.txt
+            # 백그라운드로 consumer 실행
+            python .github/echo/bin/kafka_consumer.py >/tmp/kafka_consumer.log 2>&1 &
+            # producer 실행
+            EXTRA="${{ inputs.extra_accounts }}" ROWS="${{ inputs.rows }}" python .github/echo/bin/kafka_producer.py
+            # 약간 대기 후 consumer 로그 수집
+            sleep 5; cp /tmp/kafka_consumer.log .github/echo/logs/kafka_consumer.log || true
+          else
+            pip install -r .github/echo/requirements.txt
+            python .github/echo/bin/simulate.py
+          fi
+
+      - name: MinIO Client (mc) & Upload results
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          curl -fsSL https://dl.min.io/client/mc/release/linux-amd64/mc -o mc && chmod +x mc
+          ./mc alias set local http://127.0.0.1:9000 admin admin12345
+          ./mc mb --ignore-existing local/finops
+          ./mc mirror --overwrite site local/finops/site
+          ./mc mirror --overwrite .github/echo local/finops/echo
+          ./mc ls -r local/finops | tee .github/echo/logs/minio.tree
+
+      - name: DB Backup (pg_dumpall)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          PGPASSWORD=finops pg_dumpall -h 127.0.0.1 -U finops > .github/echo_db/backup/pg_dumpall.sql
+          gzip -c .github/echo_db/backup/pg_dumpall.sql > artifacts/db/pg_dumpall.sql.gz
+
+      - name: Package outputs
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cp -a .github/echo_db/ddl site/sql/
+          cp -a .github/echo_db/seed site/sql/ || true
+          cp -a .github/echo_db/views site/sql/
+          cp -a site/imgs artifacts/imgs/
+          cp -a site/reports artifacts/reports/
+          cp -a site/sql artifacts/sql/
+          cp -a .github/echo/logs artifacts/logs/
+          cp -a .github/echo_db/backup artifacts/db/
+          (cd artifacts && zip -r zip/finops_outputs.zip imgs reports sql logs db >/dev/null)
+
+      - name: Encrypt outputs (optional AES-256)
+        if: ${{ inputs.encrypt_outputs == 'true' }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          PASS="${{ inputs.enc_pass }}"
+          if [ -z "$PASS" ]; then PASS="$(openssl rand -hex 16)"; fi
+          printf "%s\n" "enc_pass=$PASS" > .github/echo/crypto/enc.pass
+          openssl enc -aes-256-cbc -md sha256 -salt -pbkdf2 -in artifacts/zip/finops_outputs.zip -out artifacts/zip/finops_outputs.zip.enc -k "$PASS"
+          echo "[ECHO] 암호화 완료 → artifacts/zip/finops_outputs.zip.enc (비번: 저장됨 .github/echo/crypto/enc.pass)"
+
+      - name: SBOM (syft)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          curl -fsSL https://raw.githubusercontent.com/anchore/sbom-action/main/install.sh | bash -s -- -b /usr/local/bin v1.31.0
+          syft version
+          syft scan dir:. -o spdx-json > artifacts/sbom/repo.spdx.json
+
+      - name: Security Scan (Trivy + Gitleaks)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          curl -fsSL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+          trivy fs --scanners vuln,config,secret --format json --output artifacts/scan/trivy.json .
+          curl -fsSL https://github.com/zricethezav/gitleaks/releases/latest/download/gitleaks_linux_x64.tar.gz \
+            | tar xz -C /usr/local/bin gitleaks
+          gitleaks detect --redact -v --no-git -o artifacts/scan/gitleaks.sarif --report-format sarif
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: finops-echoops-v810
+          path: |
+            artifacts/**
+            site/**
+            .github/echo/**
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Commit & Push (safe refspec)
+        if: ${{ inputs.commit_changes == 'true' }}
+        shell: bash
+        env:
+          GIT_AUTHOR_NAME: "github-actions[bot]"
+          GIT_AUTHOR_EMAIL: "41898282+github-actions[bot]@users.noreply.github.com"
+          GIT_COMMITTER_NAME: "github-actions[bot]"
+          GIT_COMMITTER_EMAIL: "41898282+github-actions[bot]@users.noreply.github.com"
+        run: |
+          set -Eeuo pipefail
+          TS(){ date +"%Y-%m-%d %H:%M:%S%z"; }
+          echoe(){ echo "[$(TS)] [ECHO] $*"; }
+          BRANCH="${GITHUB_REF_NAME:-main}"
+          git config user.name  "$GIT_AUTHOR_NAME"
+          git config user.email "$GIT_AUTHOR_EMAIL"
+          git add -A
+          if git diff --cached --quiet; then echoe "변경 없음 → 푸시 스킵"; exit 0; fi
+          git commit -m "[ECHO] v8.1.0 outputs (imgs,csv,sql,minio,backup,obs,kafka=${{ inputs.run_kafka }},encrypt=${{ inputs.encrypt_outputs }},rows=${{ inputs.rows }})"
+          git fetch --tags --force origin
+          echoe "safe push → refs/heads/${BRANCH}"
+          git push origin "refs/heads/${BRANCH}:refs/heads/${BRANCH}" --force-with-lease
+
+      - name: Create Release (optional)
+        if: ${{ inputs.create_release == 'true' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: finops-echoops-v810-${{ github.run_number }}
+          name: "FinOps EchoOps v8.1.0 • Run #${{ github.run_number }}"
+          draft: false
+          prerelease: false
+          files: |
+            artifacts/zip/finops_outputs.zip
+            artifacts/zip/finops_outputs.zip.enc

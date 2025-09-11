@@ -1,0 +1,82 @@
+name: Dependabot Updates via Proxy
+
+on:
+  schedule:
+    - cron: '0 0 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  dependabot:
+name: Dependabot Proxy Build
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+    branches: [ main ]
+    paths:
+      - '**/pom.xml'
+      - '.github/**'
+  workflow_dispatch:
+
+jobs:
+  build:
+    if: ${{ github.actor == 'dependabot[bot]' }}
+    runs-on: ubuntu-latest
+    env:
+      HTTP_PROXY: ${{ secrets.HTTP_PROXY }}
+      HTTPS_PROXY: ${{ secrets.HTTPS_PROXY }}
+      NO_PROXY: ${{ secrets.NO_PROXY }}
+      MAVEN_OPTS: "-Dhttp.proxyHost=${{ secrets.PROXY_HOST }} -Dhttp.proxyPort=${{ secrets.PROXY_PORT }} -Dhttps.proxyHost=${{ secrets.PROXY_HOST }} -Dhttps.proxyPort=${{ secrets.PROXY_PORT }}"
+      JAVA_TOOL_OPTIONS: "-Dhttp.proxyHost=${{ secrets.PROXY_HOST }} -Dhttp.proxyPort=${{ secrets.PROXY_PORT }} -Dhttps.proxyHost=${{ secrets.PROXY_HOST }} -Dhttps.proxyPort=${{ secrets.PROXY_PORT }}"
+    steps:
+      - name: Configure Linux proxy
+        run: |
+          echo "Acquire::http::Proxy \"${HTTP_PROXY}\";" | sudo tee /etc/apt/apt.conf.d/99proxy
+          echo "Acquire::https::Proxy \"${HTTPS_PROXY}\";" | sudo tee -a /etc/apt/apt.conf.d/99proxy
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Run Dependabot for Maven
+        run: |
+          docker run --rm \
+            -e GITHUB_ACCESS_TOKEN=${{ secrets.GITHUB_TOKEN }} \
+            -e HTTP_PROXY=${HTTP_PROXY} \
+            -e HTTPS_PROXY=${HTTPS_PROXY} \
+            -v "${{ github.workspace }}":/home/dependabot/app \
+            ghcr.io/dependabot/dependabot-core update \
+            maven /home/dependabot/app
+      - name: Run Dependabot for Docker
+        run: |
+          docker run --rm \
+            -e GITHUB_ACCESS_TOKEN=${{ secrets.GITHUB_TOKEN }} \
+            -e HTTP_PROXY=${HTTP_PROXY} \
+            -e HTTPS_PROXY=${HTTPS_PROXY} \
+            -v "${{ github.workspace }}":/home/dependabot/app \
+            ghcr.io/dependabot/dependabot-core update \
+            docker /home/dependabot/app
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Build with Maven
+        run: mvn -B package --file pom.xml
+
+      - name: Build Docker image
+        run: docker build -t myapp:latest .
+
+      - name: Install system packages via proxy
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl
+        env:
+          http_proxy: ${{ env.HTTP_PROXY }}
+          https_proxy: ${{ env.HTTPS_PROXY }}
