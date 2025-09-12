@@ -91,12 +91,10 @@ jobs:
           echo "ENABLE_TLS=${{ github.event.inputs.enable_tls }}" >> $GITHUB_ENV
           echo "CREATE_ARTIFACTS=${{ github.event.inputs.create_artifacts }}" >> $GITHUB_ENV
           echo "RUN_APPLY=${{ github.event.inputs.run_apply }}" >> $GITHUB_ENV
-
           # 대량 생성 기본값/상수
           echo "BULK_COUNT=20" >> $GITHUB_ENV
           echo "BULK_PREFIX=${{ github.event.inputs.db_user }}_bulk" >> $GITHUB_ENV
           echo "MSSQL_SA_PASSWORD=Str0ng!Passw0rd" >> $GITHUB_ENV
-
           # 디렉터리
           mkdir -p \
             .github/echo_db/{postgres,mysql,mssql,oracle,db2,common} \
@@ -169,7 +167,7 @@ jobs:
           - 팜 구성 계정/권한, 방화벽 예외
           MD
 
-      # PostgreSQL: 권한 + 대량 생성 파일
+      # === PostgreSQL: 권한 + 대량 생성 (DB 생성은 bash에서) ===
       - name: Generate PostgreSQL SQL (roles/grants + bulk)
         shell: bash
         run: |
@@ -217,9 +215,9 @@ jobs:
           GRANT SELECT,INSERT,UPDATE,DELETE ON ALL TABLES IN SCHEMA public TO app_write;
           SQL
 
-          # 대량 생성 파일
+          # ✅ 대량 스크립트: DB는 이미 생성되어 있다고 가정(Apply 단계에서 생성)
           {
-            echo "/* BULK CREATE (roles/db/users/grants) for PostgreSQL */"
+            echo "/* BULK users/grants for PostgreSQL (DB must exist) */"
             cat <<'EOS'
           DO $$
           BEGIN
@@ -231,6 +229,7 @@ jobs:
               uname="${BULK_PREFIX}${i}"
               db="${DB_NAME}_${i}"
               cat <<EOS
+          -- user/db ${i}
           DO \$\$
           BEGIN
             IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='${uname}') THEN
@@ -238,17 +237,10 @@ jobs:
             END IF;
           END\$\$;
 
-          DO \$\$
-          BEGIN
-            IF NOT EXISTS (SELECT FROM pg_database WHERE datname='${db}') THEN
-              EXECUTE 'CREATE DATABASE "${db}"';
-            END IF;
-          END\$\$;
-
           \\connect "${db}"
 
           ALTER SCHEMA public OWNER TO "${uname}";
-          GRANT app_read TO "${uname}";
+          GRANT app_read  TO "${uname}";
           GRANT app_write TO "${uname}";
           ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO app_read;
           ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT,INSERT,UPDATE,DELETE ON TABLES TO app_write;
@@ -268,7 +260,7 @@ jobs:
             done
           } > .github/echo_db/postgres/99_bulk.sql
 
-      # MySQL: 권한 + 대량 생성 파일 (bash루프)
+      # === MySQL: 권한 + 대량 생성 (bash 루프) ===
       - name: Generate MySQL SQL (create/user/grants + bulk)
         shell: bash
         run: |
@@ -318,7 +310,7 @@ jobs:
             done
           } > .github/echo_db/mysql/99_bulk.sql
 
-      # MSSQL: 전용 롤 + 권한 + 대량 생성 + TLS 샘플
+      # === MSSQL: 전용 롤 + 권한 + 대량 생성 ===
       - name: Generate MSSQL SQL (roles/grants + bulk)
         shell: bash
         run: |
@@ -390,11 +382,7 @@ jobs:
           GO
           SQL
 
-          cat > .github/echo_db/mssql/JDBC_TLS.sample <<'CONF'
-          jdbc:sqlserver://db.example.com:1433;databaseName=${DB_NAME};encrypt=true;trustServerCertificate=false;hostNameInCertificate=CN=db.example.com;
-          CONF
-
-      # Oracle/Db2 템플릿
+      # === Oracle/Db2 템플릿 ===
       - name: Generate Oracle/Db2 templates
         shell: bash
         run: |
@@ -415,7 +403,7 @@ jobs:
           GRANT CREATETAB ON DATABASE TO USER ${DB_USER};
           SQL
 
-      # Ansible & Makefile
+      # === Ansible & Makefile ===
       - name: Generate Ansible playbook & Makefile
         shell: bash
         run: |
@@ -463,7 +451,7 @@ jobs:
           	@echo "DB: ${DB_NAME}, USER: ${DB_USER}, MODEL: ${GRANT_MODEL}, TARGET: ${TARGET_DB}"
           MK
 
-      # 컨테이너 기동 (postgres/mysql/mssql/all)
+      # === 컨테이너 기동 (postgres/mysql/mssql/all) ===
       - name: Start PostgreSQL container
         if: ${{ env.RUN_APPLY == 'true' && (env.TARGET_DB == 'postgres' || env.TARGET_DB == 'all') }}
         shell: bash
@@ -498,7 +486,7 @@ jobs:
             sleep 3
           done || true
 
-      # 실제 적용: PostgreSQL (단일 + 대량)
+      # === 실제 적용: PostgreSQL (단일 + 대량) ===
       - name: Apply SQL (PostgreSQL)
         if: ${{ env.RUN_APPLY == 'true' && (env.TARGET_DB == 'postgres' || env.TARGET_DB == 'all') }}
         shell: bash
@@ -506,9 +494,13 @@ jobs:
           set -Eeuo pipefail
           sudo apt-get update && sudo apt-get install -y postgresql-client gettext-base
           export PGPASSWORD=postgres
+
+          # 기준 DB 생성
           if ! psql -h 127.0.0.1 -U postgres -d postgres -tc "SELECT 1 FROM pg_database WHERE datname='${DB_NAME}'" | grep -q 1; then
             psql -h 127.0.0.1 -U postgres -d postgres -c "CREATE DATABASE \"${DB_NAME}\""
           fi
+
+          # 기준 권한/스키마/모델 적용
           envsubst < .github/echo_db/postgres/01_roles.sql \
             | psql -h 127.0.0.1 -U postgres -d "${DB_NAME}" -v ON_ERROR_STOP=1
           envsubst < .github/echo_db/postgres/02_schema_grants.sql \
@@ -518,10 +510,18 @@ jobs:
           else
             psql -h 127.0.0.1 -U postgres -d "${DB_NAME}" -v ON_ERROR_STOP=1 -f .github/echo_db/postgres/03_model_basic.sql
           fi
+
+          # ✅ 대량 DB 생성(함수/트랜잭션 밖에서)
+          for i in $(seq -w 1 ${BULK_COUNT}); do
+            db="${DB_NAME}_${i}"
+            createdb --host=127.0.0.1 --port=5432 --username=postgres --no-password --if-not-exists "${db}"
+          done
+
+          # ✅ 대량 유저/권한/테이블 적용
           envsubst < .github/echo_db/postgres/99_bulk.sql \
             | psql -h 127.0.0.1 -U postgres -d postgres -v ON_ERROR_STOP=1
 
-      # 실제 적용: MySQL (단일 + 대량)
+      # === 실제 적용: MySQL (단일 + 대량) ===
       - name: Apply SQL (MySQL) + Bulk
         if: ${{ env.RUN_APPLY == 'true' && (env.TARGET_DB == 'mysql' || env.TARGET_DB == 'all') }}
         shell: bash
@@ -538,7 +538,7 @@ jobs:
           fi
           envsubst < .github/echo_db/mysql/99_bulk.sql | mysql -h 127.0.0.1 -P 3306 -uroot -proot
 
-      # 실제 적용: MSSQL (단일 + 대량)
+      # === 실제 적용: MSSQL (단일 + 대량) ===
       - name: Apply SQL (MSSQL) + Bulk (sqlcmd)
         if: ${{ env.RUN_APPLY == 'true' && (env.TARGET_DB == 'mssql' || env.TARGET_DB == 'all') }}
         shell: bash
