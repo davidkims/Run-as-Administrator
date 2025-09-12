@@ -489,7 +489,7 @@ jobs:
           YML
 
       - name: 🔁 Open PR for PROD workflow copy
-        uses: peter-evans/create-pull-request@v6
+        uses: peter-evans/create-pull-request@v7
         with:
           commit-message: "chore(prod): add prod workflow copy & promote bundles"
           title: "chore(prod): add prod workflow copy & promote bundles"
