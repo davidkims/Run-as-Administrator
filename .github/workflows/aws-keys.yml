@@ -1,489 +1,372 @@
-name: "🧱 WAS Multi-FS + tmpfs + sysctl + systemd (Scaffold)"
+name: "🗄️ Workflow DB FullOps (권한 파일 생성+적용+제품별 샘플)"
 
 on:
   workflow_dispatch:
     inputs:
-      data_size_gb:
-        description: "DATA 루프백 크기(GB)"
-        required: true
-        default: "15"
-      logs_size_gb:
-        description: "LOGS 루프백 크기(GB)"
-        required: true
-        default: "10"
-      cache_size_gb:
-        description: "CACHE 루프백 크기(GB)"
-        required: true
-        default: "5"
-      data_mount:
-        description: "DATA 마운트 지점"
-        required: true
-        default: "/mnt/was_data"
-      logs_mount:
-        description: "LOGS 마운트 지점"
-        required: true
-        default: "/mnt/was_logs"
-      cache_mount:
-        description: "CACHE 마운트 지점"
-        required: true
-        default: "/mnt/was_cache"
-      data_label:
-        description: "DATA 라벨"
-        required: true
-        default: "WASDATA"
-      logs_label:
-        description: "LOGS 라벨"
-        required: true
-        default: "WASLOGS"
-      cache_label:
-        description: "CACHE 라벨"
-        required: true
-        default: "WASCACHE"
-      tmpfs_mount:
-        description: "tmpfs 마운트 지점"
-        required: true
-        default: "/mnt/was_tmp"
-      tmpfs_size:
-        description: "tmpfs 크기 (예: 2G)"
-        required: true
-        default: "2G"
-      swap_size_gb:
-        description: "추가 SWAP 크기(GB, 0이면 생략)"
-        required: true
-        default: "4"
-      sysctl_swappiness:
-        description: "vm.swappiness 값"
-        required: true
-        default: "10"
-      sysctl_inotify:
-        description: "fs.inotify.max_user_watches 값"
-        required: true
-        default: "1048576"
-      app_type:
-        description: "WAS 타입"
+      wf_product:
+        description: "워크플로우 제품"
         type: choice
         required: true
-        default: "spring-boot"
-        options: ["spring-boot","tomcat"]
-      jvm_heap:
-        description: "JVM Heap (Xms,Xmx) (예: 1024m,2048m)"
+        default: "airflow"
+        options: ["airflow", "n8n", "ibm-baw", "sharepoint-wfm"]
+      target_db:
+        description: "대상 DB"
+        type: choice
         required: true
-        default: "1024m,2048m"
-      app_jar_path:
-        description: "[spring-boot] JAR 경로 (예: target/app.jar)"
+        default: "postgres"
+        options: ["postgres", "mysql", "mssql"]  # mssql은 권한파일만 생성(기본)
+      db_name:
+        description: "DB 이름"
+        required: true
+        default: "appdb"
+      db_user:
+        description: "DB 접속 사용자"
+        required: true
+        default: "appuser"
+      db_password:
+        description: "DB 접속 비밀번호"
+        required: true
+        default: "StrongPw123!"
+      extra_schema:
+        description: "추가 스키마(없으면 빈칸)"
         required: false
-        default: "target/app.jar"
-      tomcat_base:
-        description: "[tomcat] TOMCAT_BASE 경로 (예: /opt/tomcat)"
-        required: false
-        default: "/opt/tomcat"
-      commit_changes:
-        description: "에코 산출물 커밋/푸시 (true/false)"
+        default: ""
+      grant_model:
+        description: "권한 모델"
+        type: choice
+        required: true
+        default: "strict"
+        options: ["strict", "basic"]
+      enable_tls:
+        description: "TLS 가이드 파일 포함"
+        type: choice
+        required: true
+        default: "true"
+        options: ["true", "false"]
+      create_artifacts:
+        description: "생성 산출물(권한 SQL/샘플설정) 아티팩트 업로드"
+        type: choice
+        required: true
+        default: "true"
+        options: ["true", "false"]
+      run_apply:
+        description: "DB 컨테이너 기동 후 SQL 실제 적용(지원: postgres/mysql)"
+        type: choice
         required: true
         default: "false"
+        options: ["true", "false"]
 
 permissions:
   contents: write
 
 jobs:
-  expand:
+  db-fullops:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+
+    services:
+      postgres:
+        if: ${{ github.event.inputs.run_apply == 'true' && github.event.inputs.target_db == 'postgres' }}
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+
+      mysql:
+        if: ${{ github.event.inputs.run_apply == 'true' && github.event.inputs.target_db == 'mysql' }}
+        image: mysql:8
+        env:
+          MYSQL_ROOT_PASSWORD: root
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -proot --silent"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+
+      # MSSQL은 적용 비활성(권한 파일만 생성). 적용 원하시면 아래 주석 해제 및 단계 추가 필요.
+      # mssql:
+      #   if: ${{ github.event.inputs.run_apply == 'true' && github.event.inputs.target_db == 'mssql' }}
+      #   image: mcr.microsoft.com/mssql/server:2022-latest
+      #   env:
+      #     ACCEPT_EULA: "Y"
+      #     SA_PASSWORD: "Str0ng!Passw0rd"
+      #   ports:
+      #     - 1433:1433
+      #   options: >-
+      #     --health-cmd="/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P 'Str0ng!Passw0rd' -C -Q 'SELECT 1' || exit 1"
+      #     --health-interval=15s
+      #     --health-timeout=10s
+      #     --health-retries=20
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Show runner info
+      - name: Prepare variables
+        id: prep
+        shell: bash
         run: |
           set -Eeuo pipefail
-          echo "[INFO] Kernel: $(uname -a)"
-          df -h
-          free -h
-          lsblk || true
+          echo "WF_PRODUCT=${{ github.event.inputs.wf_product }}" >> $GITHUB_ENV
+          echo "TARGET_DB=${{ github.event.inputs.target_db }}" >> $GITHUB_ENV
+          echo "DB_NAME=${{ github.event.inputs.db_name }}" >> $GITHUB_ENV
+          echo "DB_USER=${{ github.event.inputs.db_user }}" >> $GITHUB_ENV
+          echo "DB_PASSWORD=${{ github.event.inputs.db_password }}" >> $GITHUB_ENV
+          echo "EXTRA_SCHEMA=${{ github.event.inputs.extra_schema }}" >> $GITHUB_ENV
+          echo "GRANT_MODEL=${{ github.event.inputs.grant_model }}" >> $GITHUB_ENV
+          echo "ENABLE_TLS=${{ github.event.inputs.enable_tls }}" >> $GITHUB_ENV
+          echo "CREATE_ARTIFACTS=${{ github.event.inputs.create_artifacts }}" >> $GITHUB_ENV
+          echo "RUN_APPLY=${{ github.event.inputs.run_apply }}" >> $GITHUB_ENV
+          mkdir -p .github/echo_db/{postgres,mysql,mssql,common} .github/echo_products/{airflow,n8n,ibm-baw,sharepoint-wfm}
 
-      - name: Reclaim disk (optional)
+      # 1) 공통 보안/TLS 가이드 & 백업/DR 체크리스트
+      - name: Generate common guides
+        shell: bash
         run: |
           set -Eeuo pipefail
-          docker system prune -af || true
-          sudo rm -rf /usr/local/lib/android /opt/ghc /usr/local/.ghcup || true
-          sudo apt-get clean || true
-          df -h
-
-      - name: Make mount points
-        run: |
-          set -Eeuo pipefail
-          for MP in "${{ github.event.inputs.data_mount }}" "${{ github.event.inputs.logs_mount }}" "${{ github.event.inputs.cache_mount }}" "${{ github.event.inputs.tmpfs_mount }}"; do
-            echo "[INFO] mkdir -p $MP"
-            sudo mkdir -p "$MP"
-          done
-
-      - name: Create loopback images (data/logs/cache) and mount
-        id: loopfs
-        run: |
-          set -Eeuo pipefail
-          create_and_mount () {
-            local IMG="$1" SIZE_GB="$2" LABEL="$3" MP="$4"
-            echo "[INFO] Allocate ${IMG} (${SIZE_GB}G)"
-            if ! fallocate -l "${SIZE_GB}G" "${IMG}"; then
-              echo "[WARN] fallocate failed, fallback to dd"
-              dd if=/dev/zero of="${IMG}" bs=1G count="${SIZE_GB}" status=progress
-            fi
-            echo "[INFO] mkfs.ext4 -L ${LABEL} ${IMG}"
-            sudo mkfs.ext4 -F -L "${LABEL}" "${IMG}"
-            echo "[INFO] mount ${IMG} -> ${MP}"
-            sudo mount -o loop "${IMG}" "${MP}"
-            sudo chown -R $USER:$USER "${MP}"
-            df -h "${MP}"
-            findmnt -no TARGET,SOURCE,FSTYPE,OPTIONS "${MP}" || true
-          }
-
-          create_and_mount "wasdata.img"  "${{ github.event.inputs.data_size_gb }}"  "${{ github.event.inputs.data_label }}"  "${{ github.event.inputs.data_mount }}"
-          create_and_mount "waslogs.img"  "${{ github.event.inputs.logs_size_gb }}"  "${{ github.event.inputs.logs_label }}"  "${{ github.event.inputs.logs_mount }}"
-          create_and_mount "wascache.img" "${{ github.event.inputs.cache_size_gb }}" "${{ github.event.inputs.cache_label }}" "${{ github.event.inputs.cache_mount }}"
-
-          echo "data_img=wasdata.img"  >> "$GITHUB_OUTPUT"
-          echo "logs_img=waslogs.img"  >> "$GITHUB_OUTPUT"
-          echo "cache_img=wascache.img" >> "$GITHUB_OUTPUT"
-
-      - name: Mount tmpfs
-        run: |
-          set -Eeuo pipefail
-          MP="${{ github.event.inputs.tmpfs_mount }}"
-          SIZE="${{ github.event.inputs.tmpfs_size }}"
-          echo "[INFO] Mount tmpfs ${SIZE} at ${MP}"
-          sudo mount -t tmpfs -o "size=${SIZE},mode=1777" tmpfs "${MP}"
-          df -h "${MP}" || true
-          echo "TEMP_DIR=${MP}" > .was-tmpfs.env
-          cat .was-tmpfs.env
-
-      - name: Prepare common WAS directories
-        run: |
-          set -Eeuo pipefail
-          D="${{ github.event.inputs.data_mount }}"
-          L="${{ github.event.inputs.logs_mount }}"
-          C="${{ github.event.inputs.cache_mount }}"
-          sudo mkdir -p "${D}/uploads" "${D}/sessions" "${D}/conf" "${D}/static" "${D}/assets"
-          sudo mkdir -p "${L}/app" "${L}/gc" "${L}/tomcat"
-          sudo mkdir -p "${C}/cache" "${C}/tmp"
-          sudo chmod -R 2775 "${D}" "${L}" "${C}"
-          echo "[INFO] Top-level dirs created."
-
-      - name: Configure SWAP (optional)
-        if: ${{ github.event.inputs.swap_size_gb != '0' && github.event.inputs.swap_size_gb != '' }}
-        run: |
-          set -Eeuo pipefail
-          SWAP_GB="${{ github.event.inputs.swap_size_gb }}"
-          SWAPF="swapfile_${SWAP_GB}G"
-          echo "[INFO] Creating ${SWAP_GB}G swap file..."
-          sudo fallocate -l "${SWAP_GB}G" "/${SWAPF}" || sudo dd if=/dev/zero of="/${SWAPF}" bs=1G count="${SWAP_GB}" status=progress
-          sudo chmod 600 "/${SWAPF}"
-          sudo mkswap "/${SWAPF}"
-          sudo swapon "/${SWAPF}"
-          swapon --show
-          free -h
-
-      - name: Apply sysctl tuning
-        run: |
-          set -Eeuo pipefail
-          SWP="${{ github.event.inputs.sysctl_swappiness }}"
-          INO="${{ github.event.inputs.sysctl_inotify }}"
-          echo "[INFO] Apply sysctl (runtime)"
-          sudo sysctl -w vm.swappiness="${SWP}"
-          sudo sysctl -w fs.inotify.max_user_watches="${INO}"
-          echo "[INFO] Persist to /etc/sysctl.d/99-was.conf"
-          echo -e "vm.swappiness=${SWP}\nfs.inotify.max_user_watches=${INO}" | sudo tee /etc/sysctl.d/99-was.conf
-          sudo sysctl --system | grep -E "vm.swappiness|fs.inotify.max_user_watches" || true
-
-      - name: Write JVM memory settings
-        id: jvm
-        run: |
-          set -Eeuo pipefail
-          JVM_HEAP="${{ github.event.inputs.jvm_heap }}"
-          XMS="$(echo "$JVM_HEAP" | cut -d',' -f1)"
-          XMX="$(echo "$JVM_HEAP" | cut -d',' -f2)"
-          [ -z "$XMS" -o -z "$XMX" ] && { echo "::error::jvm_heap 형식은 'Xms,Xmx'"; exit 1; }
-          D="${{ github.event.inputs.data_mount }}"; L="${{ github.event.inputs.logs_mount }}"
-          echo "JAVA_TOOL_OPTIONS=\"-Xms${XMS} -Xmx${XMX} -XX:+UseG1GC -XX:MaxGCPauseMillis=200 -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=${D}/heapdump.hprof -Xlog:gc*:file=${L}/gc/gc.log:time,uptime:filecount=5,filesize=50M\"" > .java-memory.env
-          cat .java-memory.env
-          if [ "${{ github.event.inputs.app_type }}" = "tomcat" ]; then
-            echo 'CATALINA_OPTS="${JAVA_TOOL_OPTIONS} ${CATALINA_OPTS}"' > .tomcat-opts.env
-            cat .tomcat-opts.env
-          fi
-
-      - name: Generate systemd unit/timer scaffolding (for real servers)
-        run: |
-          set -Eeuo pipefail
-          outdir="deploy/systemd"
-          mkdir -p "${outdir}"
-
-          DATA_MP="${{ github.event.inputs.data_mount }}"
-          LOGS_MP="${{ github.event.inputs.logs_mount }}"
-          CACHE_MP="${{ github.event.inputs.cache_mount }}"
-          TMP_MP="${{ github.event.inputs.tmpfs_mount }}"
-
-          # .mount 유닛 (루프백은 /etc/fstab 권장이나, 예시 목적 mount units 제공)
-          cat > "${outdir}/was-data.mount" <<'EOF'
-          [Unit]
-          Description=WAS Data Mount (loopback via fstab recommended)
-          [Mount]
-          What=/path/to/wasdata.img
-          Where=/mnt/was_data
-          Type=ext4
-          Options=loop
-          [Install]
-          WantedBy=multi-user.target
-          EOF
-
-          cat > "${outdir}/was-logs.mount" <<'EOF'
-          [Unit]
-          Description=WAS Logs Mount (loopback)
-          [Mount]
-          What=/path/to/waslogs.img
-          Where=/mnt/was_logs
-          Type=ext4
-          Options=loop
-          [Install]
-          WantedBy=multi-user.target
-          EOF
-
-          cat > "${outdir}/was-cache.mount" <<'EOF'
-          [Unit]
-          Description=WAS Cache Mount (loopback)
-          [Mount]
-          What=/path/to/wascache.img
-          Where=/mnt/was_cache
-          Type=ext4
-          Options=loop
-          [Install]
-          WantedBy=multi-user.target
-          EOF
-
-          # tmpfs를 systemd로 영구화 (서버용)
-          cat > "${outdir}/was-tmp.mount" <<EOF
-          [Unit]
-          Description=WAS tmpfs Mount
-          [Mount]
-          What=tmpfs
-          Where=${TMP_MP}
-          Type=tmpfs
-          Options=size=${{ github.event.inputs.tmpfs_size }},mode=1777
-          [Install]
-          WantedBy=multi-user.target
-          EOF
-
-          # WAS 서비스 (Spring Boot/Tomcat 공용)
-          APP_TYPE="${{ github.event.inputs.app_type }}"
-          if [ "$APP_TYPE" = "spring-boot" ]; then
-            cat > "${outdir}/was.service" <<'EOF'
-            [Unit]
-            Description=WAS (Spring Boot)
-            After=network-online.target
-            Wants=network-online.target
-
-            [Service]
-            Type=simple
-            EnvironmentFile=/etc/was/.java-memory.env
-            WorkingDirectory=/opt/was
-            ExecStart=/usr/bin/bash -lc "JAVA_TOOL_OPTIONS=\"$JAVA_TOOL_OPTIONS\" /usr/bin/java -jar /opt/was/app.jar"
-            Restart=always
-            RestartSec=5
-            LimitNOFILE=65536
-
-            [Install]
-            WantedBy=multi-user.target
-            EOF
-          else
-            cat > "${outdir}/was.service" <<'EOF'
-            [Unit]
-            Description=WAS (Tomcat)
-            After=network-online.target
-            Wants=network-online.target
-
-            [Service]
-            Type=forking
-            EnvironmentFile=/etc/was/.java-memory.env
-            Environment="CATALINA_BASE=/opt/tomcat"
-            ExecStart=/usr/bin/bash -lc "export CATALINA_OPTS=\"$JAVA_TOOL_OPTIONS $CATALINA_OPTS\"; /opt/tomcat/bin/catalina.sh start"
-            ExecStop=/opt/tomcat/bin/catalina.sh stop
-            Restart=always
-            RestartSec=5
-            LimitNOFILE=65536
-
-            [Install]
-            WantedBy=multi-user.target
-            EOF
-          fi
-
-          # 타이머 예시: 부팅 1분 후 마운트 확인 및 WAS 재시작 점검
-          cat > "${outdir}/was-health.service" <<'EOF'
-          [Unit]
-          Description=WAS mount & health check
-
-          [Service]
-          Type=oneshot
-          ExecStart=/usr/bin/bash -lc '/usr/local/sbin/was-health-check.sh'
-          EOF
-
-          cat > "${outdir}/was-health.timer" <<'EOF'
-          [Unit]
-          Description=Run WAS health check after boot and hourly
-
-          [Timer]
-          OnBootSec=1min
-          OnUnitActiveSec=1h
-          Unit=was-health.service
-
-          [Install]
-          WantedBy=timers.target
-          EOF
-
-          # 헬스체크 스크립트 예시
-          mkdir -p deploy/scripts
-          cat > deploy/scripts/was-health-check.sh <<'EOS'
-          #!/usr/bin/env bash
-          set -Eeuo pipefail
-          MPS=("/mnt/was_data" "/mnt/was_logs" "/mnt/was_cache" "/mnt/was_tmp")
-          for mp in "${MPS[@]}"; do
-            if ! mountpoint -q "$mp"; then
-              echo "[ERROR] $mp not mounted" >&2
-              exit 1
-            fi
-          done
-          # 포트/프로세스 간단 체크 (예: 8080)
-          if ! ss -lnt | grep -q ':8080'; then
-            systemctl restart was.service || true
-          fi
-          EOS
-          chmod +x deploy/scripts/was-health-check.sh
-
-          # 서버 배치 가이드
-          cat > deploy/README-systemd.md <<'MD'
-          # Systemd 배포 가이드 (실서버)
-          1) /opt/was 및 /etc/was 디렉토리 준비:
-             sudo mkdir -p /opt/was /etc/was
-             sudo cp .java-memory.env /etc/was/.java-memory.env   # 런타임 JVM 옵션
-             sudo cp /path/to/app.jar /opt/was/app.jar            # Spring Boot일 때
-
-          2) 루프백 이미지/마운트 설정:
-             - 생산환경은 /etc/fstab 로 loop 마운트 등록 권장
-             - 본 리포지토리의 *.mount 파일은 예시이며 What/Where 경로를 환경에 맞게 수정
-
-          3) 유닛/타이머 배치:
-             sudo cp deploy/systemd/*.service /etc/systemd/system/
-             sudo cp deploy/systemd/*.mount   /etc/systemd/system/
-             sudo cp deploy/systemd/*.timer   /etc/systemd/system/
-             sudo cp deploy/scripts/was-health-check.sh /usr/local/sbin/
-             sudo chmod +x /usr/local/sbin/was-health-check.sh
-
-             sudo systemctl daemon-reload
-             sudo systemctl enable was-data.mount was-logs.mount was-cache.mount was-tmp.mount
-             sudo systemctl enable was.service was-health.timer
-             sudo systemctl start was-data.mount was-logs.mount was-cache.mount was-tmp.mount
-             sudo systemctl start was.service
-             sudo systemctl start was-health.timer
-
-          4) 확인:
-             systemctl status was.service
-             systemctl list-timers | grep was-health
-             mount | egrep 'was_(data|logs|cache)|was_tmp'
+          cat > .github/echo_db/common/SECURITY_TLS_GUIDE.md <<'MD'
+          # DB 보안/TLS 가이드 (요약)
+          - 서버 측 TLS 인증서, 클라이언트 인증(필요 시) 구성
+          - 최소 권한 원칙(Role/Grant), 비밀번호 금고(Vault/KeyVault)
+          - 감사 로그 활성화, 로테이션, 보관 정책
+          - 백업/DR: 정기 백업 + 복구 리허설, PITR(Postgres) 등
           MD
 
-      - name: Sample run (optional, runner 제한 내)
+          cat > .github/echo_db/common/BACKUP_DR_CHECKLIST.md <<'MD'
+          # 백업/DR 체크리스트
+          - 전체/증분 백업 주기, 점검 절차
+          - 복구 목표(RPO/RTO) 정의 및 리허설
+          - 레플리케이션/HA 구성(AG/Patroni/InnoDB Cluster 등)
+          - 스냅샷/아카이브 보관 기간 및 접근통제
+          MD
+
+      # 2) 제품별 샘플 설정/가이드
+      - name: Generate product samples
+        shell: bash
         run: |
           set -Eeuo pipefail
-          APP="${{ github.event.inputs.app_type }}"
-          D="${{ github.event.inputs.data_mount }}"
-          L="${{ github.event.inputs.logs_mount }}"
-          source .java-memory.env || true
+          # Airflow
+          cat > .github/echo_products/airflow/ENV.sample <<'ENV'
+          AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:pw@db:5432/airflow
+          # airflow db init 후 webserver/scheduler 실행
+          ENV
 
-          if [ "$APP" = "spring-boot" ]; then
-            JAR="${{ github.event.inputs.app_jar_path }}"
-            if [ -f "${JAR}" ]; then
-              echo "[INFO] Launch Spring Boot sample"
-              nohup bash -c "JAVA_TOOL_OPTIONS='${JAVA_TOOL_OPTIONS}' java -jar ${JAR} --logging.file.name=${L}/app/app.log --spring.servlet.multipart.location=${D}/uploads" >/tmp/sb.out 2>&1 &
-              sleep 3
-            else
-              echo "[WARN] ${JAR} not found; skip launching."
-            fi
+          # n8n
+          cat > .github/echo_products/n8n/ENV.sample <<'ENV'
+          DB_TYPE=postgresdb
+          DB_POSTGRESDB_HOST=db
+          DB_POSTGRESDB_PORT=5432
+          DB_POSTGRESDB_DATABASE=n8n
+          DB_POSTGRESDB_USER=n8n
+          DB_POSTGRESDB_PASSWORD=strong_pw
+          ENV
+
+          # IBM BAW
+          cat > .github/echo_products/ibm-baw/JDBC.sample.properties <<'PROPS'
+          # 예시 JDBC (환경에 맞게 수정)
+          db.type=postgres
+          db.url=jdbc:postgresql://db.example.com:5432/bawdb?sslmode=require
+          db.user=baw
+          db.password=*****
+          # BAW는 Process/PDW/Common DB 분리(단, Postgres는 Common DB 제외 구성)
+          PROPS
+
+          # SharePoint Workflow Manager
+          cat > .github/echo_products/sharepoint-wfm/SETUP_CHECKLIST.md <<'MD'
+          # SP Workflow Manager 사전 체크
+          - SQL Server: TCP/IP 활성화(1433), SQL Browser 실행
+          - Azure Service Fabric Runtime 설치(권장 최신)
+          - 팜 구성 계정/권한 준비, 방화벽 예외
+          MD
+
+      # 3) 권한 파일 — PostgreSQL
+      - name: Generate PostgreSQL SQL (create/roles/grants)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cat > .github/echo_db/postgres/00_create_db.sql <<'SQL'
+          DO $$
+          BEGIN
+            IF NOT EXISTS (SELECT FROM pg_database WHERE datname = :'DB_NAME') THEN
+              PERFORM dblink_exec('dbname=postgres', 'CREATE DATABASE ' || quote_ident(:'DB_NAME'));
+            END IF;
+          END$$;
+          SQL
+
+          cat > .github/echo_db/postgres/01_roles.sql <<'SQL'
+          -- 사용자/역할 생성
+          CREATE ROLE :"DB_USER" LOGIN PASSWORD :'DB_PASSWORD';
+          -- 최소 권한 롤(읽기/쓰기) 분리
+          DO $$
+          BEGIN
+            IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='app_read') THEN CREATE ROLE app_read NOLOGIN; END IF;
+            IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='app_write') THEN CREATE ROLE app_write NOLOGIN; END IF;
+          END$$;
+          GRANT app_read TO :"DB_USER";
+          GRANT app_write TO :"DB_USER";
+          SQL
+
+          cat > .github/echo_db/postgres/02_schema_grants.sql <<'SQL'
+          \connect :"DB_NAME";
+          CREATE SCHEMA IF NOT EXISTS public AUTHORIZATION :"DB_USER";
+          -- 추가 스키마(선택)
+          -- CREATE SCHEMA IF NOT EXISTS :"EXTRA_SCHEMA" AUTHORIZATION :"DB_USER";
+          ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO app_read;
+          ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT,INSERT,UPDATE,DELETE ON TABLES TO app_write;
+          SQL
+
+          cat > .github/echo_db/postgres/03_model_strict.sql <<'SQL'
+          -- strict 모델: 테이블별 명시적 권한만 부여(샘플)
+          -- 예시 테이블
+          CREATE TABLE IF NOT EXISTS public.process_instance(
+            id BIGSERIAL PRIMARY KEY,
+            status TEXT NOT NULL,
+            assignee TEXT,
+            created_at TIMESTAMPTZ DEFAULT now()
+          );
+
+          REVOKE ALL ON public.process_instance FROM PUBLIC;
+          GRANT SELECT ON public.process_instance TO app_read;
+          GRANT SELECT,INSERT,UPDATE,DELETE ON public.process_instance TO app_write;
+          SQL
+
+          cat > .github/echo_db/postgres/03_model_basic.sql <<'SQL'
+          -- basic 모델: 스키마 단위로 일괄 권한
+          ALTER SCHEMA public OWNER TO :"DB_USER";
+          GRANT USAGE ON SCHEMA public TO app_read, app_write;
+          GRANT SELECT ON ALL TABLES IN SCHEMA public TO app_read;
+          GRANT SELECT,INSERT,UPDATE,DELETE ON ALL TABLES IN SCHEMA public TO app_write;
+          SQL
+
+      # 4) 권한 파일 — MySQL
+      - name: Generate MySQL SQL (create/user/grants)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cat > .github/echo_db/mysql/00_create_db.sql <<'SQL'
+          CREATE DATABASE IF NOT EXISTS `${DB_NAME}` CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;
+          SQL
+
+          cat > .github/echo_db/mysql/01_user.sql <<'SQL'
+          CREATE USER IF NOT EXISTS '${DB_USER}'@'%' IDENTIFIED BY '${DB_PASSWORD}';
+          GRANT USAGE ON *.* TO '${DB_USER}'@'%';
+          SQL
+
+          cat > .github/echo_db/mysql/02_grants_basic.sql <<'SQL'
+          GRANT SELECT ON `${DB_NAME}`.* TO '${DB_USER}'@'%';
+          GRANT INSERT, UPDATE, DELETE ON `${DB_NAME}`.* TO '${DB_USER}'@'%';
+          FLUSH PRIVILEGES;
+          SQL
+
+          cat > .github/echo_db/mysql/02_grants_strict.sql <<'SQL'
+          -- strict: 테이블 생성 후 테이블 단위 부여(샘플)
+          USE `${DB_NAME}`;
+          CREATE TABLE IF NOT EXISTS process_instance(
+            id BIGINT PRIMARY KEY AUTO_INCREMENT,
+            status VARCHAR(64) NOT NULL,
+            assignee VARCHAR(128),
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+          );
+          REVOKE ALL PRIVILEGES, GRANT OPTION FROM '${DB_USER}'@'%';
+          GRANT SELECT ON `${DB_NAME}`.process_instance TO '${DB_USER}'@'%';
+          GRANT INSERT,UPDATE,DELETE ON `${DB_NAME}`.process_instance TO '${DB_USER}'@'%';
+          FLUSH PRIVILEGES;
+          SQL
+
+      # 5) 권한 파일 — MSSQL (생성만)
+      - name: Generate MSSQL SQL (create/login/grants) - files only
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cat > .github/echo_db/mssql/00_create_db.sql <<'SQL'
+          IF DB_ID(N'${DB_NAME}') IS NULL
+            CREATE DATABASE [${DB_NAME}];
+          GO
+          SQL
+
+          cat > .github/echo_db/mssql/01_user.sql <<'SQL'
+          USE [${DB_NAME}];
+          IF NOT EXISTS (SELECT 1 FROM sys.sql_logins WHERE name = N'${DB_USER}')
+            CREATE LOGIN [${DB_USER}] WITH PASSWORD=N'${DB_PASSWORD}', CHECK_POLICY=ON;
+          CREATE USER [${DB_USER}] FOR LOGIN [${DB_USER}];
+          SQL
+
+          cat > .github/echo_db/mssql/02_grants_basic.sql <<'SQL'
+          USE [${DB_NAME}];
+          EXEC sp_addrolemember N'db_datareader', N'${DB_USER}';
+          EXEC sp_addrolemember N'db_datawriter', N'${DB_USER}';
+          SQL
+
+          cat > .github/echo_db/mssql/02_grants_strict.sql <<'SQL'
+          USE [${DB_NAME}];
+          IF OBJECT_ID('dbo.process_instance','U') IS NULL
+            CREATE TABLE dbo.process_instance(
+              id BIGINT IDENTITY(1,1) PRIMARY KEY,
+              status NVARCHAR(64) NOT NULL,
+              assignee NVARCHAR(128),
+              created_at DATETIME2 DEFAULT SYSUTCDATETIME()
+            );
+          REVOKE SELECT, INSERT, UPDATE, DELETE ON dbo.process_instance FROM [${DB_USER}];
+          GRANT SELECT ON dbo.process_instance TO [${DB_USER}];
+          GRANT INSERT, UPDATE, DELETE ON dbo.process_instance TO [${DB_USER}];
+          SQL
+
+      # 6) 실제 적용 (postgres/mysql만)
+      - name: Apply SQL (PostgreSQL)
+        if: ${{ env.RUN_APPLY == 'true' && env.TARGET_DB == 'postgres' }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          sudo apt-get update && sudo apt-get install -y postgresql-client
+          export PGPASSWORD=postgres
+          psql -h localhost -U postgres -p 5432 -d postgres -v ON_ERROR_STOP=1 \
+            -v DB_NAME="${DB_NAME}" -v DB_USER="${DB_USER}" -v DB_PASSWORD="${DB_PASSWORD}" -f .github/echo_db/postgres/00_create_db.sql
+
+          # DB 내부 적용
+          psql -h localhost -U postgres -p 5432 -d "${DB_NAME}" -v ON_ERROR_STOP=1 \
+            -v DB_NAME="${DB_NAME}" -v DB_USER="${DB_USER}" -v DB_PASSWORD="${DB_PASSWORD}" -f .github/echo_db/postgres/01_roles.sql
+
+          psql -h localhost -U postgres -p 5432 -d "${DB_NAME}" -v ON_ERROR_STOP=1 \
+            -v DB_NAME="${DB_NAME}" -v DB_USER="${DB_USER}" -v EXTRA_SCHEMA="${EXTRA_SCHEMA}" -f .github/echo_db/postgres/02_schema_grants.sql
+
+          if [ "${GRANT_MODEL}" = "strict" ]; then
+            psql -h localhost -U postgres -p 5432 -d "${DB_NAME}" -v ON_ERROR_STOP=1 -f .github/echo_db/postgres/03_model_strict.sql
           else
-            TBASE="${{ github.event.inputs.tomcat_base }}"
-            if [ -x "${TBASE}/bin/catalina.sh" ]; then
-              echo "[INFO] Launch Tomcat sample"
-              source .tomcat-opts.env || true
-              nohup bash -c "export CATALINA_BASE='${TBASE}'; export CATALINA_OPTS='${CATALINA_OPTS}'; ${TBASE}/bin/catalina.sh start" >/tmp/tc.out 2>&1 &
-              sleep 3
-              sudo rm -rf "${TBASE}/logs" && sudo ln -s "${L}/tomcat" "${TBASE}/logs"
-            else
-              echo "[WARN] Tomcat not found; skip."
-            fi
+            psql -h localhost -U postgres -p 5432 -d "${DB_NAME}" -v ON_ERROR_STOP=1 -f .github/echo_db/postgres/03_model_basic.sql
           fi
 
-      - name: Generate reports
+      - name: Apply SQL (MySQL)
+        if: ${{ env.RUN_APPLY == 'true' && env.TARGET_DB == 'mysql' }}
+        shell: bash
         run: |
           set -Eeuo pipefail
-          {
-            echo "# WAS Multi-FS Expansion Report"
-            echo "## Mounts"
-            df -h | sed -n '1p;/was_/p'
-            echo
-            echo "### findmnt"
-            findmnt -R | sed -n '/was_/,+3p' || true
-            echo
-            echo "## Memory"
-            free -h
-            echo
-            echo "## Swap"
-            swapon --show || true
-            echo
-            echo "## sysctl"
-            sysctl vm.swappiness fs.inotify.max_user_watches
-            echo
-            echo "## JVM"
-            echo '```'
-            cat .java-memory.env
-            [ -f .tomcat-opts.env ] && cat .tomcat-opts.env || true
-            echo '```'
-          } > was_multi_expansion_report.md
+          sudo apt-get update && sudo apt-get install -y mysql-client
 
-          sudo bash -c "du -sh ${{ github.event.inputs.data_mount }}/* 2>/dev/null | sort -h > data_usage.txt" || true
-          sudo bash -c "du -sh ${{ github.event.inputs.logs_mount }}/* 2>/dev/null | sort -h > logs_usage.txt" || true
-          sudo bash -c "du -sh ${{ github.event.inputs.cache_mount }}/* 2>/dev/null | sort -h > cache_usage.txt" || true
-          sudo bash -c "find ${{ github.event.inputs.data_mount }} -maxdepth 2 -type d | sort > data_tree.txt" || true
-          sudo bash -c "find ${{ github.event.inputs.logs_mount }} -maxdepth 2 -type d | sort > logs_tree.txt" || true
-          sudo bash -c "find ${{ github.event.inputs.cache_mount }} -maxdepth 2 -type d | sort > cache_tree.txt" || true
+          mysql -h 127.0.0.1 -P 3306 -uroot -proot < .github/echo_db/mysql/00_create_db.sql
+          DBVARS=$(envsubst < .github/echo_db/mysql/01_user.sql)
+          echo "$DBVARS" | mysql -h 127.0.0.1 -P 3306 -uroot -proot
 
+          if [ "${GRANT_MODEL}" = "strict" ]; then
+            DBVARS=$(envsubst < .github/echo_db/mysql/02_grants_strict.sql)
+          else
+            DBVARS=$(envsubst < .github/echo_db/mysql/02_grants_basic.sql)
+          fi
+          echo "$DBVARS" | mysql -h 127.0.0.1 -P 3306 -uroot -proot
+
+      # 7) 산출물 업로드
       - name: Upload artifacts
+        if: ${{ env.CREATE_ARTIFACTS == 'true' }}
         uses: actions/upload-artifact@v4
         with:
-          name: was-multi-fs-artifacts
-          if-no-files-found: warn
+          name: db-fullops-artifacts
           path: |
-            was_multi_expansion_report.md
-            data_usage.txt
-            logs_usage.txt
-            cache_usage.txt
-            data_tree.txt
-            logs_tree.txt
-            cache_tree.txt
-            .java-memory.env
-            .tomcat-opts.env
-            .was-tmpfs.env
-            deploy/systemd/*
-            deploy/scripts/*
-            deploy/README-systemd.md
-            ${{ steps.loopfs.outputs.data_img }}
-            ${{ steps.loopfs.outputs.logs_img }}
-            ${{ steps.loopfs.outputs.cache_img }}
-
-      - name: Commit & push (optional)
-        if: ${{ github.event.inputs.commit_changes == 'true' }}
-        run: |
-          set -Eeuo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          mkdir -p .github/echo_was_multi
-          cp -f was_multi_expansion_report.md .github/echo_was_multi/
-          cp -f deploy/README-systemd.md .github/echo_was_multi/
-          git add .github/echo_was_multi deploy/systemd deploy/scripts || true
-          git commit -m "[ECHO][WAS] Multi-FS+tmpfs+sysctl+systemd scaffolding" || echo "[INFO] Nothing to commit"
-          git push || echo "[WARN] Push skipped"
+            .github/echo_db/**
+            .github/echo_products/**
