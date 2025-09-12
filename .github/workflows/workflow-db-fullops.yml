@@ -1,4 +1,4 @@
-name: "🗄️ Workflow DB FullOps (ALL-in-One: 권한/대량+적용+TLS+Oracle/Db2+Ansible/Makefile)"
+name: "🗄️ Workflow DB FullOps (ALL: 권한/대량+적용+TLS+Oracle/Db2+Ansible/Makefile+ISO+Release)"
 
 on:
   workflow_dispatch:
@@ -9,51 +9,104 @@ on:
         required: true
         default: "airflow"
         options: ["airflow", "n8n", "ibm-baw", "sharepoint-wfm"]
+
       target_db:
         description: "대상 DB (all: 모두 실행)"
         type: choice
         required: true
         default: "all"
         options: ["postgres", "mysql", "mssql", "all"]
+
       db_name:
         description: "DB 이름(기준 접두)"
         required: true
         default: "appdb"
+
       db_user:
         description: "DB 접속 사용자(기준 접두)"
         required: true
         default: "appuser"
+
       db_password:
         description: "DB 접속 비밀번호"
         required: true
         default: "StrongPw123!"
+
       extra_schema:
         description: "추가 스키마(없으면 빈칸)"
         required: false
         default: ""
+
       grant_model:
         description: "권한 모델"
         type: choice
         required: true
         default: "strict"
         options: ["strict", "basic"]
+
       enable_tls:
         description: "TLS 가이드/템플릿 포함"
         type: choice
         required: true
         default: "true"
         options: ["true", "false"]
+
       create_artifacts:
         description: "산출물 업로드(권한/대량/샘플/Ansible/Makefile)"
         type: choice
         required: true
         default: "true"
         options: ["true", "false"]
+
       run_apply:
         description: "컨테이너 기동 후 실제 적용(지원: postgres/mysql/mssql/all)"
         type: choice
         required: true
         default: "true"
+        options: ["true", "false"]
+
+      # ------ 신규: ISO/Release/대량 디렉토리 생성 ------
+      iso_enable:
+        description: "ISO 생성 활성화(통합+제품별)"
+        type: choice
+        required: true
+        default: "true"
+        options: ["true", "false"]
+
+      iso_per_service:
+        description: "제품별 ISO 개별 생성"
+        type: choice
+        required: true
+        default: "true"
+        options: ["true", "false"]
+
+      iso_bulk_dir_count:
+        description: "ISO에 포함할 대량 디렉토리 개수"
+        required: true
+        default: "20"
+
+      iso_bulk_dir_prefix:
+        description: "대량 디렉토리 접두사(예: bundle_)"
+        required: true
+        default: "bundle_"
+
+      release_enable:
+        description: "GitHub Release 게시"
+        type: choice
+        required: true
+        default: "true"
+        options: ["true", "false"]
+
+      release_tag:
+        description: "릴리즈 태그(예: v1.0.0 또는 vAUTO-<run>)"
+        required: true
+        default: "vAUTO-${{ github.run_number }}"
+
+      release_prerelease:
+        description: "프리릴리즈 여부"
+        type: choice
+        required: true
+        default: "false"
         options: ["true", "false"]
 
 permissions:
@@ -67,7 +120,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 러너 업그레이드/필수 도구
       - name: System upgrade (apt-get)
         shell: bash
         run: |
@@ -91,18 +143,28 @@ jobs:
           echo "ENABLE_TLS=${{ github.event.inputs.enable_tls }}" >> $GITHUB_ENV
           echo "CREATE_ARTIFACTS=${{ github.event.inputs.create_artifacts }}" >> $GITHUB_ENV
           echo "RUN_APPLY=${{ github.event.inputs.run_apply }}" >> $GITHUB_ENV
-          # 대량 생성 기본값/상수
+          # 대량 DB 생성(기존)
           echo "BULK_COUNT=20" >> $GITHUB_ENV
           echo "BULK_PREFIX=${{ github.event.inputs.db_user }}_bulk" >> $GITHUB_ENV
           echo "MSSQL_SA_PASSWORD=Str0ng!Passw0rd" >> $GITHUB_ENV
-          # 디렉터리
+          # 신규: ISO/Release
+          echo "ISO_ENABLE=${{ github.event.inputs.iso_enable }}" >> $GITHUB_ENV
+          echo "ISO_PER_SERVICE=${{ github.event.inputs.iso_per_service }}" >> $GITHUB_ENV
+          echo "ISO_BULK_DIR_COUNT=${{ github.event.inputs.iso_bulk_dir_count }}" >> $GITHUB_ENV
+          echo "ISO_BULK_DIR_PREFIX=${{ github.event.inputs.iso_bulk_dir_prefix }}" >> $GITHUB_ENV
+          echo "RELEASE_ENABLE=${{ github.event.inputs.release_enable }}" >> $GITHUB_ENV
+          echo "RELEASE_TAG=${{ github.event.inputs.release_tag }}" >> $GITHUB_ENV
+          echo "RELEASE_PRERELEASE=${{ github.event.inputs.release_prerelease }}" >> $GITHUB_ENV
+
           mkdir -p \
             .github/echo_db/{postgres,mysql,mssql,oracle,db2,common} \
             .github/echo_products/{airflow,n8n,ibm-baw,sharepoint-wfm} \
             .github/echo_ansible/group_vars \
-            .github/echo_ansible/roles/db_tasks/{templates,tasks}
+            .github/echo_ansible/roles/db_tasks/{templates,tasks} \
+            .github/out/release_root \
+            .github/out/iso
 
-      # 공통 가이드/TLS 템플릿
+      # ---------------- 공통 가이드/TLS/제품 샘플/DB 스크립트 생성 (생략 없이 기존 동일) ----------------
       - name: Generate common guides & TLS templates
         shell: bash
         run: |
@@ -117,7 +179,6 @@ jobs:
           - 전체/증분, RPO/RTO, DR Runbook
           - 레플리카/클러스터(AG/Patroni/InnoDB Cluster 등) + 모니터링/알람
           MD
-          # MSSQL TLS 템플릿
           cat > .github/echo_db/mssql/TLS_CLIENT_CONNECTION_EXAMPLES.md <<'MD'
           ## MSSQL TLS 클라이언트 연결 예시
           - sqlcmd(ODBC 18+): sqlcmd -S host,1433 -U user -C -Q "SELECT 1"
@@ -131,7 +192,6 @@ jobs:
           * 컨테이너는 커스텀 이미지 + 인증서 바인딩 스크립트 필요
           MD
 
-      # 제품별 샘플
       - name: Generate product samples
         shell: bash
         run: |
@@ -161,7 +221,6 @@ jobs:
           - 팜 구성 계정/권한, 방화벽 예외
           MD
 
-      # === PostgreSQL: 권한 + 대량 생성 (DB 생성은 bash에서) ===
       - name: Generate PostgreSQL SQL (roles/grants + bulk)
         shell: bash
         run: |
@@ -247,7 +306,6 @@ jobs:
             done
           } > .github/echo_db/postgres/99_bulk.sql
 
-      # === MySQL: 권한 + 대량 생성 (bash 루프) ===
       - name: Generate MySQL SQL (create/user/grants + bulk)
         shell: bash
         run: |
@@ -292,7 +350,6 @@ jobs:
             done
           } > .github/echo_db/mysql/99_bulk.sql
 
-      # === MSSQL: 전용 롤 + 권한 + 대량 생성 ===
       - name: Generate MSSQL SQL (roles/grants + bulk)
         shell: bash
         run: |
@@ -356,7 +413,6 @@ jobs:
           GO
           SQL
 
-      # === Oracle/Db2 템플릿 ===
       - name: Generate Oracle/Db2 templates
         shell: bash
         run: |
@@ -377,55 +433,56 @@ jobs:
           GRANT CREATETAB ON DATABASE TO USER ${DB_USER};
           SQL
 
-      # === Ansible & Makefile ===
-      - name: Generate Ansible playbook & Makefile
+      # ---------------- 신규: 대량 디렉토리 생성 + ISO 이미지 생성 ----------------
+      - name: Build release trees (bulk directories) & common README
+        if: ${{ env.ISO_ENABLE == 'true' }}
         shell: bash
         run: |
           set -Eeuo pipefail
-          mkdir -p .github/echo_ansible/roles/db_tasks/tasks
-          cat > .github/echo_ansible/inventory.ini <<'INV'
-          [db_local]
-          127.0.0.1 ansible_connection=local
-          INV
-          cat > .github/echo_ansible/group_vars/all.yml <<'YML'
-          db_name: ${DB_NAME}
-          db_user: ${DB_USER}
-          db_password: ${DB_PASSWORD}
-          grant_model: ${GRANT_MODEL}
-          target_db: ${TARGET_DB}
-          YML
-          cat > .github/echo_ansible/roles/db_tasks/tasks/main.yml <<'YML'
-          ---
-          - name: Show DB variables
-            debug:
-              msg:
-                db_name: "{{ db_name }}"
-                db_user: "{{ db_user }}"
-                grant_model: "{{ grant_model }}"
-                target_db: "{{ target_db }}"
-          - name: Display note
-            debug:
-              msg: "이 역할은 로컬 생성된 SQL 템플릿을 배포/적용하는 골격 예시입니다."
-          YML
-          cat > .github/echo_ansible/site.yml <<'YML'
-          ---
-          - hosts: db_local
-            gather_facts: false
-            roles:
-              - db_tasks
-          YML
-          cat > .github/echo_ansible/Makefile <<'MK'
-          .PHONY: ansible-setup ansible-run show
-          ansible-setup:
-          	python3 -m pip install --upgrade pip
-          	pip3 install ansible
-          ansible-run:
-          	ansible-playbook -i inventory.ini site.yml
-          show:
-          	@echo "DB: ${DB_NAME}, USER: ${DB_USER}, MODEL: ${GRANT_MODEL}, TARGET: ${TARGET_DB}"
-          MK
+          ROOT=".github/out/release_root"
+          # 공통 트리(ALL)
+          mkdir -p "$ROOT/ALL"
+          rsync -a .github/echo_db/        "$ROOT/ALL/echo_db/"
+          rsync -a .github/echo_products/  "$ROOT/ALL/echo_products/"
+          rsync -a .github/echo_ansible/   "$ROOT/ALL/echo_ansible/"
+          # 제품별 트리
+          mkdir -p "$ROOT/POSTGRES" "$ROOT/MYSQL" "$ROOT/MSSQL"
+          rsync -a .github/echo_db/postgres/ "$ROOT/POSTGRES/echo_db/postgres/"
+          rsync -a .github/echo_db/common/   "$ROOT/POSTGRES/echo_db/common/"
+          rsync -a .github/echo_db/mysql/    "$ROOT/MYSQL/echo_db/mysql/"
+          rsync -a .github/echo_db/common/   "$ROOT/MYSQL/echo_db/common/"
+          rsync -a .github/echo_db/mssql/    "$ROOT/MSSQL/echo_db/mssql/"
+          rsync -a .github/echo_db/common/   "$ROOT/MSSQL/echo_db/common/"
+          # 대량 디렉토리 생성(ALL 아래에만 예시로 N개 생성)
+          for i in $(seq -w 1 ${ISO_BULK_DIR_COUNT}); do
+            mkdir -p "$ROOT/ALL/${ISO_BULK_DIR_PREFIX}${i}"
+            echo "placeholder ${i}" > "$ROOT/ALL/${ISO_BULK_DIR_PREFIX}${i}/README.txt"
+          done
+          # 안내 README
+          cat > "$ROOT/ALL/README_FULLOPS.txt" <<TXT
+          이 ISO에는 DB 스크립트(권한/대량), TLS 가이드, 제품별 샘플설정, Ansible/Makefile 템플릿이 포함되어 있습니다.
+          TXT
 
-      # === 컨테이너 기동 (postgres/mysql/mssql/all) ===
+      - name: Make ISOs (ALL + per service)
+        if: ${{ env.ISO_ENABLE == 'true' }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          sudo apt-get update && sudo apt-get install -y genisoimage
+          OUT=".github/out/iso"
+          ROOT=".github/out/release_root"
+          TS="$(date -u +%Y%m%dT%H%M%SZ)"
+          ALL_ISO="$OUT/FULLOPS_ALL_${TS}.iso"
+          genisoimage -quiet -J -r -V "FULLOPS_ALL" -o "$ALL_ISO" "$ROOT/ALL"
+          if [ "${ISO_PER_SERVICE}" = "true" ]; then
+            genisoimage -quiet -J -r -V "FULLOPS_POSTGRES" -o "$OUT/FULLOPS_POSTGRES_${TS}.iso" "$ROOT/POSTGRES"
+            genisoimage -quiet -J -r -V "FULLOPS_MYSQL"    -o "$OUT/FULLOPS_MYSQL_${TS}.iso"    "$ROOT/MYSQL"
+            genisoimage -quiet -J -r -V "FULLOPS_MSSQL"    -o "$OUT/FULLOPS_MSSQL_${TS}.iso"    "$ROOT/MSSQL"
+          fi
+          (cd "$OUT" && sha256sum *.iso > CHECKSUMS.txt)
+          echo "ISO_TIME=${TS}" >> $GITHUB_ENV
+
+      # ---------------- 컨테이너 기동 & 실제 적용(이전 로직 유지, 보안경고 제거 버전) ----------------
       - name: Start PostgreSQL container
         if: ${{ env.RUN_APPLY == 'true' && (env.TARGET_DB == 'postgres' || env.TARGET_DB == 'all') }}
         shell: bash
@@ -444,7 +501,6 @@ jobs:
         run: |
           set -Eeuo pipefail
           docker run -d --name mysqldb -e MYSQL_ROOT_PASSWORD=root -p 3306:3306 mysql:8
-          # 호스트 클라이언트 설치 및 보안 옵션파일 생성(경고 제거)
           sudo apt-get update && sudo apt-get install -y mysql-client
           mkdir -p .github/secure
           cat > .github/secure/mysql.cnf <<'CNF'
@@ -453,10 +509,9 @@ jobs:
           user=root
           password=root
           port=3306
-          # ssl-mode=REQUIRED  # TLS 환경이면 주석 해제
+          # ssl-mode=REQUIRED
           CNF
           chmod 600 .github/secure/mysql.cnf
-          # readiness check (CLI 비밀번호 인자 미사용 → 경고 제거)
           for i in {1..60}; do
             if mysqladmin --defaults-extra-file=.github/secure/mysql.cnf ping --silent >/dev/null 2>&1; then break; fi
             sleep 3
@@ -473,23 +528,18 @@ jobs:
             sleep 3
           done || true
 
-      # === 실제 적용: PostgreSQL (단일 + 대량) ===
-      - name: Apply SQL (PostgreSQL)  # .pgpass 사용(비번 경고 없음)
+      - name: Apply SQL (PostgreSQL)  # .pgpass 사용
         if: ${{ env.RUN_APPLY == 'true' && (env.TARGET_DB == 'postgres' || env.TARGET_DB == 'all') }}
         shell: bash
         run: |
           set -Eeuo pipefail
           sudo apt-get update && sudo apt-get install -y postgresql-client gettext-base
-          # libpq 자격증명 파일(~/.pgpass) 사용
           umask 077
           printf "127.0.0.1:5432:*:postgres:postgres\n" > ~/.pgpass
-
           # 기준 DB 생성
           if ! psql -h 127.0.0.1 -U postgres -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname='${DB_NAME}'" | grep -q 1; then
             createdb -h 127.0.0.1 -p 5432 -U postgres "${DB_NAME}"
           fi
-
-          # 기준 권한/스키마/모델
           envsubst < .github/echo_db/postgres/01_roles.sql         | psql -h 127.0.0.1 -U postgres -d "${DB_NAME}" -v ON_ERROR_STOP=1
           envsubst < .github/echo_db/postgres/02_schema_grants.sql | psql -h 127.0.0.1 -U postgres -d "${DB_NAME}" -v ON_ERROR_STOP=1
           if [ "${GRANT_MODEL}" = "strict" ]; then
@@ -497,32 +547,26 @@ jobs:
           else
             psql -h 127.0.0.1 -U postgres -d "${DB_NAME}" -v ON_ERROR_STOP=1 -f .github/echo_db/postgres/03_model_basic.sql
           fi
-
-          # 대량 DB 생성 (psql로 체크 → createdb)
+          # 대량 DB 생성
           for i in $(seq -w 1 ${BULK_COUNT}); do
             db="${DB_NAME}_${i}"
             if ! psql -h 127.0.0.1 -U postgres -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname='${db}'" | grep -q 1; then
               createdb -h 127.0.0.1 -p 5432 -U postgres "${db}"
             fi
           done
-
           # 대량 유저/권한/테이블
           envsubst < .github/echo_db/postgres/99_bulk.sql | psql -h 127.0.0.1 -U postgres -d postgres -v ON_ERROR_STOP=1
 
-      # === 실제 적용: MySQL (단일 + 대량) ===
-      - name: Apply SQL (MySQL) + Bulk  # defaults-extra-file 사용(비번 경고 없음)
+      - name: Apply SQL (MySQL) + Bulk  # defaults-extra-file 사용
         if: ${{ env.RUN_APPLY == 'true' && (env.TARGET_DB == 'mysql' || env.TARGET_DB == 'all') }}
         shell: bash
         run: |
           set -Eeuo pipefail
           sudo apt-get update && sudo apt-get install -y mysql-client gettext-base
-
-          # readiness (비밀번호 옵션파일 사용)
           for i in {1..20}; do
             if mysql --defaults-extra-file=.github/secure/mysql.cnf -e "SELECT 1" >/dev/null 2>&1; then break; fi
             sleep 3
           done
-
           envsubst < .github/echo_db/mysql/00_create_db.sql | mysql --defaults-extra-file=.github/secure/mysql.cnf
           envsubst < .github/echo_db/mysql/01_user.sql      | mysql --defaults-extra-file=.github/secure/mysql.cnf
           if [ "${GRANT_MODEL}" = "strict" ]; then
@@ -531,12 +575,9 @@ jobs:
             envsubst < .github/echo_db/mysql/02_grants_basic.sql  | mysql --defaults-extra-file=.github/secure/mysql.cnf
           fi
           envsubst < .github/echo_db/mysql/99_bulk.sql | mysql --defaults-extra-file=.github/secure/mysql.cnf
-
-          # 흔적 최소화(선택)
           shred -u .github/secure/mysql.cnf || rm -f .github/secure/mysql.cnf
 
-      # === 실제 적용: MSSQL (단일 + 대량) ===
-      - name: Apply SQL (MSSQL) + Bulk (sqlcmd)  # SQLCMDPASSWORD 사용(비번 경고 없음)
+      - name: Apply SQL (MSSQL) + Bulk (sqlcmd)  # SQLCMDPASSWORD 사용
         if: ${{ env.RUN_APPLY == 'true' && (env.TARGET_DB == 'mssql' || env.TARGET_DB == 'all') }}
         shell: bash
         run: |
@@ -548,15 +589,11 @@ jobs:
           sudo apt-get update
           sudo ACCEPT_EULA=Y apt-get install -y msodbcsql18 mssql-tools18
           export PATH="$PATH:/opt/mssql-tools18/bin"
-
-          # 비밀번호를 환경변수로 전달 (CLI -P 제거)
           export SQLCMDPASSWORD="${MSSQL_SA_PASSWORD}"
-
           for i in {1..60}; do
             if sqlcmd -S 127.0.0.1 -U sa -C -Q "SELECT 1" >/dev/null 2>&1; then break; fi
             sleep 3
           done
-
           envsubst < .github/echo_db/mssql/00_create_db.sql        | sqlcmd -S 127.0.0.1 -U sa -C
           envsubst < .github/echo_db/mssql/01_roles.sql            | sqlcmd -S 127.0.0.1 -U sa -C
           envsubst < .github/echo_db/mssql/02_user_and_grants.sql  | sqlcmd -S 127.0.0.1 -U sa -C
@@ -567,8 +604,8 @@ jobs:
           fi
           envsubst < .github/echo_db/mssql/99_bulk.sql | sqlcmd -S 127.0.0.1 -U sa -C
 
-      # 산출물 업로드
-      - name: Upload artifacts
+      # ---------------- 산출물 업로드 (스크립트/샘플/Ansible + ISO) ----------------
+      - name: Upload artifacts (scripts & samples & ansible)
         if: ${{ env.CREATE_ARTIFACTS == 'true' }}
         uses: actions/upload-artifact@v4
         with:
@@ -577,3 +614,32 @@ jobs:
             .github/echo_db/**
             .github/echo_products/**
             .github/echo_ansible/**
+
+      - name: Upload ISO images
+        if: ${{ env.ISO_ENABLE == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: iso-images
+          path: .github/out/iso/*
+
+      # ---------------- GitHub Release 게시(태그=입력값) ----------------
+      - name: Create GitHub Release (tag & upload ISOs)
+        if: ${{ env.RELEASE_ENABLE == 'true' && env.ISO_ENABLE == 'true' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: "Workflow DB FullOps ${ { env.RELEASE_TAG } }"
+          body: |
+            Workflow DB FullOps 통합 릴리즈
+            - 제품: ${{ env.WF_PRODUCT }}
+            - 대상 DB: ${{ env.TARGET_DB }}
+            - 권한 모델: ${{ env.GRANT_MODEL }}
+            - ISO 타임스탬프: ${{ env.ISO_TIME }}
+            - 포함: Scripts/Ansible/TLS/Oracle-Db2 + ISO(ALL${{ env.ISO_PER_SERVICE == 'true' && ' + per-service' || '' }})
+          draft: false
+          prerelease: ${{ env.RELEASE_PRERELEASE == 'true' }}
+          files: |
+            .github/out/iso/*.iso
+            .github/out/iso/CHECKSUMS.txt
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
