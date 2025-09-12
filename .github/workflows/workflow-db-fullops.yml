@@ -32,11 +32,6 @@ on:
         required: true
         default: "StrongPw123!"
 
-      extra_schema:
-        description: "추가 스키마(없으면 빈칸)"
-        required: false
-        default: ""
-
       grant_model:
         description: "권한 모델"
         type: choice
@@ -44,54 +39,8 @@ on:
         default: "strict"
         options: ["strict", "basic"]
 
-      enable_tls:
-        description: "TLS 가이드/템플릿 포함"
-        type: choice
-        required: true
-        default: "true"
-        options: ["true", "false"]
-
-      create_artifacts:
-        description: "산출물 업로드(권한/대량/샘플/Ansible/Makefile)"
-        type: choice
-        required: true
-        default: "true"
-        options: ["true", "false"]
-
       run_apply:
         description: "컨테이너 기동 후 실제 적용(지원: postgres/mysql/mssql/all)"
-        type: choice
-        required: true
-        default: "true"
-        options: ["true", "false"]
-
-      # ------ ISO/Release/대량 디렉토리 ------
-      iso_enable:
-        description: "ISO 생성 활성화(통합+제품별)"
-        type: choice
-        required: true
-        default: "true"
-        options: ["true", "false"]
-
-      iso_per_service:
-        description: "제품별 ISO 개별 생성"
-        type: choice
-        required: true
-        default: "true"
-        options: ["true", "false"]
-
-      iso_bulk_dir_count:
-        description: "ISO에 포함할 대량 디렉토리 개수"
-        required: true
-        default: "20"
-
-      iso_bulk_dir_prefix:
-        description: "대량 디렉토리 접두사(예: bundle_)"
-        required: true
-        default: "bundle_"
-
-      release_enable:
-        description: "GitHub Release 게시"
         type: choice
         required: true
         default: "true"
@@ -102,12 +51,17 @@ on:
         required: true
         default: "AUTO"
 
-      release_prerelease:
-        description: "프리릴리즈 여부"
+      mode_preset:
+        description: "모드 프리셋(full/iso-only/artifacts-only/release-only/minimal)"
         type: choice
         required: true
-        default: "false"
-        options: ["true", "false"]
+        default: "full"
+        options: ["full","iso-only","artifacts-only","release-only","minimal"]
+
+      extra_json:
+        description: "추가설정 JSON(선택) — iso_enable, iso_per_service, create_artifacts, enable_tls, bulk_count, bulk_prefix, iso_bulk_dir_count, iso_bulk_dir_prefix, release_enable, release_prerelease"
+        required: false
+        default: "{}"
 
 permissions:
   contents: write
@@ -138,30 +92,70 @@ jobs:
           echo "DB_NAME=${{ github.event.inputs.db_name }}" >> $GITHUB_ENV
           echo "DB_USER=${{ github.event.inputs.db_user }}" >> $GITHUB_ENV
           echo "DB_PASSWORD=${{ github.event.inputs.db_password }}" >> $GITHUB_ENV
-          echo "EXTRA_SCHEMA=${{ github.event.inputs.extra_schema }}" >> $GITHUB_ENV
           echo "GRANT_MODEL=${{ github.event.inputs.grant_model }}" >> $GITHUB_ENV
-          echo "ENABLE_TLS=${{ github.event.inputs.enable_tls }}" >> $GITHUB_ENV
-          echo "CREATE_ARTIFACTS=${{ github.event.inputs.create_artifacts }}" >> $GITHUB_ENV
           echo "RUN_APPLY=${{ github.event.inputs.run_apply }}" >> $GITHUB_ENV
-          # 대량 기본값
-          echo "BULK_COUNT=20" >> $GITHUB_ENV
-          echo "BULK_PREFIX=${{ github.event.inputs.db_user }}_bulk" >> $GITHUB_ENV
-          echo "MSSQL_SA_PASSWORD=Str0ng!Passw0rd" >> $GITHUB_ENV
-          # ISO/Release
-          echo "ISO_ENABLE=${{ github.event.inputs.iso_enable }}" >> $GITHUB_ENV
-          echo "ISO_PER_SERVICE=${{ github.event.inputs.iso_per_service }}" >> $GITHUB_ENV
-          echo "ISO_BULK_DIR_COUNT=${{ github.event.inputs.iso_bulk_dir_count }}" >> $GITHUB_ENV
-          echo "ISO_BULK_DIR_PREFIX=${{ github.event.inputs.iso_bulk_dir_prefix }}" >> $GITHUB_ENV
-          echo "RELEASE_ENABLE=${{ github.event.inputs.release_enable }}" >> $GITHUB_ENV
-          echo "RELEASE_PRERELEASE=${{ github.event.inputs.release_prerelease }}" >> $GITHUB_ENV
 
-          # ✅ 릴리즈 태그 계산
+          # ===== 프리셋 기본값 =====
+          MODE="${{ github.event.inputs.mode_preset }}"
+          case "$MODE" in
+            full)
+              ISO_ENABLE=true; ISO_PER_SERVICE=true; CREATE_ARTIFACTS=true; RELEASE_ENABLE=true; RELEASE_PRERELEASE=false; ENABLE_TLS=true;;
+            iso-only)
+              ISO_ENABLE=true; ISO_PER_SERVICE=true; CREATE_ARTIFACTS=true; RELEASE_ENABLE=false; RELEASE_PRERELEASE=false; ENABLE_TLS=true;;
+            artifacts-only)
+              ISO_ENABLE=false; ISO_PER_SERVICE=false; CREATE_ARTIFACTS=true; RELEASE_ENABLE=false; RELEASE_PRERELEASE=false; ENABLE_TLS=true;;
+            release-only)
+              ISO_ENABLE=false; ISO_PER_SERVICE=false; CREATE_ARTIFACTS=false; RELEASE_ENABLE=true; RELEASE_PRERELEASE=false; ENABLE_TLS=true;;
+            minimal|*)
+              ISO_ENABLE=false; ISO_PER_SERVICE=false; CREATE_ARTIFACTS=false; RELEASE_ENABLE=false; RELEASE_PRERELEASE=false; ENABLE_TLS=false;;
+          esac
+
+          # ===== 기본 수치/접두 =====
+          BULK_COUNT=20
+          BULK_PREFIX="${{ github.event.inputs.db_user }}_bulk"
+          ISO_BULK_DIR_COUNT=20
+          ISO_BULK_DIR_PREFIX="bundle_"
+
+          # ===== extra_json 오버라이드 =====
+          EXTRA='${{ github.event.inputs.extra_json }}'
+          parse_bool() { v="$1"; [ "$v" = "true" ] && echo true || [ "$v" = "false" ] && echo false || echo ""; }
+          if [ -n "$EXTRA" ] && [ "$EXTRA" != "null" ]; then
+            jq -e . >/dev/null 2>&1 <<<"$EXTRA" || { echo "extra_json이 올바른 JSON이 아닙니다"; exit 1; }
+
+            v=$(jq -r 'select(.iso_enable!=null)     | .iso_enable'            <<<"$EXTRA"); b=$(parse_bool "$v"); [ -n "$b" ] && ISO_ENABLE=$b
+            v=$(jq -r 'select(.iso_per_service!=null)| .iso_per_service'        <<<"$EXTRA"); b=$(parse_bool "$v"); [ -n "$b" ] && ISO_PER_SERVICE=$b
+            v=$(jq -r 'select(.create_artifacts!=null)| .create_artifacts'      <<<"$EXTRA"); b=$(parse_bool "$v"); [ -n "$b" ] && CREATE_ARTIFACTS=$b
+            v=$(jq -r 'select(.enable_tls!=null)     | .enable_tls'             <<<"$EXTRA"); b=$(parse_bool "$v"); [ -n "$b" ] && ENABLE_TLS=$b
+            v=$(jq -r 'select(.release_enable!=null) | .release_enable'         <<<"$EXTRA"); b=$(parse_bool "$v"); [ -n "$b" ] && RELEASE_ENABLE=$b
+            v=$(jq -r 'select(.release_prerelease!=null)| .release_prerelease'  <<<"$EXTRA"); b=$(parse_bool "$v"); [ -n "$b" ] && RELEASE_PRERELEASE=$b
+
+            v=$(jq -r 'select(.bulk_count!=null)         | .bulk_count'         <<<"$EXTRA"); [ "$v" != "null" ] && [ -n "$v" ] && BULK_COUNT="$v"
+            v=$(jq -r 'select(.bulk_prefix!=null)        | .bulk_prefix'        <<<"$EXTRA"); [ "$v" != "null" ] && [ -n "$v" ] && BULK_PREFIX="$v"
+            v=$(jq -r 'select(.iso_bulk_dir_count!=null) | .iso_bulk_dir_count' <<<"$EXTRA"); [ "$v" != "null" ] && [ -n "$v" ] && ISO_BULK_DIR_COUNT="$v"
+            v=$(jq -r 'select(.iso_bulk_dir_prefix!=null)| .iso_bulk_dir_prefix'<<<"$EXTRA"); [ "$v" != "null" ] && [ -n "$v" ] && ISO_BULK_DIR_PREFIX="$v"
+          fi
+
+          echo "ENABLE_TLS=${ENABLE_TLS}"                 >> $GITHUB_ENV
+          echo "CREATE_ARTIFACTS=${CREATE_ARTIFACTS}"     >> $GITHUB_ENV
+          echo "ISO_ENABLE=${ISO_ENABLE}"                 >> $GITHUB_ENV
+          echo "ISO_PER_SERVICE=${ISO_PER_SERVICE}"       >> $GITHUB_ENV
+          echo "RELEASE_ENABLE=${RELEASE_ENABLE}"         >> $GITHUB_ENV
+          echo "RELEASE_PRERELEASE=${RELEASE_PRERELEASE}" >> $GITHUB_ENV
+          echo "BULK_COUNT=${BULK_COUNT}"                 >> $GITHUB_ENV
+          echo "BULK_PREFIX=${BULK_PREFIX}"               >> $GITHUB_ENV
+          echo "ISO_BULK_DIR_COUNT=${ISO_BULK_DIR_COUNT}" >> $GITHUB_ENV
+          echo "ISO_BULK_DIR_PREFIX=${ISO_BULK_DIR_PREFIX}" >> $GITHUB_ENV
+
+          # 릴리즈 태그 계산
           if [ -z "${{ github.event.inputs.release_tag }}" ] || [ "${{ github.event.inputs.release_tag }}" = "AUTO" ]; then
             REL_TAG="vAUTO-${GITHUB_RUN_NUMBER}"
           else
             REL_TAG="${{ github.event.inputs.release_tag }}"
           fi
           echo "RELEASE_TAG=${REL_TAG}" >> $GITHUB_ENV
+
+          # 비밀 기본값
+          echo "MSSQL_SA_PASSWORD=Str0ng!Passw0rd" >> $GITHUB_ENV
 
           mkdir -p \
             .github/echo_db/{postgres,mysql,mssql,oracle,db2,common} \
@@ -171,7 +165,7 @@ jobs:
             .github/out/release_root \
             .github/out/iso
 
-      # ---------------- 공통 가이드/TLS/제품 샘플/DB 스크립트 생성 ----------------
+      # 공통 가이드/TLS(문서)
       - name: Generate common guides & TLS templates
         shell: bash
         run: |
@@ -199,6 +193,7 @@ jobs:
           * 컨테이너는 커스텀 이미지 + 인증서 바인딩 스크립트 필요
           MD
 
+      # 제품별 샘플
       - name: Generate product samples
         shell: bash
         run: |
@@ -228,6 +223,54 @@ jobs:
           - 팜 구성 계정/권한, 방화벽 예외
           MD
 
+      # Ansible/Makefile 스캐폴딩
+      - name: Generate Ansible skeleton & Makefile
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cat > .github/echo_ansible/inventory.ini <<'INV'
+          [db_local]
+          127.0.0.1 ansible_connection=local
+          INV
+          cat > .github/echo_ansible/group_vars/all.yml <<YML
+          db_name: ${DB_NAME}
+          db_user: ${DB_USER}
+          db_password: ${DB_PASSWORD}
+          grant_model: ${GRANT_MODEL}
+          target_db: ${TARGET_DB}
+          YML
+          cat > .github/echo_ansible/roles/db_tasks/tasks/main.yml <<'YML'
+          ---
+          - name: Show DB variables
+            debug:
+              msg:
+                db_name: "{{ db_name }}"
+                db_user: "{{ db_user }}"
+                grant_model: "{{ grant_model }}"
+                target_db: "{{ target_db }}"
+          - name: Display note
+            debug:
+              msg: "로컬 생성된 SQL 템플릿을 배포/적용하는 골격 예시입니다."
+          YML
+          cat > .github/echo_ansible/site.yml <<'YML'
+          ---
+          - hosts: db_local
+            gather_facts: false
+            roles:
+              - db_tasks
+          YML
+          cat > .github/echo_ansible/Makefile <<'MK'
+          .PHONY: ansible-setup ansible-run show
+          ansible-setup:
+          	python3 -m pip install --upgrade pip
+          	pip3 install ansible
+          ansible-run:
+          	ansible-playbook -i inventory.ini site.yml
+          show:
+          	@echo "DB: ${DB_NAME}, USER: ${DB_USER}, MODEL: ${GRANT_MODEL}, TARGET: ${TARGET_DB}"
+          MK
+
+      # Postgres SQL 생성(권한/대량)
       - name: Generate PostgreSQL SQL (roles/grants + bulk)
         shell: bash
         run: |
@@ -313,6 +356,7 @@ jobs:
             done
           } > .github/echo_db/postgres/99_bulk.sql
 
+      # MySQL SQL 생성(권한/대량)
       - name: Generate MySQL SQL (create/user/grants + bulk)
         shell: bash
         run: |
@@ -357,6 +401,7 @@ jobs:
             done
           } > .github/echo_db/mysql/99_bulk.sql
 
+      # MSSQL SQL 생성(권한/대량)
       - name: Generate MSSQL SQL (roles/grants + bulk)
         shell: bash
         run: |
@@ -420,6 +465,7 @@ jobs:
           GO
           SQL
 
+      # Oracle/Db2 템플릿
       - name: Generate Oracle/Db2 templates
         shell: bash
         run: |
@@ -440,7 +486,7 @@ jobs:
           GRANT CREATETAB ON DATABASE TO USER ${DB_USER};
           SQL
 
-      # ---------------- 대량 디렉토리 + ISO 생성 ----------------
+      # 릴리즈 트리 & ISO
       - name: Build release trees (bulk directories) & common README
         if: ${{ env.ISO_ENABLE == 'true' }}
         shell: bash
@@ -485,7 +531,7 @@ jobs:
           (cd "$OUT" && sha256sum *.iso > CHECKSUMS.txt)
           echo "ISO_TIME=${TS}" >> $GITHUB_ENV
 
-      # ---------------- 컨테이너 기동 ----------------
+      # 컨테이너 기동
       - name: Start PostgreSQL container
         if: ${{ env.RUN_APPLY == 'true' && (env.TARGET_DB == 'postgres' || env.TARGET_DB == 'all') }}
         shell: bash
@@ -526,14 +572,13 @@ jobs:
         run: |
           set -Eeuo pipefail
           docker run -d --name mssql -e "ACCEPT_EULA=Y" -e "MSSQL_SA_PASSWORD=${MSSQL_SA_PASSWORD}" -p 1433:1433 mcr.microsoft.com/mssql/server:2022-latest
-          # 컨테이너 내부 sqlcmd 준비 체크(경고 제거: -P 대신 환경변수)
           for i in {1..80}; do
             if docker exec -e SQLCMDPASSWORD="${MSSQL_SA_PASSWORD}" mssql /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -C -Q "SELECT 1" >/dev/null 2>&1; then break; fi
             sleep 3
           done || true
 
-      # ---------------- 실제 적용 ----------------
-      - name: Apply SQL (PostgreSQL)  # .pgpass 사용
+      # 실제 적용 (비밀번호 경고 제거: pgpass/defaults-extra-file/SQLCMDPASSWORD)
+      - name: Apply SQL (PostgreSQL)
         if: ${{ env.RUN_APPLY == 'true' && (env.TARGET_DB == 'postgres' || env.TARGET_DB == 'all') }}
         shell: bash
         run: |
@@ -541,13 +586,9 @@ jobs:
           sudo apt-get update && sudo apt-get install -y postgresql-client gettext-base
           umask 077
           printf "127.0.0.1:5432:*:postgres:postgres\n" > ~/.pgpass
-
-          # 기준 DB 생성
           if ! psql -h 127.0.0.1 -U postgres -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname='${DB_NAME}'" | grep -q 1; then
             createdb -h 127.0.0.1 -p 5432 -U postgres "${DB_NAME}"
           fi
-
-          # 권한/스키마/모델
           envsubst < .github/echo_db/postgres/01_roles.sql         | psql -h 127.0.0.1 -U postgres -d "${DB_NAME}" -v ON_ERROR_STOP=1
           envsubst < .github/echo_db/postgres/02_schema_grants.sql | psql -h 127.0.0.1 -U postgres -d "${DB_NAME}" -v ON_ERROR_STOP=1
           if [ "${GRANT_MODEL}" = "strict" ]; then
@@ -555,19 +596,15 @@ jobs:
           else
             psql -h 127.0.0.1 -U postgres -d "${DB_NAME}" -v ON_ERROR_STOP=1 -f .github/echo_db/postgres/03_model_basic.sql
           fi
-
-          # 대량 DB 생성
           for i in $(seq -w 1 ${BULK_COUNT}); do
             db="${DB_NAME}_${i}"
             if ! psql -h 127.0.0.1 -U postgres -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname='${db}'" | grep -q 1; then
               createdb -h 127.0.0.1 -p 5432 -U postgres "${db}"
             fi
           done
-
-          # 대량 유저/권한/테이블
           envsubst < .github/echo_db/postgres/99_bulk.sql | psql -h 127.0.0.1 -U postgres -d postgres -v ON_ERROR_STOP=1
 
-      - name: Apply SQL (MySQL) + Bulk  # defaults-extra-file 사용
+      - name: Apply SQL (MySQL) + Bulk
         if: ${{ env.RUN_APPLY == 'true' && (env.TARGET_DB == 'mysql' || env.TARGET_DB == 'all') }}
         shell: bash
         run: |
@@ -587,7 +624,7 @@ jobs:
           envsubst < .github/echo_db/mysql/99_bulk.sql | mysql --defaults-extra-file=.github/secure/mysql.cnf
           shred -u .github/secure/mysql.cnf || rm -f .github/secure/mysql.cnf
 
-      - name: Apply SQL (MSSQL) + Bulk (sqlcmd)  # SQLCMDPASSWORD 사용
+      - name: Apply SQL (MSSQL) + Bulk (sqlcmd)
         if: ${{ env.RUN_APPLY == 'true' && (env.TARGET_DB == 'mssql' || env.TARGET_DB == 'all') }}
         shell: bash
         run: |
@@ -600,12 +637,10 @@ jobs:
           sudo ACCEPT_EULA=Y apt-get install -y msodbcsql18 mssql-tools18
           export PATH="$PATH:/opt/mssql-tools18/bin"
           export SQLCMDPASSWORD="${MSSQL_SA_PASSWORD}"
-
           for i in {1..60}; do
             if sqlcmd -S 127.0.0.1 -U sa -C -Q "SELECT 1" >/dev/null 2>&1; then break; fi
             sleep 3
           done
-
           envsubst < .github/echo_db/mssql/00_create_db.sql        | sqlcmd -S 127.0.0.1 -U sa -C
           envsubst < .github/echo_db/mssql/01_roles.sql            | sqlcmd -S 127.0.0.1 -U sa -C
           envsubst < .github/echo_db/mssql/02_user_and_grants.sql  | sqlcmd -S 127.0.0.1 -U sa -C
@@ -616,7 +651,7 @@ jobs:
           fi
           envsubst < .github/echo_db/mssql/99_bulk.sql | sqlcmd -S 127.0.0.1 -U sa -C
 
-      # ---------------- 산출물 업로드 + Release ----------------
+      # 산출물 업로드
       - name: Upload artifacts (scripts & samples & ansible)
         if: ${{ env.CREATE_ARTIFACTS == 'true' }}
         uses: actions/upload-artifact@v4
@@ -634,6 +669,7 @@ jobs:
           name: iso-images
           path: .github/out/iso/*
 
+      # GitHub Release
       - name: Create GitHub Release (tag & upload ISOs)
         if: ${{ env.RELEASE_ENABLE == 'true' && env.ISO_ENABLE == 'true' }}
         uses: softprops/action-gh-release@v2
