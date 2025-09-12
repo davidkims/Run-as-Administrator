@@ -63,49 +63,6 @@ jobs:
   db-fullops:
     runs-on: ubuntu-latest
 
-    services:
-      postgres:
-        if: ${{ github.event.inputs.run_apply == 'true' && github.event.inputs.target_db == 'postgres' }}
-        image: postgres:16
-        env:
-          POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: postgres
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd="pg_isready -U postgres"
-          --health-interval=10s
-          --health-timeout=5s
-          --health-retries=10
-
-      mysql:
-        if: ${{ github.event.inputs.run_apply == 'true' && github.event.inputs.target_db == 'mysql' }}
-        image: mysql:8
-        env:
-          MYSQL_ROOT_PASSWORD: root
-        ports:
-          - 3306:3306
-        options: >-
-          --health-cmd="mysqladmin ping -proot --silent"
-          --health-interval=10s
-          --health-timeout=5s
-          --health-retries=10
-
-      # MSSQL은 적용 비활성(권한 파일만 생성). 적용 원하시면 아래 주석 해제 및 단계 추가 필요.
-      # mssql:
-      #   if: ${{ github.event.inputs.run_apply == 'true' && github.event.inputs.target_db == 'mssql' }}
-      #   image: mcr.microsoft.com/mssql/server:2022-latest
-      #   env:
-      #     ACCEPT_EULA: "Y"
-      #     SA_PASSWORD: "Str0ng!Passw0rd"
-      #   ports:
-      #     - 1433:1433
-      #   options: >-
-      #     --health-cmd="/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P 'Str0ng!Passw0rd' -C -Q 'SELECT 1' || exit 1"
-      #     --health-interval=15s
-      #     --health-timeout=10s
-      #     --health-retries=20
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -187,66 +144,64 @@ jobs:
           - 팜 구성 계정/권한 준비, 방화벽 예외
           MD
 
-      # 3) 권한 파일 — PostgreSQL
+      # 3) 권한 파일 — PostgreSQL (템플릿; envsubst로 치환 적용)
       - name: Generate PostgreSQL SQL (create/roles/grants)
         shell: bash
         run: |
           set -Eeuo pipefail
-          cat > .github/echo_db/postgres/00_create_db.sql <<'SQL'
-          DO $$
-          BEGIN
-            IF NOT EXISTS (SELECT FROM pg_database WHERE datname = :'DB_NAME') THEN
-              PERFORM dblink_exec('dbname=postgres', 'CREATE DATABASE ' || quote_ident(:'DB_NAME'));
-            END IF;
-          END$$;
-          SQL
-
           cat > .github/echo_db/postgres/01_roles.sql <<'SQL'
           -- 사용자/역할 생성
-          CREATE ROLE :"DB_USER" LOGIN PASSWORD :'DB_PASSWORD';
+          DO $$
+          BEGIN
+            IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='${DB_USER}') THEN
+              EXECUTE format('CREATE ROLE %I LOGIN PASSWORD %L', '${DB_USER}', '${DB_PASSWORD}');
+            END IF;
+          END$$;
+
           -- 최소 권한 롤(읽기/쓰기) 분리
           DO $$
           BEGIN
             IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='app_read') THEN CREATE ROLE app_read NOLOGIN; END IF;
             IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='app_write') THEN CREATE ROLE app_write NOLOGIN; END IF;
           END$$;
-          GRANT app_read TO :"DB_USER";
-          GRANT app_write TO :"DB_USER";
+
+          GRANT app_read TO "${DB_USER}";
+          GRANT app_write TO "${DB_USER}";
           SQL
 
           cat > .github/echo_db/postgres/02_schema_grants.sql <<'SQL'
-          \connect :"DB_NAME";
-          CREATE SCHEMA IF NOT EXISTS public AUTHORIZATION :"DB_USER";
-          -- 추가 스키마(선택)
-          -- CREATE SCHEMA IF NOT EXISTS :"EXTRA_SCHEMA" AUTHORIZATION :"DB_USER";
+          -- 기본 스키마 소유자 지정
+          ALTER SCHEMA public OWNER TO "${DB_USER}";
+
+          -- 추가 스키마(선택) — 값이 있으면 수동 적용 권장:
+          -- CREATE SCHEMA IF NOT EXISTS "${EXTRA_SCHEMA}" AUTHORIZATION "${DB_USER}";
+
+          -- 기본 권한 템플릿
           ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO app_read;
           ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT,INSERT,UPDATE,DELETE ON TABLES TO app_write;
           SQL
 
           cat > .github/echo_db/postgres/03_model_strict.sql <<'SQL'
-          -- strict 모델: 테이블별 명시적 권한만 부여(샘플)
-          -- 예시 테이블
+          -- strict: 테이블 개별 권한
           CREATE TABLE IF NOT EXISTS public.process_instance(
             id BIGSERIAL PRIMARY KEY,
             status TEXT NOT NULL,
             assignee TEXT,
             created_at TIMESTAMPTZ DEFAULT now()
           );
-
           REVOKE ALL ON public.process_instance FROM PUBLIC;
           GRANT SELECT ON public.process_instance TO app_read;
           GRANT SELECT,INSERT,UPDATE,DELETE ON public.process_instance TO app_write;
           SQL
 
           cat > .github/echo_db/postgres/03_model_basic.sql <<'SQL'
-          -- basic 모델: 스키마 단위로 일괄 권한
-          ALTER SCHEMA public OWNER TO :"DB_USER";
+          -- basic: 스키마 단위 일괄 권한
           GRANT USAGE ON SCHEMA public TO app_read, app_write;
           GRANT SELECT ON ALL TABLES IN SCHEMA public TO app_read;
           GRANT SELECT,INSERT,UPDATE,DELETE ON ALL TABLES IN SCHEMA public TO app_write;
           SQL
 
-      # 4) 권한 파일 — MySQL
+      # 4) 권한 파일 — MySQL (템플릿; envsubst로 치환 적용)
       - name: Generate MySQL SQL (create/user/grants)
         shell: bash
         run: |
@@ -267,7 +222,7 @@ jobs:
           SQL
 
           cat > .github/echo_db/mysql/02_grants_strict.sql <<'SQL'
-          -- strict: 테이블 생성 후 테이블 단위 부여(샘플)
+          -- strict: 테이블 생성 후 테이블 단위 권한
           USE `${DB_NAME}`;
           CREATE TABLE IF NOT EXISTS process_instance(
             id BIGINT PRIMARY KEY AUTO_INCREMENT,
@@ -281,7 +236,7 @@ jobs:
           FLUSH PRIVILEGES;
           SQL
 
-      # 5) 권한 파일 — MSSQL (생성만)
+      # 5) 권한 파일 — MSSQL (생성만; 적용은 별도)
       - name: Generate MSSQL SQL (create/login/grants) - files only
         shell: bash
         run: |
@@ -296,7 +251,8 @@ jobs:
           USE [${DB_NAME}];
           IF NOT EXISTS (SELECT 1 FROM sys.sql_logins WHERE name = N'${DB_USER}')
             CREATE LOGIN [${DB_USER}] WITH PASSWORD=N'${DB_PASSWORD}', CHECK_POLICY=ON;
-          CREATE USER [${DB_USER}] FOR LOGIN [${DB_USER}];
+          IF NOT EXISTS (SELECT 1 FROM sys.database_principals WHERE name = N'${DB_USER}')
+            CREATE USER [${DB_USER}] FOR LOGIN [${DB_USER}];
           SQL
 
           cat > .github/echo_db/mssql/02_grants_basic.sql <<'SQL'
@@ -319,49 +275,85 @@ jobs:
           GRANT INSERT, UPDATE, DELETE ON dbo.process_instance TO [${DB_USER}];
           SQL
 
-      # 6) 실제 적용 (postgres/mysql만)
+      # 6) (선택) DB 컨테이너 기동 — PostgreSQL
+      - name: Start PostgreSQL container (conditional)
+        if: ${{ env.RUN_APPLY == 'true' && env.TARGET_DB == 'postgres' }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          docker run -d --name pg -e POSTGRES_PASSWORD=postgres -p 5432:5432 postgres:16
+          # 대기
+          for i in {1..30}; do
+            if docker exec pg pg_isready -U postgres >/dev/null 2>&1; then break; fi
+            sleep 2
+          done
+          docker exec pg pg_isready -U postgres
+
+      # 7) (선택) DB 컨테이너 기동 — MySQL
+      - name: Start MySQL container (conditional)
+        if: ${{ env.RUN_APPLY == 'true' && env.TARGET_DB == 'mysql' }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          docker run -d --name mysqldb -e MYSQL_ROOT_PASSWORD=root -p 3306:3306 mysql:8
+          # 대기
+          for i in {1..40}; do
+            if docker exec mysqldb mysqladmin ping -proot --silent >/dev/null 2>&1; then break; fi
+            sleep 3
+          done
+          docker exec mysqldb mysqladmin ping -proot --silent
+
+      # 8) 실제 적용 (PostgreSQL)
       - name: Apply SQL (PostgreSQL)
         if: ${{ env.RUN_APPLY == 'true' && env.TARGET_DB == 'postgres' }}
         shell: bash
         run: |
           set -Eeuo pipefail
-          sudo apt-get update && sudo apt-get install -y postgresql-client
+          sudo apt-get update && sudo apt-get install -y postgresql-client gettext-base
+
           export PGPASSWORD=postgres
-          psql -h localhost -U postgres -p 5432 -d postgres -v ON_ERROR_STOP=1 \
-            -v DB_NAME="${DB_NAME}" -v DB_USER="${DB_USER}" -v DB_PASSWORD="${DB_PASSWORD}" -f .github/echo_db/postgres/00_create_db.sql
 
-          # DB 내부 적용
-          psql -h localhost -U postgres -p 5432 -d "${DB_NAME}" -v ON_ERROR_STOP=1 \
-            -v DB_NAME="${DB_NAME}" -v DB_USER="${DB_USER}" -v DB_PASSWORD="${DB_PASSWORD}" -f .github/echo_db/postgres/01_roles.sql
-
-          psql -h localhost -U postgres -p 5432 -d "${DB_NAME}" -v ON_ERROR_STOP=1 \
-            -v DB_NAME="${DB_NAME}" -v DB_USER="${DB_USER}" -v EXTRA_SCHEMA="${EXTRA_SCHEMA}" -f .github/echo_db/postgres/02_schema_grants.sql
-
-          if [ "${GRANT_MODEL}" = "strict" ]; then
-            psql -h localhost -U postgres -p 5432 -d "${DB_NAME}" -v ON_ERROR_STOP=1 -f .github/echo_db/postgres/03_model_strict.sql
-          else
-            psql -h localhost -U postgres -p 5432 -d "${DB_NAME}" -v ON_ERROR_STOP=1 -f .github/echo_db/postgres/03_model_basic.sql
+          # DB 없으면 생성
+          if ! psql -h 127.0.0.1 -U postgres -d postgres -tc "SELECT 1 FROM pg_database WHERE datname='${DB_NAME}'" | grep -q 1; then
+            psql -h 127.0.0.1 -U postgres -d postgres -c "CREATE DATABASE \"${DB_NAME}\""
           fi
 
+          # 역할/권한 적용 (템플릿 -> envsubst -> psql)
+          envsubst < .github/echo_db/postgres/01_roles.sql \
+            | psql -h 127.0.0.1 -U postgres -d "${DB_NAME}" -v ON_ERROR_STOP=1
+
+          envsubst < .github/echo_db/postgres/02_schema_grants.sql \
+            | psql -h 127.0.0.1 -U postgres -d "${DB_NAME}" -v ON_ERROR_STOP=1
+
+          if [ "${GRANT_MODEL}" = "strict" ]; then
+            psql -h 127.0.0.1 -U postgres -d "${DB_NAME}" -v ON_ERROR_STOP=1 -f .github/echo_db/postgres/03_model_strict.sql
+          else
+            psql -h 127.0.0.1 -U postgres -d "${DB_NAME}" -v ON_ERROR_STOP=1 -f .github/echo_db/postgres/03_model_basic.sql
+          fi
+
+      # 9) 실제 적용 (MySQL)
       - name: Apply SQL (MySQL)
         if: ${{ env.RUN_APPLY == 'true' && env.TARGET_DB == 'mysql' }}
         shell: bash
         run: |
           set -Eeuo pipefail
-          sudo apt-get update && sudo apt-get install -y mysql-client
+          sudo apt-get update && sudo apt-get install -y mysql-client gettext-base
 
-          mysql -h 127.0.0.1 -P 3306 -uroot -proot < .github/echo_db/mysql/00_create_db.sql
-          DBVARS=$(envsubst < .github/echo_db/mysql/01_user.sql)
-          echo "$DBVARS" | mysql -h 127.0.0.1 -P 3306 -uroot -proot
+          envsubst < .github/echo_db/mysql/00_create_db.sql \
+            | mysql -h 127.0.0.1 -P 3306 -uroot -proot
+
+          envsubst < .github/echo_db/mysql/01_user.sql \
+            | mysql -h 127.0.0.1 -P 3306 -uroot -proot
 
           if [ "${GRANT_MODEL}" = "strict" ]; then
-            DBVARS=$(envsubst < .github/echo_db/mysql/02_grants_strict.sql)
+            envsubst < .github/echo_db/mysql/02_grants_strict.sql \
+              | mysql -h 127.0.0.1 -P 3306 -uroot -proot
           else
-            DBVARS=$(envsubst < .github/echo_db/mysql/02_grants_basic.sql)
+            envsubst < .github/echo_db/mysql/02_grants_basic.sql \
+              | mysql -h 127.0.0.1 -P 3306 -uroot -proot
           fi
-          echo "$DBVARS" | mysql -h 127.0.0.1 -P 3306 -uroot -proot
 
-      # 7) 산출물 업로드
+      # 10) 산출물 업로드
       - name: Upload artifacts
         if: ${{ env.CREATE_ARTIFACTS == 'true' }}
         uses: actions/upload-artifact@v4
