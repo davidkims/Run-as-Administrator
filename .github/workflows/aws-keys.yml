@@ -1,4 +1,4 @@
-name: "🗄️ Workflow DB FullOps (권한 파일 생성+적용+제품별 샘플)"
+name: "🗄️ Workflow DB FullOps (권한/대량생성+적용+TLS템플릿+Oracle/Db2+Ansible/Makefile)"
 
 on:
   workflow_dispatch:
@@ -38,13 +38,13 @@ on:
         default: "strict"
         options: ["strict", "basic"]
       enable_tls:
-        description: "TLS 가이드 파일 포함"
+        description: "TLS 가이드/템플릿 포함"
         type: choice
         required: true
         default: "true"
         options: ["true", "false"]
       create_artifacts:
-        description: "생성 산출물(권한 SQL/샘플설정) 아티팩트 업로드"
+        description: "생성 산출물(권한/대량/샘플/Ansible/Makefile) 업로드"
         type: choice
         required: true
         default: "true"
@@ -67,7 +67,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Prepare variables
+      # --- 시스템 업그레이드 (Upgrade) ---
+      - name: System upgrade (apt-get)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get -y upgrade
+          sudo apt-get -y install gettext-base jq
+
+      - name: Prepare variables & dirs
         id: prep
         shell: bash
         run: |
@@ -82,43 +91,62 @@ jobs:
           echo "ENABLE_TLS=${{ github.event.inputs.enable_tls }}" >> $GITHUB_ENV
           echo "CREATE_ARTIFACTS=${{ github.event.inputs.create_artifacts }}" >> $GITHUB_ENV
           echo "RUN_APPLY=${{ github.event.inputs.run_apply }}" >> $GITHUB_ENV
-          # MSSQL SA 패스워드(컨테이너 내부용 고정값)
+          # 내부 상수
           echo "MSSQL_SA_PASSWORD=Str0ng!Passw0rd" >> $GITHUB_ENV
-          mkdir -p .github/echo_db/{postgres,mysql,mssql,common} .github/echo_products/{airflow,n8n,ibm-baw,sharepoint-wfm}
+          echo "BULK_COUNT=20" >> $GITHUB_ENV
+          echo "BULK_PREFIX=${{ github.event.inputs.db_user }}_bulk" >> $GITHUB_ENV
 
-      # 1) 공통 가이드
-      - name: Generate common guides
+          mkdir -p \
+            .github/echo_db/{postgres,mysql,mssql,oracle,db2,common} \
+            .github/echo_products/{airflow,n8n,ibm-baw,sharepoint-wfm} \
+            .github/echo_ansible/group_vars \
+            .github/echo_ansible/roles/db_tasks/templates
+
+      # --- 공통 보안/TLS & 백업/DR & TLS 템플릿 ---
+      - name: Generate common guides & TLS templates
         shell: bash
         run: |
           set -Eeuo pipefail
           cat > .github/echo_db/common/SECURITY_TLS_GUIDE.md <<'MD'
-          # DB 보안/TLS 가이드 (요약)
-          - 서버 측 TLS 인증서, 클라이언트 인증(필요 시) 구성
-          - 최소 권한 원칙(Role/Grant), 비밀번호 금고(Vault/KeyVault)
-          - 감사 로그 활성화, 로테이션, 보관 정책
-          - 백업/DR: 정기 백업 + 복구 리허설, PITR(Postgres) 등
+          # 보안/TLS 요약
+          - TLS 강제(서버 인증서), 최소권한(ROLE/GRANT), 비밀관리(Vault/KeyVault)
+          - 감사 로깅/로테이션, 백업/DR(PITR/스냅샷), 정기 복구 리허설
           MD
 
           cat > .github/echo_db/common/BACKUP_DR_CHECKLIST.md <<'MD'
           # 백업/DR 체크리스트
-          - 전체/증분 백업 주기, 점검 절차
-          - 복구 목표(RPO/RTO) 정의 및 리허설
-          - 레플리케이션/HA 구성(AG/Patroni/InnoDB Cluster 등)
-          - 스냅샷/아카이브 보관 기간 및 접근통제
+          - 전체/증분, RPO/RTO, DR Runbook
+          - 레플리카/클러스터(AG/Patroni/InnoDB Cluster 등) + 모니터링/알람
           MD
 
-      # 2) 제품별 샘플
+          # MSSQL TLS 클라이언트/서버 템플릿(가이드/예시)
+          cat > .github/echo_db/mssql/TLS_CLIENT_CONNECTION_EXAMPLES.md <<'MD'
+          ## MSSQL TLS 클라이언트 연결 예시
+          - sqlcmd(OLE DB 18+): sqlcmd -S host,1433 -U user -P 'pw' -C -Q "SELECT 1"
+          - JDBC: jdbc:sqlserver://host:1433;databaseName=appdb;encrypt=true;trustServerCertificate=false;hostNameInCertificate=CN=db.example.com;
+          - ODBC: Encrypt=Yes;TrustServerCertificate=No;HostNameInCertificate=CN=db.example.com;
+          > 실제 서버 TLS 활성화는 서버 인증서 설치/바인딩 필요(운영 정책에 맞게 적용).
+          MD
+
+          cat > .github/echo_db/mssql/TLS_SERVER_ENABLE_GUIDE.md <<'MD'
+          # MSSQL TLS 서버 활성화 가이드(개요)
+          1) 조직 CA 또는 공인CA 인증서(.pfx/.pem) 준비(서버 FQDN 포함)
+          2) 윈도우/리눅스별 SQL Server에 인증서 등록/바인딩
+          3) force encryption=on 정책/포트 방화벽 예외
+          4) 클라이언트는 encrypt=true, trustServerCertificate=false, hostNameInCertificate 일치 필요
+          * 컨테이너 환경은 커스텀 이미지와 mssql.conf/openssl 설치 후 바인딩 스크립트 사용
+          MD
+
+      # --- 제품별 샘플 ---
       - name: Generate product samples
         shell: bash
         run: |
           set -Eeuo pipefail
-          # Airflow
           cat > .github/echo_products/airflow/ENV.sample <<'ENV'
           AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:pw@db:5432/airflow
-          # airflow db init 후 webserver/scheduler 실행
+          # airflow db init && airflow webserver
           ENV
 
-          # n8n
           cat > .github/echo_products/n8n/ENV.sample <<'ENV'
           DB_TYPE=postgresdb
           DB_POSTGRESDB_HOST=db
@@ -128,24 +156,22 @@ jobs:
           DB_POSTGRESDB_PASSWORD=strong_pw
           ENV
 
-          # IBM BAW
           cat > .github/echo_products/ibm-baw/JDBC.sample.properties <<'PROPS'
           db.type=postgres
           db.url=jdbc:postgresql://db.example.com:5432/bawdb?sslmode=require
           db.user=baw
           db.password=*****
-          # BAW: Process/PDW/Common DB 분리(단, Postgres는 Common DB 제외 구성)
+          # BAW: Process/PDW/Common DB 분리(단, Postgres는 Common DB 제외)
           PROPS
 
-          # SharePoint Workflow Manager
           cat > .github/echo_products/sharepoint-wfm/SETUP_CHECKLIST.md <<'MD'
-          - SQL Server: TCP/IP 활성화(1433), SQL Browser 실행
-          - Azure Service Fabric Runtime 설치(권장 최신)
-          - 팜 구성 계정/권한 준비, 방화벽 예외
+          - SQL Server: TCP/IP(1433) 활성, SQL Browser 실행
+          - Azure Service Fabric Runtime 설치
+          - 팜 구성 계정/권한, 방화벽 예외
           MD
 
-      # 3) 권한 템플릿 — PostgreSQL
-      - name: Generate PostgreSQL SQL (create/roles/grants)
+      # --- PostgreSQL 권한 템플릿 ---
+      - name: Generate PostgreSQL SQL (roles/grants)
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -169,7 +195,6 @@ jobs:
 
           cat > .github/echo_db/postgres/02_schema_grants.sql <<'SQL'
           ALTER SCHEMA public OWNER TO "${DB_USER}";
-          -- 추가 스키마 필요 시 수동 적용:
           -- CREATE SCHEMA IF NOT EXISTS "${EXTRA_SCHEMA}" AUTHORIZATION "${DB_USER}";
           ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO app_read;
           ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT,INSERT,UPDATE,DELETE ON TABLES TO app_write;
@@ -193,8 +218,8 @@ jobs:
           GRANT SELECT,INSERT,UPDATE,DELETE ON ALL TABLES IN SCHEMA public TO app_write;
           SQL
 
-      # 4) 권한 템플릿 — MySQL
-      - name: Generate MySQL SQL (create/user/grants)
+      # --- MySQL 권한 + 대량 생성 템플릿 ---
+      - name: Generate MySQL SQL (create/user/grants + bulk)
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -227,8 +252,25 @@ jobs:
           FLUSH PRIVILEGES;
           SQL
 
-      # 5) 권한 템플릿 — MSSQL
-      - name: Generate MSSQL SQL (create/login/grants)
+          # 대량 생성(샘플: 사용자/DB N개)
+          {
+            echo "/* BULK CREATE (users/db) generated */"
+            echo "SET @i := 1;"
+            echo "WHILE @i <= ${BULK_COUNT} DO"
+            echo "  SET @uname := '${BULK_PREFIX}' + LPAD(@i, 2, '0');"
+            echo "  SET @db := CONCAT('${DB_NAME}_', LPAD(@i, 2, '0'));"
+            echo "  SET @sql := CONCAT('CREATE DATABASE IF NOT EXISTS `', @db, '` CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;');"
+            echo "  PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;"
+            echo "  SET @sql := CONCAT('CREATE USER IF NOT EXISTS ''', @uname, '''@''%'' IDENTIFIED BY ''${DB_PASSWORD}'';');"
+            echo "  PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;"
+            echo "  SET @sql := CONCAT('GRANT SELECT,INSERT,UPDATE,DELETE ON `', @db, '`.* TO ''', @uname, '''@''%''; FLUSH PRIVILEGES;');"
+            echo "  PREPARE s FROM @sql; EXECUTE s; DEALLOCATE PREPARE s;"
+            echo "  SET @i := @i + 1;"
+            echo "END WHILE;"
+          } > .github/echo_db/mysql/99_bulk.sql
+
+      # --- MSSQL 권한 + 전용 롤 + 대량 생성 템플릿 + TLS 예시 ---
+      - name: Generate MSSQL SQL (roles/grants + bulk + TLS conn templates)
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -238,21 +280,23 @@ jobs:
           GO
           SQL
 
-          cat > .github/echo_db/mssql/01_user.sql <<'SQL'
+          cat > .github/echo_db/mssql/01_roles.sql <<'SQL'
+          USE [${DB_NAME}];
+          IF NOT EXISTS (SELECT 1 FROM sys.database_principals WHERE name=N'app_read') CREATE ROLE app_read AUTHORIZATION dbo;
+          IF NOT EXISTS (SELECT 1 FROM sys.database_principals WHERE name=N'app_write') CREATE ROLE app_write AUTHORIZATION dbo;
+          SQL
+
+          cat > .github/echo_db/mssql/02_user_and_grants.sql <<'SQL'
           USE [${DB_NAME}];
           IF NOT EXISTS (SELECT 1 FROM sys.sql_logins WHERE name = N'${DB_USER}')
             CREATE LOGIN [${DB_USER}] WITH PASSWORD=N'${DB_PASSWORD}', CHECK_POLICY=ON;
           IF NOT EXISTS (SELECT 1 FROM sys.database_principals WHERE name = N'${DB_USER}')
             CREATE USER [${DB_USER}] FOR LOGIN [${DB_USER}];
+          EXEC sp_addrolemember N'app_read',  N'${DB_USER}';
+          EXEC sp_addrolemember N'app_write', N'${DB_USER}';
           SQL
 
-          cat > .github/echo_db/mssql/02_grants_basic.sql <<'SQL'
-          USE [${DB_NAME}];
-          EXEC sp_addrolemember N'db_datareader', N'${DB_USER}';
-          EXEC sp_addrolemember N'db_datawriter', N'${DB_USER}';
-          SQL
-
-          cat > .github/echo_db/mssql/02_grants_strict.sql <<'SQL'
+          cat > .github/echo_db/mssql/03_model_strict.sql <<'SQL'
           USE [${DB_NAME}];
           IF OBJECT_ID('dbo.process_instance','U') IS NULL
             CREATE TABLE dbo.process_instance(
@@ -261,13 +305,133 @@ jobs:
               assignee NVARCHAR(128),
               created_at DATETIME2 DEFAULT SYSUTCDATETIME()
             );
-          REVOKE SELECT, INSERT, UPDATE, DELETE ON dbo.process_instance FROM [${DB_USER}];
-          GRANT SELECT ON dbo.process_instance TO [${DB_USER}];
-          GRANT INSERT, UPDATE, DELETE ON dbo.process_instance TO [${DB_USER}];
+          DENY SELECT, INSERT, UPDATE, DELETE ON dbo.process_instance TO PUBLIC;
+          GRANT SELECT ON dbo.process_instance TO app_read;
+          GRANT SELECT, INSERT, UPDATE, DELETE ON dbo.process_instance TO app_write;
           SQL
 
-      # 6) (선택) PostgreSQL 컨테이너 기동
-      - name: Start PostgreSQL container (conditional)
+          cat > .github/echo_db/mssql/03_model_basic.sql <<'SQL'
+          USE [${DB_NAME}];
+          -- 스키마 단위 부여(샘플, 실제 운영 정책에 맞춤)
+          EXEC sp_addrolemember N'app_read',  N'${DB_USER}';
+          EXEC sp_addrolemember N'app_write', N'${DB_USER}';
+          SQL
+
+          # 대량 생성(샘플: 사용자/DB N개)
+          cat > .github/echo_db/mssql/99_bulk.sql <<'SQL'
+          DECLARE @i INT = 1;
+          WHILE @i <= ${BULK_COUNT}
+          BEGIN
+            DECLARE @uname SYSNAME = CONCAT('${BULK_PREFIX}', RIGHT(CONCAT('0', @i), 2));
+            DECLARE @db SYSNAME = CONCAT('${DB_NAME}_', RIGHT(CONCAT('0', @i), 2));
+            IF DB_ID(@db) IS NULL
+              EXEC('CREATE DATABASE [' + @db + '];');
+            IF NOT EXISTS (SELECT 1 FROM sys.sql_logins WHERE name=@uname)
+              EXEC('CREATE LOGIN [' + @uname + '] WITH PASSWORD=N''${DB_PASSWORD}'', CHECK_POLICY=ON;');
+            DECLARE @sql NVARCHAR(MAX) = N'USE [' + @db + ']; ' +
+              N'IF NOT EXISTS (SELECT 1 FROM sys.database_principals WHERE name=N''' + @uname + ''') CREATE USER [' + @uname + '] FOR LOGIN [' + @uname + ']; ' +
+              N'IF NOT EXISTS (SELECT 1 FROM sys.database_principals WHERE name=N''app_read'')  CREATE ROLE app_read AUTHORIZATION dbo; ' +
+              N'IF NOT EXISTS (SELECT 1 FROM sys.database_principals WHERE name=N''app_write'') CREATE ROLE app_write AUTHORIZATION dbo; ' +
+              N'EXEC sp_addrolemember N''app_read'',  N''' + @uname + N'''; ' +
+              N'EXEC sp_addrolemember N''app_write'', N''' + @uname + N'''; ';
+            EXEC sp_executesql @sql;
+            SET @i += 1;
+          END
+          GO
+          SQL
+
+          # TLS 연결 샘플(클라이언트) 추가
+          cat > .github/echo_db/mssql/JDBC_TLS.sample <<'CONF'
+          jdbc:sqlserver://db.example.com:1433;databaseName=${DB_NAME};encrypt=true;trustServerCertificate=false;hostNameInCertificate=CN=db.example.com;
+          CONF
+
+      # --- Oracle/Db2 스크립트(템플릿만) ---
+      - name: Generate Oracle/Db2 templates (create user/roles/grants)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          # Oracle (sqlplus용 템플릿)
+          cat > .github/echo_db/oracle/create_user.sql <<'SQL'
+          -- 접속: sqlplus sys/*****@//host:1521/ORCLPDB1 as sysdba
+          CREATE USER ${DB_USER} IDENTIFIED BY "${DB_PASSWORD}"
+            DEFAULT TABLESPACE USERS TEMPORARY TABLESPACE TEMP QUOTA UNLIMITED ON USERS;
+          GRANT CREATE SESSION TO ${DB_USER};
+          GRANT CONNECT, RESOURCE TO ${DB_USER};
+          -- 최소 권한 정책에 맞춰 필요한 권한만 선별 부여 권장
+          SQL
+
+          cat > .github/echo_db/oracle/grants_basic.sql <<'SQL'
+          -- 예: 스키마/오브젝트 권한 샘플
+          GRANT SELECT, INSERT, UPDATE, DELETE ON ${DB_USER}.PROCESS_INSTANCE TO ${DB_USER};
+          SQL
+
+          # Db2 (CLP 템플릿)
+          cat > .github/echo_db/db2/create_user.sql <<'SQL'
+          -- db2 connect to ${DB_NAME} user db2inst1 using ******
+          -- OS/LDAP 사용자 기반 DB2 권장. 예시는 DB 권한 부여 샘플.
+          GRANT CONNECT ON DATABASE TO USER ${DB_USER};
+          GRANT CREATETAB ON DATABASE TO USER ${DB_USER};
+          SQL
+
+      # --- Ansible 플레이북 & Makefile 동시 생성 ---
+      - name: Generate Ansible playbook & Makefile
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          # inventory
+          cat > .github/echo_ansible/inventory.ini <<'INV'
+          [db_local]
+          127.0.0.1 ansible_connection=local
+          INV
+
+          # vars
+          cat > .github/echo_ansible/group_vars/all.yml <<'YML'
+          db_name: ${DB_NAME}
+          db_user: ${DB_USER}
+          db_password: ${DB_PASSWORD}
+          grant_model: ${GRANT_MODEL}
+          target_db: ${TARGET_DB}
+          YML
+
+          # tasks
+          cat > .github/echo_ansible/roles/db_tasks/tasks/main.yml <<'YML'
+          ---
+          - name: Show DB variables
+            debug:
+              msg:
+                db_name: "{{ db_name }}"
+                db_user: "{{ db_user }}"
+                grant_model: "{{ grant_model }}"
+                target_db: "{{ target_db }}"
+
+          - name: Display note
+            debug:
+              msg: "이 역할은 로컬 생성된 SQL 템플릿을 배포/적용하는 골격 예시입니다."
+          YML
+
+          # site playbook
+          cat > .github/echo_ansible/site.yml <<'YML'
+          ---
+          - hosts: db_local
+            gather_facts: false
+            roles:
+              - db_tasks
+          YML
+
+          # Makefile
+          cat > .github/echo_ansible/Makefile <<'MK'
+          .PHONY: ansible-setup ansible-run show
+          ansible-setup:
+          	python3 -m pip install --upgrade pip
+          	pip3 install ansible
+          ansible-run:
+          	ansible-playbook -i inventory.ini site.yml
+          show:
+          	@echo "DB: ${DB_NAME}, USER: ${DB_USER}, MODEL: ${GRANT_MODEL}, TARGET: ${TARGET_DB}"
+          MK
+
+      # --- 컨테이너 기동 (조건부) ---
+      - name: Start PostgreSQL container
         if: ${{ env.RUN_APPLY == 'true' && env.TARGET_DB == 'postgres' }}
         shell: bash
         run: |
@@ -279,35 +443,29 @@ jobs:
           done
           docker exec pg pg_isready -U postgres
 
-      # 7) (선택) MySQL 컨테이너 기동 — 안정화(필수 대기/재시도 강화)
-      - name: Start MySQL container (conditional)
+      - name: Start MySQL container
         if: ${{ env.RUN_APPLY == 'true' && env.TARGET_DB == 'mysql' }}
         shell: bash
         run: |
           set -Eeuo pipefail
           docker run -d --name mysqldb -e MYSQL_ROOT_PASSWORD=root -p 3306:3306 mysql:8
-          # 초기화 시간이 긴 경우가 있어 충분히 대기/재시도
           for i in {1..60}; do
             if docker exec mysqldb mysqladmin ping -proot --silent >/dev/null 2>&1; then break; fi
             sleep 3
           done
-          docker exec mysqldb mysqladmin ping -proot --silent
 
-      # 8) (선택) MSSQL 컨테이너 기동 — 실제 적용 가능
-      - name: Start MSSQL container (conditional)
+      - name: Start MSSQL container
         if: ${{ env.RUN_APPLY == 'true' && env.TARGET_DB == 'mssql' }}
         shell: bash
         run: |
           set -Eeuo pipefail
           docker run -d --name mssql -e "ACCEPT_EULA=Y" -e "MSSQL_SA_PASSWORD=${MSSQL_SA_PASSWORD}" -p 1433:1433 mcr.microsoft.com/mssql/server:2022-latest
-          # 부팅 대기(지연이 김)
           for i in {1..80}; do
             if docker exec mssql /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "${MSSQL_SA_PASSWORD}" -C -Q "SELECT 1" >/dev/null 2>&1; then break; fi
             sleep 3
-          done
-          docker exec mssql /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "${MSSQL_SA_PASSWORD}" -C -Q "SELECT 1" || true
+          done || true
 
-      # 9) PostgreSQL 적용
+      # --- 실제 적용 (PostgreSQL) ---
       - name: Apply SQL (PostgreSQL)
         if: ${{ env.RUN_APPLY == 'true' && env.TARGET_DB == 'postgres' }}
         shell: bash
@@ -315,11 +473,9 @@ jobs:
           set -Eeuo pipefail
           sudo apt-get update && sudo apt-get install -y postgresql-client gettext-base
           export PGPASSWORD=postgres
-          # DB 존재 확인 후 생성
           if ! psql -h 127.0.0.1 -U postgres -d postgres -tc "SELECT 1 FROM pg_database WHERE datname='${DB_NAME}'" | grep -q 1; then
             psql -h 127.0.0.1 -U postgres -d postgres -c "CREATE DATABASE \"${DB_NAME}\""
           fi
-          # 권한 적용
           envsubst < .github/echo_db/postgres/01_roles.sql \
             | psql -h 127.0.0.1 -U postgres -d "${DB_NAME}" -v ON_ERROR_STOP=1
           envsubst < .github/echo_db/postgres/02_schema_grants.sql \
@@ -330,68 +486,57 @@ jobs:
             psql -h 127.0.0.1 -U postgres -d "${DB_NAME}" -v ON_ERROR_STOP=1 -f .github/echo_db/postgres/03_model_basic.sql
           fi
 
-      # 10) MySQL 적용 (반드시 실행되도록 재시도 포함)
-      - name: Apply SQL (MySQL)
+      # --- 실제 적용 (MySQL) + 대량 생성 ---
+      - name: Apply SQL (MySQL) + Bulk
         if: ${{ env.RUN_APPLY == 'true' && env.TARGET_DB == 'mysql' }}
         shell: bash
         run: |
           set -Eeuo pipefail
           sudo apt-get update && sudo apt-get install -y mysql-client gettext-base
-          # 연결 재시도 래퍼
-          try_mysql () { for i in {1..10}; do if mysql -h 127.0.0.1 -P 3306 -uroot -proot -e "SELECT 1" >/dev/null 2>&1; then return 0; fi; sleep 3; done; return 1; }
-          try_mysql
-
-          envsubst < .github/echo_db/mysql/00_create_db.sql \
-            | mysql -h 127.0.0.1 -P 3306 -uroot -proot
-          envsubst < .github/echo_db/mysql/01_user.sql \
-            | mysql -h 127.0.0.1 -P 3306 -uroot -proot
-
+          # 연결 재시도
+          for i in {1..20}; do if mysql -h 127.0.0.1 -P 3306 -uroot -proot -e "SELECT 1" >/dev/null 2>&1; then break; fi; sleep 3; done
+          envsubst < .github/echo_db/mysql/00_create_db.sql | mysql -h 127.0.0.1 -P 3306 -uroot -proot
+          envsubst < .github/echo_db/mysql/01_user.sql      | mysql -h 127.0.0.1 -P 3306 -uroot -proot
           if [ "${GRANT_MODEL}" = "strict" ]; then
-            envsubst < .github/echo_db/mysql/02_grants_strict.sql \
-              | mysql -h 127.0.0.1 -P 3306 -uroot -proot
+            envsubst < .github/echo_db/mysql/02_grants_strict.sql | mysql -h 127.0.0.1 -P 3306 -uroot -proot
           else
-            envsubst < .github/echo_db/mysql/02_grants_basic.sql \
-              | mysql -h 127.0.0.1 -P 3306 -uroot -proot
+            envsubst < .github/echo_db/mysql/02_grants_basic.sql  | mysql -h 127.0.0.1 -P 3306 -uroot -proot
           fi
+          # 대량 생성
+          envsubst < .github/echo_db/mysql/99_bulk.sql | mysql -h 127.0.0.1 -P 3306 -uroot -proot
 
-      # 11) MSSQL 적용 (sqlcmd/mssql-tools)
-      - name: Apply SQL (MSSQL)
+      # --- 실제 적용 (MSSQL) + 대량 생성 ---
+      - name: Apply SQL (MSSQL) + Bulk (sqlcmd)
         if: ${{ env.RUN_APPLY == 'true' && env.TARGET_DB == 'mssql' }}
         shell: bash
         run: |
           set -Eeuo pipefail
           sudo apt-get update
           sudo apt-get install -y curl ca-certificates apt-transport-https gnupg gettext-base
-          # sqlcmd 설치 (tools18)
           curl -sSL https://packages.microsoft.com/keys/microsoft.asc | sudo gpg --dearmor -o /usr/share/keyrings/microsoft.gpg
           echo "deb [arch=amd64 signed-by=/usr/share/keyrings/microsoft.gpg] https://packages.microsoft.com/ubuntu/22.04/prod jammy main" | sudo tee /etc/apt/sources.list.d/mssql-release.list
           sudo apt-get update
           sudo ACCEPT_EULA=Y apt-get install -y msodbcsql18 mssql-tools18
-          echo 'export PATH="$PATH:/opt/mssql-tools18/bin"' >> $GITHUB_ENV
           export PATH="$PATH:/opt/mssql-tools18/bin"
 
-          # 대기/재시도
+          # 연결 재시도
           for i in {1..60}; do
-            if /opt/mssql-tools18/bin/sqlcmd -S 127.0.0.1 -U sa -P "${MSSQL_SA_PASSWORD}" -C -Q "SELECT 1" >/dev/null 2>&1; then break; fi
+            if sqlcmd -S 127.0.0.1 -U sa -P "${MSSQL_SA_PASSWORD}" -C -Q "SELECT 1" >/dev/null 2>&1; then break; fi
             sleep 3
           done
 
-          # 템플릿 치환 후 적용 (GO 구분자 유지)
-          envsubst < .github/echo_db/mssql/00_create_db.sql \
-            | /opt/mssql-tools18/bin/sqlcmd -S 127.0.0.1 -U sa -P "${MSSQL_SA_PASSWORD}" -C
-
-          envsubst < .github/echo_db/mssql/01_user.sql \
-            | /opt/mssql-tools18/bin/sqlcmd -S 127.0.0.1 -U sa -P "${MSSQL_SA_PASSWORD}" -C
-
+          # 적용 (GO 구분자 유지)
+          envsubst < .github/echo_db/mssql/00_create_db.sql | sqlcmd -S 127.0.0.1 -U sa -P "${MSSQL_SA_PASSWORD}" -C
+          envsubst < .github/echo_db/mssql/01_roles.sql     | sqlcmd -S 127.0.0.1 -U sa -P "${MSSQL_SA_PASSWORD}" -C
+          envsubst < .github/echo_db/mssql/02_user_and_grants.sql | sqlcmd -S 127.0.0.1 -U sa -P "${MSSQL_SA_PASSWORD}" -C
           if [ "${GRANT_MODEL}" = "strict" ]; then
-            envsubst < .github/echo_db/mssql/02_grants_strict.sql \
-              | /opt/mssql-tools18/bin/sqlcmd -S 127.0.0.1 -U sa -P "${MSSQL_SA_PASSWORD}" -C
+            envsubst < .github/echo_db/mssql/03_model_strict.sql | sqlcmd -S 127.0.0.1 -U sa -P "${MSSQL_SA_PASSWORD}" -C
           else
-            envsubst < .github/echo_db/mssql/02_grants_basic.sql \
-              | /opt/mssql-tools18/bin/sqlcmd -S 127.0.0.1 -U sa -P "${MSSQL_SA_PASSWORD}" -C
+            envsubst < .github/echo_db/mssql/03_model_basic.sql  | sqlcmd -S 127.0.0.1 -U sa -P "${MSSQL_SA_PASSWORD}" -C
           fi
+          envsubst < .github/echo_db/mssql/99_bulk.sql | sqlcmd -S 127.0.0.1 -U sa -P "${MSSQL_SA_PASSWORD}" -C
 
-      # 12) 산출물 업로드
+      # --- 아티팩트 업로드 ---
       - name: Upload artifacts
         if: ${{ env.CREATE_ARTIFACTS == 'true' }}
         uses: actions/upload-artifact@v4
@@ -400,3 +545,4 @@ jobs:
           path: |
             .github/echo_db/**
             .github/echo_products/**
+            .github/echo_ansible/**
