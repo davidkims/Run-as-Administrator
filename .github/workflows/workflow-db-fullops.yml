@@ -9,57 +9,48 @@ on:
         required: true
         default: "airflow"
         options: ["airflow", "n8n", "ibm-baw", "sharepoint-wfm"]
-
       target_db:
         description: "대상 DB (all: 모두 실행)"
         type: choice
         required: true
         default: "all"
         options: ["postgres", "mysql", "mssql", "all"]
-
       db_name:
         description: "DB 이름(기준 접두)"
         required: true
         default: "appdb"
-
       db_user:
         description: "DB 접속 사용자(기준 접두)"
         required: true
         default: "appuser"
-
       db_password:
         description: "DB 접속 비밀번호"
         required: true
         default: "StrongPw123!"
-
       grant_model:
         description: "권한 모델"
         type: choice
         required: true
         default: "strict"
         options: ["strict", "basic"]
-
       run_apply:
         description: "컨테이너 기동 후 실제 적용(지원: postgres/mysql/mssql/all)"
         type: choice
         required: true
         default: "true"
         options: ["true", "false"]
-
       release_tag:
         description: "릴리즈 태그(예: v1.0.0 또는 AUTO)"
         required: true
         default: "AUTO"
-
       mode_preset:
         description: "모드 프리셋(full/iso-only/artifacts-only/release-only/minimal)"
         type: choice
         required: true
         default: "full"
         options: ["full","iso-only","artifacts-only","release-only","minimal"]
-
       extra_json:
-        description: "추가설정 JSON(선택) — iso_enable, iso_per_service, create_artifacts, enable_tls, bulk_count, bulk_prefix, iso_bulk_dir_count, iso_bulk_dir_prefix, release_enable, release_prerelease"
+        description: "추가설정 JSON — iso_enable, iso_per_service, create_artifacts, enable_tls, bulk_count, bulk_prefix, iso_bulk_dir_count, iso_bulk_dir_prefix, release_enable, release_prerelease"
         required: false
         default: "{}"
 
@@ -95,40 +86,30 @@ jobs:
           echo "GRANT_MODEL=${{ github.event.inputs.grant_model }}" >> $GITHUB_ENV
           echo "RUN_APPLY=${{ github.event.inputs.run_apply }}" >> $GITHUB_ENV
 
-          # ===== 프리셋 기본값 =====
           MODE="${{ github.event.inputs.mode_preset }}"
           case "$MODE" in
-            full)
-              ISO_ENABLE=true; ISO_PER_SERVICE=true; CREATE_ARTIFACTS=true; RELEASE_ENABLE=true; RELEASE_PRERELEASE=false; ENABLE_TLS=true;;
-            iso-only)
-              ISO_ENABLE=true; ISO_PER_SERVICE=true; CREATE_ARTIFACTS=true; RELEASE_ENABLE=false; RELEASE_PRERELEASE=false; ENABLE_TLS=true;;
-            artifacts-only)
-              ISO_ENABLE=false; ISO_PER_SERVICE=false; CREATE_ARTIFACTS=true; RELEASE_ENABLE=false; RELEASE_PRERELEASE=false; ENABLE_TLS=true;;
-            release-only)
-              ISO_ENABLE=false; ISO_PER_SERVICE=false; CREATE_ARTIFACTS=false; RELEASE_ENABLE=true; RELEASE_PRERELEASE=false; ENABLE_TLS=true;;
-            minimal|*)
-              ISO_ENABLE=false; ISO_PER_SERVICE=false; CREATE_ARTIFACTS=false; RELEASE_ENABLE=false; RELEASE_PRERELEASE=false; ENABLE_TLS=false;;
+            full)          ISO_ENABLE=true; ISO_PER_SERVICE=true; CREATE_ARTIFACTS=true; RELEASE_ENABLE=true;  RELEASE_PRERELEASE=false; ENABLE_TLS=true;;
+            iso-only)      ISO_ENABLE=true; ISO_PER_SERVICE=true; CREATE_ARTIFACTS=true; RELEASE_ENABLE=false; RELEASE_PRERELEASE=false; ENABLE_TLS=true;;
+            artifacts-only)ISO_ENABLE=false;ISO_PER_SERVICE=false;CREATE_ARTIFACTS=true; RELEASE_ENABLE=false; RELEASE_PRERELEASE=false; ENABLE_TLS=true;;
+            release-only)  ISO_ENABLE=false;ISO_PER_SERVICE=false;CREATE_ARTIFACTS=false;RELEASE_ENABLE=true;  RELEASE_PRERELEASE=false; ENABLE_TLS=true;;
+            minimal|*)     ISO_ENABLE=false;ISO_PER_SERVICE=false;CREATE_ARTIFACTS=false;RELEASE_ENABLE=false; RELEASE_PRERELEASE=false; ENABLE_TLS=false;;
           esac
 
-          # ===== 기본 수치/접두 =====
           BULK_COUNT=20
           BULK_PREFIX="${{ github.event.inputs.db_user }}_bulk"
           ISO_BULK_DIR_COUNT=20
           ISO_BULK_DIR_PREFIX="bundle_"
 
-          # ===== extra_json 오버라이드 =====
           EXTRA='${{ github.event.inputs.extra_json }}'
           parse_bool() { v="$1"; [ "$v" = "true" ] && echo true || [ "$v" = "false" ] && echo false || echo ""; }
           if [ -n "$EXTRA" ] && [ "$EXTRA" != "null" ]; then
             jq -e . >/dev/null 2>&1 <<<"$EXTRA" || { echo "extra_json이 올바른 JSON이 아닙니다"; exit 1; }
-
             v=$(jq -r 'select(.iso_enable!=null)     | .iso_enable'            <<<"$EXTRA"); b=$(parse_bool "$v"); [ -n "$b" ] && ISO_ENABLE=$b
             v=$(jq -r 'select(.iso_per_service!=null)| .iso_per_service'        <<<"$EXTRA"); b=$(parse_bool "$v"); [ -n "$b" ] && ISO_PER_SERVICE=$b
             v=$(jq -r 'select(.create_artifacts!=null)| .create_artifacts'      <<<"$EXTRA"); b=$(parse_bool "$v"); [ -n "$b" ] && CREATE_ARTIFACTS=$b
             v=$(jq -r 'select(.enable_tls!=null)     | .enable_tls'             <<<"$EXTRA"); b=$(parse_bool "$v"); [ -n "$b" ] && ENABLE_TLS=$b
             v=$(jq -r 'select(.release_enable!=null) | .release_enable'         <<<"$EXTRA"); b=$(parse_bool "$v"); [ -n "$b" ] && RELEASE_ENABLE=$b
             v=$(jq -r 'select(.release_prerelease!=null)| .release_prerelease'  <<<"$EXTRA"); b=$(parse_bool "$v"); [ -n "$b" ] && RELEASE_PRERELEASE=$b
-
             v=$(jq -r 'select(.bulk_count!=null)         | .bulk_count'         <<<"$EXTRA"); [ "$v" != "null" ] && [ -n "$v" ] && BULK_COUNT="$v"
             v=$(jq -r 'select(.bulk_prefix!=null)        | .bulk_prefix'        <<<"$EXTRA"); [ "$v" != "null" ] && [ -n "$v" ] && BULK_PREFIX="$v"
             v=$(jq -r 'select(.iso_bulk_dir_count!=null) | .iso_bulk_dir_count' <<<"$EXTRA"); [ "$v" != "null" ] && [ -n "$v" ] && ISO_BULK_DIR_COUNT="$v"
@@ -146,7 +127,6 @@ jobs:
           echo "ISO_BULK_DIR_COUNT=${ISO_BULK_DIR_COUNT}" >> $GITHUB_ENV
           echo "ISO_BULK_DIR_PREFIX=${ISO_BULK_DIR_PREFIX}" >> $GITHUB_ENV
 
-          # 릴리즈 태그 계산
           if [ -z "${{ github.event.inputs.release_tag }}" ] || [ "${{ github.event.inputs.release_tag }}" = "AUTO" ]; then
             REL_TAG="vAUTO-${GITHUB_RUN_NUMBER}"
           else
@@ -154,7 +134,6 @@ jobs:
           fi
           echo "RELEASE_TAG=${REL_TAG}" >> $GITHUB_ENV
 
-          # 비밀 기본값
           echo "MSSQL_SA_PASSWORD=Str0ng!Passw0rd" >> $GITHUB_ENV
 
           mkdir -p \
@@ -165,7 +144,6 @@ jobs:
             .github/out/release_root \
             .github/out/iso
 
-      # 공통 가이드/TLS(문서)
       - name: Generate common guides & TLS templates
         shell: bash
         run: |
@@ -193,7 +171,6 @@ jobs:
           * 컨테이너는 커스텀 이미지 + 인증서 바인딩 스크립트 필요
           MD
 
-      # 제품별 샘플
       - name: Generate product samples
         shell: bash
         run: |
@@ -223,7 +200,6 @@ jobs:
           - 팜 구성 계정/권한, 방화벽 예외
           MD
 
-      # Ansible/Makefile 스캐폴딩
       - name: Generate Ansible skeleton & Makefile
         shell: bash
         run: |
@@ -270,7 +246,6 @@ jobs:
           	@echo "DB: ${DB_NAME}, USER: ${DB_USER}, MODEL: ${GRANT_MODEL}, TARGET: ${TARGET_DB}"
           MK
 
-      # Postgres SQL 생성(권한/대량)
       - name: Generate PostgreSQL SQL (roles/grants + bulk)
         shell: bash
         run: |
@@ -356,7 +331,6 @@ jobs:
             done
           } > .github/echo_db/postgres/99_bulk.sql
 
-      # MySQL SQL 생성(권한/대량)
       - name: Generate MySQL SQL (create/user/grants + bulk)
         shell: bash
         run: |
@@ -401,7 +375,6 @@ jobs:
             done
           } > .github/echo_db/mysql/99_bulk.sql
 
-      # MSSQL SQL 생성(권한/대량)
       - name: Generate MSSQL SQL (roles/grants + bulk)
         shell: bash
         run: |
@@ -465,7 +438,6 @@ jobs:
           GO
           SQL
 
-      # Oracle/Db2 템플릿
       - name: Generate Oracle/Db2 templates
         shell: bash
         run: |
@@ -486,29 +458,42 @@ jobs:
           GRANT CREATETAB ON DATABASE TO USER ${DB_USER};
           SQL
 
-      # 릴리즈 트리 & ISO
+      # >>> 수정된 스텝: rsync 목적지 경로 사전 생성 <<<
       - name: Build release trees (bulk directories) & common README
         if: ${{ env.ISO_ENABLE == 'true' }}
         shell: bash
         run: |
           set -Eeuo pipefail
           ROOT=".github/out/release_root"
+
+          # 목적지 트리 전체 사전 생성
           mkdir -p "$ROOT/ALL"
-          rsync -a .github/echo_db/        "$ROOT/ALL/echo_db/"
-          rsync -a .github/echo_products/  "$ROOT/ALL/echo_products/"
-          rsync -a .github/echo_ansible/   "$ROOT/ALL/echo_ansible/"
-          mkdir -p "$ROOT/POSTGRES" "$ROOT/MYSQL" "$ROOT/MSSQL"
+          mkdir -p \
+            "$ROOT/POSTGRES/echo_db/postgres" "$ROOT/POSTGRES/echo_db/common" \
+            "$ROOT/MYSQL/echo_db/mysql"       "$ROOT/MYSQL/echo_db/common" \
+            "$ROOT/MSSQL/echo_db/mssql"       "$ROOT/MSSQL/echo_db/common"
+
+          # ALL 번들
+          rsync -a .github/echo_db/       "$ROOT/ALL/echo_db/"
+          rsync -a .github/echo_products/ "$ROOT/ALL/echo_products/"
+          rsync -a .github/echo_ansible/  "$ROOT/ALL/echo_ansible/"
+
+          # 서비스별 번들
           rsync -a .github/echo_db/postgres/ "$ROOT/POSTGRES/echo_db/postgres/"
           rsync -a .github/echo_db/common/   "$ROOT/POSTGRES/echo_db/common/"
           rsync -a .github/echo_db/mysql/    "$ROOT/MYSQL/echo_db/mysql/"
           rsync -a .github/echo_db/common/   "$ROOT/MYSQL/echo_db/common/"
           rsync -a .github/echo_db/mssql/    "$ROOT/MSSQL/echo_db/mssql/"
           rsync -a .github/echo_db/common/   "$ROOT/MSSQL/echo_db/common/"
+
+          # ISO 내 대량 디렉토리 생성
           for i in $(seq -w 1 ${ISO_BULK_DIR_COUNT}); do
             mkdir -p "$ROOT/ALL/${ISO_BULK_DIR_PREFIX}${i}"
             echo "placeholder ${i}" > "$ROOT/ALL/${ISO_BULK_DIR_PREFIX}${i}/README.txt"
           done
-          cat > "$ROOT/ALL/README_FULLOPS.txt" <<TXT
+
+          # 안내 파일
+          cat > "$ROOT/ALL/README_FULLOPS.txt" <<'TXT'
           이 ISO에는 DB 스크립트(권한/대량), TLS 가이드, 제품별 샘플설정, Ansible/Makefile 템플릿이 포함되어 있습니다.
           TXT
 
@@ -531,7 +516,6 @@ jobs:
           (cd "$OUT" && sha256sum *.iso > CHECKSUMS.txt)
           echo "ISO_TIME=${TS}" >> $GITHUB_ENV
 
-      # 컨테이너 기동
       - name: Start PostgreSQL container
         if: ${{ env.RUN_APPLY == 'true' && (env.TARGET_DB == 'postgres' || env.TARGET_DB == 'all') }}
         shell: bash
@@ -577,8 +561,7 @@ jobs:
             sleep 3
           done || true
 
-      # 실제 적용 (비밀번호 경고 제거: pgpass/defaults-extra-file/SQLCMDPASSWORD)
-      - name: Apply SQL (PostgreSQL)
+      - name: Apply SQL (PostgreSQL)  # .pgpass 사용
         if: ${{ env.RUN_APPLY == 'true' && (env.TARGET_DB == 'postgres' || env.TARGET_DB == 'all') }}
         shell: bash
         run: |
@@ -604,7 +587,7 @@ jobs:
           done
           envsubst < .github/echo_db/postgres/99_bulk.sql | psql -h 127.0.0.1 -U postgres -d postgres -v ON_ERROR_STOP=1
 
-      - name: Apply SQL (MySQL) + Bulk
+      - name: Apply SQL (MySQL) + Bulk  # defaults-extra-file 사용
         if: ${{ env.RUN_APPLY == 'true' && (env.TARGET_DB == 'mysql' || env.TARGET_DB == 'all') }}
         shell: bash
         run: |
@@ -624,7 +607,7 @@ jobs:
           envsubst < .github/echo_db/mysql/99_bulk.sql | mysql --defaults-extra-file=.github/secure/mysql.cnf
           shred -u .github/secure/mysql.cnf || rm -f .github/secure/mysql.cnf
 
-      - name: Apply SQL (MSSQL) + Bulk (sqlcmd)
+      - name: Apply SQL (MSSQL) + Bulk (sqlcmd)  # SQLCMDPASSWORD 사용
         if: ${{ env.RUN_APPLY == 'true' && (env.TARGET_DB == 'mssql' || env.TARGET_DB == 'all') }}
         shell: bash
         run: |
@@ -651,7 +634,6 @@ jobs:
           fi
           envsubst < .github/echo_db/mssql/99_bulk.sql | sqlcmd -S 127.0.0.1 -U sa -C
 
-      # 산출물 업로드
       - name: Upload artifacts (scripts & samples & ansible)
         if: ${{ env.CREATE_ARTIFACTS == 'true' }}
         uses: actions/upload-artifact@v4
@@ -669,7 +651,6 @@ jobs:
           name: iso-images
           path: .github/out/iso/*
 
-      # GitHub Release
       - name: Create GitHub Release (tag & upload ISOs)
         if: ${{ env.RELEASE_ENABLE == 'true' && env.ISO_ENABLE == 'true' }}
         uses: softprops/action-gh-release@v2
@@ -682,7 +663,7 @@ jobs:
             - 대상 DB: ${{ env.TARGET_DB }}
             - 권한 모델: ${{ env.GRANT_MODEL }}
             - ISO 타임스탬프: ${{ env.ISO_TIME }}
-            - 포함: Scripts/Ansible/TLS/Oracle-Db2 + ISO(ALL${{ env.ISO_PER_SERVICE == 'true' && ' + per-service' || '' }})
+            - 포함: Scripts/Ansible/TLS/Oracle-Db2 + ISO
           draft: false
           prerelease: ${{ env.RELEASE_PRERELEASE == 'true' }}
           files: |
