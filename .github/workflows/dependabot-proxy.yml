@@ -17,7 +17,8 @@ jobs:
     env:
       LOG_DIR: ./.lint-dump
       BIN_DIR: ./bin
-      ACTIONLINT_VERSION: "1.7.1"   # 재현성 위해 고정(원하면 latest)
+      ACTIONLINT_VERSION: "1.7.1"   # latest 로도 가능
+
     steps:
       - name: 📥 Checkout
         uses: actions/checkout@v4
@@ -33,7 +34,7 @@ jobs:
             echo "TS: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
           } > "$LOG_DIR/env.txt"
 
-      # ---------- actionlint 설치 (실패해도 계속) ----------
+      # ── (A) actionlint 설치 ────────────────────────────────────────────────────
       - name: 🔧 Install actionlint (script + fallback)
         shell: bash
         continue-on-error: true
@@ -42,7 +43,6 @@ jobs:
           echo "[INFO] Try official script -> $BIN_DIR" | tee -a "$LOG_DIR/actionlint-install.log"
           curl -sSfL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash \
             -o /tmp/download-actionlint.bash
-          # 스크립트 사용법: bash script [VERSION] [DIR]
           if bash /tmp/download-actionlint.bash "${ACTIONLINT_VERSION}" "$BIN_DIR" >>"$LOG_DIR/actionlint-install.log" 2>&1; then
             echo "[OK] script installed" | tee -a "$LOG_DIR/actionlint-install.log"
           else
@@ -53,7 +53,7 @@ jobs:
             case "$ARCH_RAW" in
               x86_64) ARCH="amd64" ;;
               aarch64|arm64) ARCH="arm64" ;;
-              *) ARCH="amd64" ;;  # 보편 폴백
+              *) ARCH="amd64" ;;
             esac
             TARBALL="actionlint_${V}_${OS}_${ARCH}.tar.gz"
             URL="https://github.com/rhysd/actionlint/releases/download/${PV}/${TARBALL}"
@@ -83,27 +83,52 @@ jobs:
             echo 127 > "$LOG_DIR/actionlint.status"
           fi
 
-      # ---------- yamllint 설치/실행 (실패해도 계속) ----------
+      # ── (B) yamllint: 엄격 규칙 자동 주입 + 실행 ──────────────────────────────
       - name: 🧰 Install yamllint
         continue-on-error: true
         run: |
           python3 -m pip install --upgrade pip
           pip install yamllint
 
-      - name: 🧪 Run yamllint (STRICT via .yamllint)
+      - name: 🧷 Ensure STRICT yamllint config (auto-create)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          # 레포에 .yamllint가 없더라도 엄격 규칙을 임시 파일로 생성하여 사용
+          mkdir -p "$LOG_DIR"
+          cat > "$LOG_DIR/yamllint.strict.yml" <<'YAML'
+          extends: default
+          rules:
+            document-start:
+              present: true
+            truthy:
+              allowed-values: ['true', 'false']
+              check-keys: true
+            line-length:
+              max: 80
+              level: error
+              allow-non-breakable-words: false
+              allow-non-breakable-inline-mappings: false
+          YAML
+
+      - name: 🧪 Run yamllint (STRICT with fallback config)
         shell: bash
         continue-on-error: true
         run: |
           set -Eeuo pipefail
           if command -v yamllint >/dev/null 2>&1; then
-            yamllint -c .yamllint -f standard -s .github/workflows 2>&1 | tee "$LOG_DIR/yamllint.log"
+            # 레포에 .yamllint가 있으면 그걸 우선 사용, 없으면 우리가 만든 엄격 규칙 사용
+            CONF=".yamllint"
+            [ -f ".yamllint" ] || CONF="$LOG_DIR/yamllint.strict.yml"
+            echo "[INFO] using config: $CONF" | tee "$LOG_DIR/yamllint.cfg.txt"
+            yamllint -c "$CONF" -f standard -s .github/workflows 2>&1 | tee "$LOG_DIR/yamllint.log"
             echo ${PIPESTATUS[0]} > "$LOG_DIR/yamllint.status"
           else
             echo "[SKIP] yamllint not installed" | tee "$LOG_DIR/yamllint.log"
             echo 127 > "$LOG_DIR/yamllint.status"
           fi
 
-      # ---------- 심화 검사 (중복키/inputs<=10) 실패해도 계속 ----------
+      # ── (C) 심화 검사: 중복키/inputs<=10 (실패해도 계속) ───────────────────────
       - name: 🐍 Deep Validate (duplicate keys, inputs<=10)
         shell: bash
         continue-on-error: true
@@ -163,7 +188,7 @@ jobs:
           PY
           echo ${PIPESTATUS[0]} > "$LOG_DIR/deep-validate.status"
 
-      # ---------- 요약 및 아티팩트 ----------
+      # ── (D) 요약 & 아티팩트 ────────────────────────────────────────────────────
       - name: 🧾 Build Summary (always)
         if: ${{ always() }}
         shell: bash
@@ -182,23 +207,9 @@ jobs:
             echo "- deep validate      : ${DV}"
             echo
             echo "**STRICT rules enabled.**"
-            echo "Any failures were *skipped* so the pipeline continued."
+            echo "Failures are *skipped* so the pipeline continues."
             echo "See the 'workflow-lint-dump' artifact for full logs."
           } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: 📦 Collect offenders (always)
-        if: ${{ always() }}
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          mkdir -p "$LOG_DIR/offenders"
-          if [ -f "$LOG_DIR/yamllint.log" ]; then
-            awk '{print $1}' "$LOG_DIR/yamllint.log" | sed 's/:$//' | grep '^\.github/workflows/' | sort -u \
-              | while read -r f; do
-                  mkdir -p "$LOG_DIR/offenders/$(dirname "$f")"
-                  cp "$f" "$LOG_DIR/offenders/$f" 2>/dev/null || true
-                done
-          fi
 
       - name: ⬆️ Upload lint dump (always)
         if: ${{ always() }}
