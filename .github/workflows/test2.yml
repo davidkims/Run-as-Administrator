@@ -34,7 +34,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  # 공통 기본값 (각 잡에서 상속/변경 가능)
+  # 공통 기본값
   ECHO_ROOT: .github/echo_linux
   DIST_DIR: dist
   ISO_DIR: dist/isos
@@ -50,14 +50,14 @@ env:
   FREE_TARGET_GB: "25"
   HIGH_WATER_PCT: "80"
   SPILL_PRIORITY: "oras,s3,azure,gcs"
-  SPILL_TO_ALL: "true"        # ← 가능하면 모든 원격으로 분산 업로드
-  SPILL_MIN_FREE_GB: "5"      # ← 이보다 작으면 원격 없어도 삭제(KEEP_LOCAL_AFTER_SPILL=false일 때)
+  SPILL_TO_ALL: "true"
+  SPILL_MIN_FREE_GB: "5"
   KEEP_LOCAL_AFTER_SPILL: "false"
 
   # Pages
   PAGES_ARTIFACT_NAME: image-suite-pages-${{ github.run_id }}
 
-  # 클라우드 자격(있으면 사용)
+  # 클라우드 자격(있으면 사용) → env 로도 노출
   AWS_REGION: ${{ secrets.AWS_REGION }}
   ECHO_S3_BUCKET: ${{ secrets.ECHO_S3_BUCKET }}
   AWS_ROLE_TO_ASSUME: ${{ secrets.AWS_ROLE_TO_ASSUME }}
@@ -99,6 +99,7 @@ jobs:
           echo "TMP=$PWD/dist/tmp" >> "$GITHUB_ENV"
           echo "TEMP=$PWD/dist/tmp" >> "$GITHUB_ENV"
           df -h
+
       - name: Init dirs
         shell: bash
         run: |
@@ -106,6 +107,7 @@ jobs:
           mkdir -p "$ECHO_ROOT"/{linux,rhel}/bulk \
                    "$DIST_DIR" "$ISO_DIR" "$IMG_DIR" "$LOG_DIR" "$META_DIR" \
                    "$SEED_DIR"/{cloud-init,preseed,kickstart} "$WORK_DIR" "$TMP_DIR"
+
       - name: Echo tools (space/spill utils)
         shell: bash
         run: |
@@ -243,8 +245,8 @@ jobs:
                 SUM_TYPE="sha256"
                 SUM_URL="https://download.rockylinux.org/pub/rocky/9/isos/x86_64/CHECKSUM";;
               alma|rhel)
-                ISO_URL="https://repo.almalinux.org/almalinux/9/isos/x86_64/AlmaLinux-9-latest_x86_64-minimal.iso"
-                FILE_NAME="AlmaLinux-9-latest_x86_64-minimal.iso"
+                ISO_URL="https://repo.almalinux.org/almalinux/9/isos/x86_64/AlmaLinux-9-latest-x86_64-minimal.iso"
+                FILE_NAME="AlmaLinux-9-latest-x86_64-minimal.iso"
                 SUM_TYPE="sha256"
                 SUM_URL="https://repo.almalinux.org/almalinux/9/isos/x86_64/CHECKSUM"
                 [ "$d" = "rhel" ] && FALLBACK_NOTE="Requested 'rhel' but used AlmaLinux (auth required for RHEL).";;
@@ -291,21 +293,8 @@ jobs:
           ensure_cmd gpg; ensure_cmd gpgv; ensure_cmd dirmngr
           ensure_cmd debian-archive-keyring || true
           ensure_cmd ubuntu-keyring || true
-          # (선택) 데모용 소량 bulk 생성 — 대용량 아님
-          echo "linux:40 rhel:40" | tr ' ' '\n' > "$META_DIR/dir_spec.txt"
-          while read -r LINE; do
-            PREFIX="$(echo "$LINE" | cut -d: -f1)"; COUNT="$(echo "$LINE" | cut -d: -f2)"
-            [ -z "$PREFIX" ] && continue
-            BASE="$ECHO_ROOT/$PREFIX/bulk"
-            for ((i=1;i<=COUNT;i++)); do
-              D="$BASE/${PREFIX}_dir_$i"
-              mkdir -p "$D/sub1" "$D/sub2"
-              echo "sample $PREFIX #$i" > "$D/README.txt"
-              printf '{"prefix":"%s","index":%d,"ts":"%s"}\n' "$PREFIX" "$i" "$(date -u +'%F %T')" > "$D/meta.json"
-              (( i % 20 == 0 )) && ensure_space
-            done
-          done < "$META_DIR/dir_spec.txt"
-          # Base ISO 다운로드/검증
+
+          # Base ISO 다운로드/검증 (데모용 소량 파일 생성 생략 가능)
           D="${{ inputs.distro || github.event.inputs.distro }}"
           set_official_iso_vars "$D"
           [ -z "${ISO_URL:-}" ] && exit 0
@@ -316,6 +305,7 @@ jobs:
           if [ -n "${SUM_SIG_URL:-}" ] && [ -f "${LIST:-}" ]; then SIG="$ISO_DIR/$(basename "$SUM_SIG_URL")"; curl -fsSL "$SUM_SIG_URL" -o "$SIG" || true; verify_gpg "${SUM_TYPE:-sha256}" "$LIST" "$SIG" "$D" || true; fi
           verify_sum "$OUT" "${SUM_TYPE:-sha256}" "${LIST:-}"
           ensure_space
+
           # Payload ISO → spill
           ensure_cmd mkisofs || ensure_cmd xorriso
           LABEL="ECHO_DATA_$(date -u +%Y%m%d)"
@@ -324,8 +314,9 @@ jobs:
           else xorriso -as mkisofs -V "$LABEL" -J -R -o "$PISO" "$ECHO_ROOT" || true; fi
           [ -f "$PISO" ] && sha256sum "$PISO" | tee "$META_DIR/custom_payload.sha256.txt" >/dev/null || true
           spill_file "$PISO"
-          # Seed (cloud-init/preseed/kickstart) ISO → spill
-          mkdir -p "$SEED_DIR"/{cloud-init,preseed,kickstart}
+
+          # Seed (cloud-init) → spill
+          mkdir -p "$SEED_DIR/cloud-init"
           cat > "$SEED_DIR/cloud-init/user-data" <<'UD'
           #cloud-config
           hostname: echo-host
@@ -335,14 +326,13 @@ jobs:
           runcmd: [ [ bash, -lc, "echo 'hello from cloud-init' > /root/hello.txt" ] ]
           UD
           echo "instance-id: iid-echo; local-hostname: echo-host" > "$SEED_DIR/cloud-init/meta-data"
-          echo "d-i time/zone string UTC" > "$SEED_DIR/preseed/preseed.cfg"
-          echo -e "#version=RHEL9\ntext\nlang en_US.UTF-8\nkeyboard us\ntimezone UTC\nrootpw echo1234" > "$SEED_DIR/kickstart/ks.cfg"
           CIDATA="$ISO_DIR/seed-cidata.iso"
           if command -v mkisofs >/dev/null 2>&1; then mkisofs -V CIDATA -J -R -o "$CIDATA" "$SEED_DIR/cloud-init" || true
           else xorriso -as mkisofs -V CIDATA -J -R -o "$CIDATA" "$SEED_DIR/cloud-init" || true; fi
           [ -f "$CIDATA" ] && sha256sum "$CIDATA" | tee "$META_DIR/seed_cidata.sha256.txt" >/dev/null || true
           spill_file "$CIDATA"
-          # Full installer ISO (UEFI/BIOS) → spill & base ISO 삭제
+
+          # Full installer ISO → spill & base ISO 삭제
           ensure_cmd xorriso; ensure_cmd isohybrid || true; ensure_cmd isohdpfx.bin || true
           WORK="$WORK_DIR/root"; rm -rf "$WORK"; mkdir -p "$WORK"
           xorriso -osirrox on -indev "$OUT" -extract / "$WORK" || true
@@ -357,7 +347,7 @@ jobs:
               done
             ;;
             debian)
-              mkdir -p "$WORK/preseed"; cp "$SEED_DIR/preseed/preseed.cfg" "$WORK/preseed/" || true
+              mkdir -p "$WORK/preseed"; echo "d-i time/zone string UTC" > "$WORK/preseed/preseed.cfg"
               for CFG in "$WORK/isolinux/txt.cfg" "$WORK/boot/grub/grub.cfg" "$WORK/EFI/BOOT/grub.cfg"; do
                 [ -f "$CFG" ] || continue
                 sed -i 's,^\(\s*linux[^#]*\)$,\1 auto=true priority=critical file=/cdrom/preseed/preseed.cfg,' "$CFG" || true
@@ -365,7 +355,7 @@ jobs:
               done
             ;;
             rocky|alma|rhel)
-              cp "$SEED_DIR/kickstart/ks.cfg" "$WORK/ks.cfg" || true
+              echo -e "#version=RHEL9\ntext\nlang en_US.UTF-8\nkeyboard us\ntimezone UTC\nrootpw echo1234" > "$WORK/ks.cfg"
               for CFG in "$WORK/isolinux/isolinux.cfg" "$WORK/EFI/BOOT/grub.cfg" "$WORK/boot/grub/grub.cfg"; do
                 [ -f "$CFG" ] || continue
                 sed -i 's,^\(\s*linuxefi\?\s\+\S\+\s\+.*\)$,\1 inst.ks=cdrom:/ks.cfg,' "$CFG" || true
@@ -392,6 +382,7 @@ jobs:
           spill_file "$OUTISO"
           rm -f "$OUT" || true
           ensure_space
+
       - name: Upload tiny artifacts from ISO job
         uses: actions/upload-artifact@v4
         with:
@@ -405,7 +396,7 @@ jobs:
   build-qcow:
     name: "Build QCOW2 (base+snap) → Spill"
     runs-on: ubuntu-latest
-    needs: [build-iso]   # 순차 실행로 디스크/네트워크 피크 분산
+    needs: [build-iso]
     env:
       GH_USER: ${{ github.actor }}
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -423,17 +414,13 @@ jobs:
           sudo rm -rf /var/lib/apt/lists/* || true
           mkdir -p dist/tmp
           echo "TMPDIR=$PWD/dist/tmp" >> "$GITHUB_ENV"
-      - name: Echo tools
+
+      - name: Echo tools (minimal)
         shell: bash
         run: |
           set -Eeuo pipefail
-          # 간단 버전으로 재생성
           cat > "$ECHO_ROOT/echo_tools.sh" <<'EOS'
           set -Eeuo pipefail
-          disk_free_gb(){ df -PB1G . | awk 'NR==2{print $4}' | sed 's/[^0-9]//g'; }
-          disk_used_pct(){ df -P . | awk 'NR==2{gsub("%","",$5); print $5}'; }
-          notify(){ echo "::warning ::$*"; }
-          softfail(){ echo "::warning ::$*"; }
           ensure_cmd(){ command -v "$1" >/dev/null 2>&1 || sudo apt-get update -y || true; command -v "$1" >/dev/null 2>&1 || sudo apt-get install -y "$1" || true; }
           spill_all(){
             local f="$1"
@@ -446,6 +433,7 @@ jobs:
           }
           EOS
           chmod +x "$ECHO_ROOT/echo_tools.sh"
+
       - name: Build QCOW2 & Spill
         shell: bash
         continue-on-error: true
@@ -464,6 +452,7 @@ jobs:
           source "$ECHO_ROOT/echo_tools.sh"; spill_all "$IMG_DIR/$BASE"
           source "$ECHO_ROOT/echo_tools.sh"; spill_all "$IMG_DIR/$SNAP"
           echo "{}" > "$META_DIR/qcow2.done.json"
+
       - name: Upload tiny artifacts from QCOW job
         uses: actions/upload-artifact@v4
         with:
@@ -485,10 +474,12 @@ jobs:
           sudo docker system prune -af || true
           sudo apt-get clean || true
           sudo rm -rf /var/lib/apt/lists/* || true
+
       - name: Download small artifacts
         uses: actions/download-artifact@v4
         with:
           path: .
+
       - name: Merge to dist/
         run: |
           mkdir -p dist
@@ -497,6 +488,7 @@ jobs:
             [ -d "$d" ] || continue
             rsync -a "$d"/ dist/
           done
+
       - name: SBOM & Hash
         shell: bash
         continue-on-error: true
@@ -516,6 +508,7 @@ jobs:
             if [ $first -eq 1 ]; then echo "  $entry" >> "$HASH_JSON"; first=0; else echo " ,$entry" >> "$HASH_JSON"; fi
           done < <(find dist -type f -print0)
           echo "]" >> "$HASH_JSON"
+
       - name: Upload tiny artifact (merged dist) for later steps
         uses: actions/upload-artifact@v4
         with:
@@ -525,6 +518,7 @@ jobs:
             dist/.**
           if-no-files-found: warn
           retention-days: 7
+
       - name: Prepare Pages Artifact
         uses: actions/upload-pages-artifact@v3
         with:
@@ -542,9 +536,9 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: dist-small-merged-${{ github.run_id }}
-          path: .
+        # dist/ 루트로 풀리도록 기본 경로 사용
       - name: Push remaining small files via ORAS
-        if: ${{ env.GH_TOKEN != '' }}
+        if: ${{ secrets.GITHUB_TOKEN != '' }}
         shell: bash
         continue-on-error: true
         run: |
@@ -570,12 +564,11 @@ jobs:
     name: "Deploy to S3 (small dist)"
     runs-on: ubuntu-latest
     needs: [sbom-hash]
-    if: ${{ env.ECHO_S3_BUCKET != '' }}
+    if: ${{ secrets.ECHO_S3_BUCKET != '' }}
     steps:
       - uses: actions/download-artifact@v4
         with:
           name: dist-small-merged-${{ github.run_id }}
-          path: .
       - name: Configure AWS
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -593,12 +586,11 @@ jobs:
     name: "Deploy to Azure Blob (small dist)"
     runs-on: ubuntu-latest
     needs: [sbom-hash]
-    if: ${{ env.AZURE_STORAGE_ACCOUNT != '' && env.AZURE_STORAGE_KEY != '' && env.ECHO_AZURE_CONTAINER != '' }}
+    if: ${{ secrets.AZURE_STORAGE_ACCOUNT != '' && secrets.AZURE_STORAGE_KEY != '' && secrets.ECHO_AZURE_CONTAINER != '' }}
     steps:
       - uses: actions/download-artifact@v4
         with:
           name: dist-small-merged-${{ github.run_id }}
-          path: .
       - name: Upload-batch to Azure
         shell: bash
         continue-on-error: true
@@ -610,14 +602,13 @@ jobs:
     name: "Deploy to GCS (small dist)"
     runs-on: ubuntu-latest
     needs: [sbom-hash]
-    if: ${{ env.ECHO_GCS_BUCKET != '' }}
+    if: ${{ secrets.ECHO_GCS_BUCKET != '' }}
     steps:
       - uses: actions/download-artifact@v4
         with:
           name: dist-small-merged-${{ github.run_id }}
-          path: .
       - name: Auth (optional WIF)
-        if: ${{ env.GCP_WORKLOAD_IDENTITY_PROVIDER != '' && env.GCP_SERVICE_ACCOUNT != '' }}
+        if: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER != '' && secrets.GCP_SERVICE_ACCOUNT != '' }}
         uses: google-github-actions/auth@v2
         with:
           workload_identity_provider: ${{ env.GCP_WORKLOAD_IDENTITY_PROVIDER }}
@@ -633,7 +624,7 @@ jobs:
 
   deploy-pages:
     name: "Deploy to GitHub Pages"
-    runs-on: ubuntu-lest
+    runs-on: ubuntu-latest
     needs: [sbom-hash]
     steps:
       - name: Deploy Pages
@@ -649,7 +640,6 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: dist-small-merged-${{ github.run_id }}
-          path: .
       - name: Create Release
         uses: softprops/action-gh-release@v2
         continue-on-error: true
