@@ -1,5 +1,5 @@
 # .github/workflows/validate-workflows.yml
-name: "✅ Validate Workflow Syntax (strict, skip on error, dump)"
+name: "✅ Validate Workflow Syntax (strict, skip on error, guaranteed dump)"
 
 on:
   push:
@@ -17,14 +17,16 @@ jobs:
     env:
       LOG_DIR: ./.lint-dump
       BIN_DIR: ./bin
-      ACTIONLINT_VERSION: "1.7.1"   # latest 로도 가능
+      ACTIONLINT_VERSION: "1.7.1"
 
     steps:
       - name: 📥 Checkout
         uses: actions/checkout@v4
 
-      - name: 📁 Prepare dump/bin dirs
+      # ─────────── 덤프 디렉터리 선생성(실패해도 계속) ───────────
+      - name: 📁 Prepare dump/bin dirs (preflight)
         shell: bash
+        continue-on-error: true
         run: |
           set -Eeuo pipefail
           mkdir -p "$LOG_DIR" "$BIN_DIR"
@@ -33,13 +35,22 @@ jobs:
             echo "Kernel: $(uname -r)"
             echo "TS: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
           } > "$LOG_DIR/env.txt"
+          : > "$LOG_DIR/actionlint-install.status"
+          : > "$LOG_DIR/actionlint.status"
+          : > "$LOG_DIR/yamllint.status"
+          : > "$LOG_DIR/deep-validate.status"
+          : > "$LOG_DIR/actionlint.log"
+          : > "$LOG_DIR/yamllint.log"
+          : > "$LOG_DIR/deep-validate.log"
 
-      # ── (A) actionlint 설치 ────────────────────────────────────────────────────
+      # ─────────── actionlint 설치 (스크립트 → tarball 폴백) ───────────
       - name: 🔧 Install actionlint (script + fallback)
         shell: bash
         continue-on-error: true
         run: |
           set -Eeuo pipefail
+          mkdir -p "$LOG_DIR" "$BIN_DIR"
+          : > "$LOG_DIR/actionlint-install.log"
           echo "[INFO] Try official script -> $BIN_DIR" | tee -a "$LOG_DIR/actionlint-install.log"
           curl -sSfL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash \
             -o /tmp/download-actionlint.bash
@@ -58,8 +69,8 @@ jobs:
             TARBALL="actionlint_${V}_${OS}_${ARCH}.tar.gz"
             URL="https://github.com/rhysd/actionlint/releases/download/${PV}/${TARBALL}"
             echo "[INFO] download ${URL}" | tee -a "$LOG_DIR/actionlint-install.log"
-            curl -fL "$URL" -o "/tmp/${TARBALL}" >>"$LOG_DIR/actionlint-install.log" 2>&1
-            tar -xzf "/tmp/${TARBALL}" -C "$BIN_DIR" >>"$LOG_DIR/actionlint-install.log" 2>&1
+            curl -fL "$URL" -o "/tmp/${TARBALL}" >>"$LOG_DIR/actionlint-install.log" 2>&1 || true
+            tar -xzf "/tmp/${TARBALL}" -C "$BIN_DIR" >>"$LOG_DIR/actionlint-install.log" 2>&1 || true
             chmod +x "$BIN_DIR/actionlint" || true
           fi
           if [ -x "$BIN_DIR/actionlint" ]; then
@@ -68,22 +79,23 @@ jobs:
           else
             echo "[FAIL] actionlint not installed" | tee -a "$LOG_DIR/actionlint-install.log"
             echo 127 > "$LOG_DIR/actionlint-install.status"
-          fi
 
       - name: 🔍 Run actionlint (STRICT)
         shell: bash
         continue-on-error: true
         run: |
           set -Eeuo pipefail
+          mkdir -p "$LOG_DIR"
           if [ -x "$BIN_DIR/actionlint" ]; then
-            "$BIN_DIR/actionlint" -color -shellcheck= 2>&1 | tee "$LOG_DIR/actionlint.log"
+            "$BIN_DIR/actionlint" -color -shellcheck= \
+              2>&1 | tee "$LOG_DIR/actionlint.log"
             echo ${PIPESTATUS[0]} > "$LOG_DIR/actionlint.status"
           else
             echo "[SKIP] actionlint binary missing" | tee "$LOG_DIR/actionlint.log"
             echo 127 > "$LOG_DIR/actionlint.status"
           fi
 
-      # ── (B) yamllint: 엄격 규칙 자동 주입 + 실행 ──────────────────────────────
+      # ─────────── yamllint (엄격 규칙: 파일 없으면 자동 생성) ───────────
       - name: 🧰 Install yamllint
         continue-on-error: true
         run: |
@@ -92,15 +104,14 @@ jobs:
 
       - name: 🧷 Ensure STRICT yamllint config (auto-create)
         shell: bash
+        continue-on-error: true
         run: |
           set -Eeuo pipefail
-          # 레포에 .yamllint가 없더라도 엄격 규칙을 임시 파일로 생성하여 사용
           mkdir -p "$LOG_DIR"
           cat > "$LOG_DIR/yamllint.strict.yml" <<'YAML'
           extends: default
           rules:
-            document-start:
-              present: true
+            document-start: {present: true}
             truthy:
               allowed-values: ['true', 'false']
               check-keys: true
@@ -116,25 +127,27 @@ jobs:
         continue-on-error: true
         run: |
           set -Eeuo pipefail
+          mkdir -p "$LOG_DIR"
           if command -v yamllint >/dev/null 2>&1; then
-            # 레포에 .yamllint가 있으면 그걸 우선 사용, 없으면 우리가 만든 엄격 규칙 사용
             CONF=".yamllint"
             [ -f ".yamllint" ] || CONF="$LOG_DIR/yamllint.strict.yml"
             echo "[INFO] using config: $CONF" | tee "$LOG_DIR/yamllint.cfg.txt"
-            yamllint -c "$CONF" -f standard -s .github/workflows 2>&1 | tee "$LOG_DIR/yamllint.log"
+            yamllint -c "$CONF" -f standard -s .github/workflows \
+              2>&1 | tee "$LOG_DIR/yamllint.log"
             echo ${PIPESTATUS[0]} > "$LOG_DIR/yamllint.status"
           else
             echo "[SKIP] yamllint not installed" | tee "$LOG_DIR/yamllint.log"
             echo 127 > "$LOG_DIR/yamllint.status"
           fi
 
-      # ── (C) 심화 검사: 중복키/inputs<=10 (실패해도 계속) ───────────────────────
+      # ─────────── 심화 검사(중복키/inputs<=10) ───────────
       - name: 🐍 Deep Validate (duplicate keys, inputs<=10)
         shell: bash
         continue-on-error: true
         run: |
           set -Eeuo pipefail
-          python3 -m pip install -q ruamel.yaml pyyaml
+          mkdir -p "$LOG_DIR"
+          python3 -m pip install -q ruamel.yaml pyyaml || true
           python3 - <<'PY' 2>&1 | tee "$LOG_DIR/deep-validate.log"
           import sys, glob, json
           from pathlib import Path
@@ -188,7 +201,7 @@ jobs:
           PY
           echo ${PIPESTATUS[0]} > "$LOG_DIR/deep-validate.status"
 
-      # ── (D) 요약 & 아티팩트 ────────────────────────────────────────────────────
+      # ─────────── 요약 작성 ───────────
       - name: 🧾 Build Summary (always)
         if: ${{ always() }}
         shell: bash
@@ -210,6 +223,18 @@ jobs:
             echo "Failures are *skipped* so the pipeline continues."
             echo "See the 'workflow-lint-dump' artifact for full logs."
           } >> "$GITHUB_STEP_SUMMARY"
+
+      # ─────────── 업로드 직전: 덤프 보장(없으면 README 생성) ───────────
+      - name: 🧷 Ensure dump presence (always)
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set +e  # 어떤 상황에서도 여기서 실패하지 않게
+          mkdir -p "$LOG_DIR"
+          # 최소 1개 파일이 존재하도록 보장
+          if [ -z "$(ls -A "$LOG_DIR" 2>/dev/null)" ]; then
+            echo "Lint dump placeholder. Some steps produced no output." > "$LOG_DIR/README.txt"
+          fi
 
       - name: ⬆️ Upload lint dump (always)
         if: ${{ always() }}
