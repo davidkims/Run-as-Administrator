@@ -16,41 +16,76 @@ jobs:
     timeout-minutes: 20
     env:
       LOG_DIR: ./.lint-dump
-      ACTIONLINT_VERSION: "1.7.1"   # 고정 권장. 최신 쓰려면 "latest"
+      BIN_DIR: ./bin
+      ACTIONLINT_VERSION: "1.7.1"   # 재현성 위해 고정(원하면 latest)
     steps:
       - name: 📥 Checkout
         uses: actions/checkout@v4
 
-      - name: 📁 Prepare dump dir
+      - name: 📁 Prepare dump/bin dirs
         shell: bash
         run: |
           set -Eeuo pipefail
-          mkdir -p "$LOG_DIR"
-          echo "Runner: $(uname -a)" > "$LOG_DIR/env.txt"
-          echo "TS: $(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$LOG_DIR/env.txt"
+          mkdir -p "$LOG_DIR" "$BIN_DIR"
+          {
+            echo "Runner: $(uname -a)"
+            echo "Kernel: $(uname -r)"
+            echo "TS: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } > "$LOG_DIR/env.txt"
 
-      # --- actionlint 설치/실행 (실패해도 계속) ---
-      - name: 🔧 Install actionlint
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          curl -sSfL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash \
-            -o /tmp/download-actionlint.bash
-          bash /tmp/download-actionlint.bash "${ACTIONLINT_VERSION}" ./bin
-          ./bin/actionlint --version | tee -a "$LOG_DIR/env.txt"
-
-      - name: 🔍 Run actionlint (strict)
+      # ---------- actionlint 설치 (실패해도 계속) ----------
+      - name: 🔧 Install actionlint (script + fallback)
         shell: bash
         continue-on-error: true
         run: |
           set -Eeuo pipefail
-          # shellcheck 비활성화(-shellcheck=)로 외부 의존성 배제
-          ./bin/actionlint -color -shellcheck= \
-            2>&1 | tee "$LOG_DIR/actionlint.log"
-          echo $? > "$LOG_DIR/actionlint.status"
+          echo "[INFO] Try official script -> $BIN_DIR" | tee -a "$LOG_DIR/actionlint-install.log"
+          curl -sSfL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash \
+            -o /tmp/download-actionlint.bash
+          # 스크립트 사용법: bash script [VERSION] [DIR]
+          if bash /tmp/download-actionlint.bash "${ACTIONLINT_VERSION}" "$BIN_DIR" >>"$LOG_DIR/actionlint-install.log" 2>&1; then
+            echo "[OK] script installed" | tee -a "$LOG_DIR/actionlint-install.log"
+          else
+            echo "[WARN] script failed; fallback to direct tarball" | tee -a "$LOG_DIR/actionlint-install.log"
+            V="${ACTIONLINT_VERSION}"; PV="v${ACTIONLINT_VERSION}"
+            OS="linux"
+            ARCH_RAW="$(uname -m)"
+            case "$ARCH_RAW" in
+              x86_64) ARCH="amd64" ;;
+              aarch64|arm64) ARCH="arm64" ;;
+              *) ARCH="amd64" ;;  # 보편 폴백
+            esac
+            TARBALL="actionlint_${V}_${OS}_${ARCH}.tar.gz"
+            URL="https://github.com/rhysd/actionlint/releases/download/${PV}/${TARBALL}"
+            echo "[INFO] download ${URL}" | tee -a "$LOG_DIR/actionlint-install.log"
+            curl -fL "$URL" -o "/tmp/${TARBALL}" >>"$LOG_DIR/actionlint-install.log" 2>&1
+            tar -xzf "/tmp/${TARBALL}" -C "$BIN_DIR" >>"$LOG_DIR/actionlint-install.log" 2>&1
+            chmod +x "$BIN_DIR/actionlint" || true
+          fi
+          if [ -x "$BIN_DIR/actionlint" ]; then
+            "$BIN_DIR/actionlint" --version | tee -a "$LOG_DIR/env.txt"
+            echo 0 > "$LOG_DIR/actionlint-install.status"
+          else
+            echo "[FAIL] actionlint not installed" | tee -a "$LOG_DIR/actionlint-install.log"
+            echo 127 > "$LOG_DIR/actionlint-install.status"
+          fi
 
-      # --- yamllint 설치/실행 (실패해도 계속) ---
+      - name: 🔍 Run actionlint (STRICT)
+        shell: bash
+        continue-on-error: true
+        run: |
+          set -Eeuo pipefail
+          if [ -x "$BIN_DIR/actionlint" ]; then
+            "$BIN_DIR/actionlint" -color -shellcheck= 2>&1 | tee "$LOG_DIR/actionlint.log"
+            echo ${PIPESTATUS[0]} > "$LOG_DIR/actionlint.status"
+          else
+            echo "[SKIP] actionlint binary missing" | tee "$LOG_DIR/actionlint.log"
+            echo 127 > "$LOG_DIR/actionlint.status"
+          fi
+
+      # ---------- yamllint 설치/실행 (실패해도 계속) ----------
       - name: 🧰 Install yamllint
+        continue-on-error: true
         run: |
           python3 -m pip install --upgrade pip
           pip install yamllint
@@ -60,19 +95,23 @@ jobs:
         continue-on-error: true
         run: |
           set -Eeuo pipefail
-          yamllint -c .yamllint -f standard -s .github/workflows \
-            2>&1 | tee "$LOG_DIR/yamllint.log"
-          echo $? > "$LOG_DIR/yamllint.status"
+          if command -v yamllint >/dev/null 2>&1; then
+            yamllint -c .yamllint -f standard -s .github/workflows 2>&1 | tee "$LOG_DIR/yamllint.log"
+            echo ${PIPESTATUS[0]} > "$LOG_DIR/yamllint.status"
+          else
+            echo "[SKIP] yamllint not installed" | tee "$LOG_DIR/yamllint.log"
+            echo 127 > "$LOG_DIR/yamllint.status"
+          fi
 
-      # --- 심화 검사: 중복키/입력 10개 제한 (실패해도 계속) ---
+      # ---------- 심화 검사 (중복키/inputs<=10) 실패해도 계속 ----------
       - name: 🐍 Deep Validate (duplicate keys, inputs<=10)
         shell: bash
         continue-on-error: true
         run: |
           set -Eeuo pipefail
-          python3 -m pip install ruamel.yaml pyyaml >/dev/null
+          python3 -m pip install -q ruamel.yaml pyyaml
           python3 - <<'PY' 2>&1 | tee "$LOG_DIR/deep-validate.log"
-          import sys, glob, json, os
+          import sys, glob, json
           from pathlib import Path
           import yaml
           from ruamel.yaml import YAML
@@ -81,30 +120,25 @@ jobs:
           files = sorted(glob.glob(".github/workflows/*.yml") + glob.glob(".github/workflows/*.yaml"))
           print("FILES:", files)
           if not files:
-            print("No workflow files found.")
-            sys.exit(0)
+            print("No workflow files found."); sys.exit(0)
 
           ru = YAML(typ='rt')
           errors, summary = [], []
-
           for f in files:
             p = Path(f)
             try:
               with p.open(encoding="utf-8") as fh:
                 ru.load(fh)
             except DuplicateKeyError as e:
-              errors.append(f"[{f}] Duplicate key: {e}")
-              continue
+              errors.append(f"[{f}] Duplicate key: {e}"); continue
             except Exception as e:
-              errors.append(f"[{f}] ruamel parse error: {e}")
-              continue
+              errors.append(f"[{f}] ruamel parse error: {e}"); continue
 
             try:
               with p.open(encoding="utf-8") as fh:
                 data = yaml.safe_load(fh) or {}
             except Exception as e:
-              errors.append(f"[{f}] PyYAML parse error: {e}")
-              continue
+              errors.append(f"[{f}] PyYAML parse error: {e}"); continue
 
             def count_inputs(kind):
               on = data.get("on") or {}
@@ -114,11 +148,8 @@ jobs:
 
             wc = count_inputs("workflow_call")
             wd = count_inputs("workflow_dispatch")
-
-            if wc > 10:
-              errors.append(f"[{f}] workflow_call.inputs={wc} (>10)")
-            if wd > 10:
-              errors.append(f"[{f}] workflow_dispatch.inputs={wd} (>10)")
+            if wc > 10: errors.append(f"[{f}] workflow_call.inputs={wc} (>10)")
+            if wd > 10: errors.append(f"[{f}] workflow_dispatch.inputs={wd} (>10)")
 
             summary.append({"file": f, "workflow_call_inputs": wc, "workflow_dispatch_inputs": wd})
 
@@ -127,44 +158,46 @@ jobs:
             print(json.dumps(row, ensure_ascii=False))
           if errors:
             print("\n=== ERRORS ===")
-            for e in errors:
-              print(e)
+            for e in errors: print(e)
             sys.exit(1)
           PY
-          echo $? > "$LOG_DIR/deep-validate.status"
+          echo ${PIPESTATUS[0]} > "$LOG_DIR/deep-validate.status"
 
-      # --- 에러 발생 시에도 파이프라인 계속: 여기서 요약 생성 ---
+      # ---------- 요약 및 아티팩트 ----------
       - name: 🧾 Build Summary (always)
         if: ${{ always() }}
         shell: bash
         run: |
           set -Eeuo pipefail
-          A=$([ -f "$LOG_DIR/actionlint.status" ] && cat "$LOG_DIR/actionlint.status" || echo 0)
-          Y=$([ -f "$LOG_DIR/yamllint.status" ] && cat "$LOG_DIR/yamllint.status" || echo 0)
-          D=$([ -f "$LOG_DIR/deep-validate.status" ] && cat "$LOG_DIR/deep-validate.status" || echo 0)
+          read_status(){ [ -f "$1" ] && cat "$1" || echo 0; }
+          AI=$(read_status "$LOG_DIR/actionlint-install.status")
+          AL=$(read_status "$LOG_DIR/actionlint.status")
+          YL=$(read_status "$LOG_DIR/yamllint.status")
+          DV=$(read_status "$LOG_DIR/deep-validate.status")
           {
             echo "## Workflow Lint Summary"
-            echo "- actionlint: $A"
-            echo "- yamllint : $Y"
-            echo "- deep-validate: $D"
+            echo "- actionlint install : ${AI}"
+            echo "- actionlint lint    : ${AL}"
+            echo "- yamllint           : ${YL}"
+            echo "- deep validate      : ${DV}"
             echo
-            echo "### Note"
-            echo "- 규칙은 **엄격**하게 적용되었습니다."
-            echo "- 한 단계라도 실패해도 **파이프라인은 계속 진행**됩니다."
-            echo "- 상세 로그는 아래 아티팩트를 확인하세요."
+            echo "**STRICT rules enabled.**"
+            echo "Any failures were *skipped* so the pipeline continued."
+            echo "See the 'workflow-lint-dump' artifact for full logs."
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # --- 문제 파일 수집(선택) & 아티팩트 업로드 ---
       - name: 📦 Collect offenders (always)
         if: ${{ always() }}
         shell: bash
         run: |
           set -Eeuo pipefail
           mkdir -p "$LOG_DIR/offenders"
-          # yamllint 로그에서 파일 경로 뽑아 저장
           if [ -f "$LOG_DIR/yamllint.log" ]; then
-            awk '{print $1}' "$LOG_DIR/yamllint.log" | sed 's/:$//' | sort -u \
-              | xargs -r -I{} bash -c 'mkdir -p "$LOG_DIR/offenders/$(dirname {})"; cp "{}" "$LOG_DIR/offenders/{}" 2>/dev/null || true'
+            awk '{print $1}' "$LOG_DIR/yamllint.log" | sed 's/:$//' | grep '^\.github/workflows/' | sort -u \
+              | while read -r f; do
+                  mkdir -p "$LOG_DIR/offenders/$(dirname "$f")"
+                  cp "$f" "$LOG_DIR/offenders/$f" 2>/dev/null || true
+                done
           fi
 
       - name: ⬆️ Upload lint dump (always)
