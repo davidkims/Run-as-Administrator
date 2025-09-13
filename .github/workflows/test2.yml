@@ -534,7 +534,7 @@ jobs:
       GH_USER: ${{ github.actor }}
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - name: Guard: GHCR token present?
+      - name: Guard:GHCR token present?
         id: guard
         shell: bash
         run: |
