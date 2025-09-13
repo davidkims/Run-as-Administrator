@@ -1,4 +1,4 @@
-name: Dependabot Updates via Proxy + Full Scan & Servers (Echoe, No-Skip, Full-Create)
+name: Dependabot Updates via Proxy + Full Scan & Servers (Echoe, No-Skip, Hardened)
 
 on:
   schedule:
@@ -29,17 +29,23 @@ env:
   NO_PROXY: ${{ secrets.NO_PROXY }}
   PROXY_HOST: ${{ secrets.PROXY_HOST }}
   PROXY_PORT: ${{ secrets.PROXY_PORT }}
+  SYFT_VERSION: "1.16.0"     # 고정 버전(존재 확인됨)
+  TRIVY_VERSION: ""          # (옵션) 비워두면 설치 스크립트 최신
 
+# ────────────────────────────────────────────────────────────────────────────────
+# 공통: echoe 헬퍼를 모든 잡에서 정의 후 사용합니다(모든 커맨드를 echoe "…"로 실행).
+# echoe는 항상 0을 반환해 스텝 실패를 막고, 실제 RC는 로그에 남깁니다.
+# ────────────────────────────────────────────────────────────────────────────────
 jobs:
   prepare-files:
     name: 1) Prepare (필수 파일 100% 생성) + Echoe
     runs-on: ubuntu-latest
     outputs:
-      created_any: ${{ steps.flags.outputs.created_any }}
+      created_any: ${{ steps.commitflag.outputs.created_any }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Define Echoe helper (non-fatal)
+      - name: Define echoe helper (non-fatal)
         shell: bash
         run: |
           mkdir -p dist/echo
@@ -47,9 +53,6 @@ jobs:
           cat > /tmp/echo_helpers.sh <<'EOS'
           set -Euo pipefail
           TS(){ date -u +'%Y-%m-%dT%H:%M:%SZ'; }
-          log(){ echo "[INFO  $(TS)] $*"; }
-          warn(){ echo "[WARN  $(TS)] $*" >&2; }
-          # echoe: print + log + eval; NEVER fail the step
           echoe(){
             if [ "$#" -eq 0 ]; then return 0; fi
             local CMD="$*"
@@ -75,7 +78,7 @@ jobs:
           source /tmp/echo_helpers.sh
           echoe "mkdir -p .github dist/site dist/sql src/main/java/com/example"
 
-      - name: Create .gitignore (if missing) + echoe
+      - name: Create .gitignore/.dockerignore/README + echoe
         shell: bash
         run: |
           source /tmp/echo_helpers.sh
@@ -85,22 +88,12 @@ jobs:
           *.log
           .DS_Store
           GIT"
-
-      - name: Create .dockerignore (if missing) + echoe
-        shell: bash
-        run: |
-          source /tmp/echo_helpers.sh
           [ -f .dockerignore ] || echoe "cat > .dockerignore <<'DOCKERIGNORE'
           .git
           dist
           target
           *.log
           DOCKERIGNORE"
-
-      - name: Create README.md (if missing) + echoe
-        shell: bash
-        run: |
-          source /tmp/echo_helpers.sh
           [ -f README.md ] || echoe "cat > README.md <<'MD'
           # Auto-Initialized Repo (EchoOps)
           - Dependabot config
@@ -110,7 +103,7 @@ jobs:
           - Echo replay: dist/echo/replay.sh
           MD"
 
-      - name: Create Dependabot config (if missing) + echoe
+      - name: Create Dependabot config + echoe
         shell: bash
         run: |
           source /tmp/echo_helpers.sh
@@ -136,7 +129,7 @@ jobs:
               open-pull-requests-limit: 10
           YML"
 
-      - name: Create minimal Maven project (if missing) + echoe
+      - name: Create minimal Maven project + echoe (idempotent)
         shell: bash
         run: |
           source /tmp/echo_helpers.sh
@@ -183,7 +176,7 @@ jobs:
             JAVA"
           fi
 
-      - name: Create safe Dockerfile (if missing) + echoe
+      - name: Create Dockerfile + echoe (idempotent)
         shell: bash
         run: |
           source /tmp/echo_helpers.sh
@@ -218,7 +211,7 @@ jobs:
           SQL"
 
       - name: Detect changes & optionally commit (non-fatal) + echoe
-        id: commit
+        id: commitflag
         shell: bash
         env:
           DO_COMMIT: ${{ github.event.inputs.commit_changes || 'true' }}
@@ -231,8 +224,6 @@ jobs:
               echoe "git add -A"
               echoe "git commit -m '[AUTO] Initialize required files (dependabot/maven/docker/site/sql)'"
               echoe "git push || true"
-            else
-              log "commit_changes=false → skip commit"
             fi
             echo "created_any=true" >> "$GITHUB_OUTPUT"
           else
@@ -249,11 +240,8 @@ jobs:
           set -Eeuo pipefail
           # Replay echoe-captured commands
           SH"
-          # 본 실행 로그를 스크립트에 기록
           sed 's/^\[ECHO.*\] //' /tmp/echo_commands.log >> dist/echo/replay.sh || true
           echoe "chmod +x dist/echo/replay.sh"
-        continue-on-error: true
-
       - uses: actions/upload-artifact@v4
         with:
           name: prepared-files
@@ -270,20 +258,14 @@ jobs:
             dist/echo/replay.sh
             /tmp/echo_commands.log
 
-      - name: Export flag
-        id: flags
-        shell: bash
-        run: |
-          echo "created_any=${{ steps.commit.outputs.created_any }}" >> "$GITHUB_OUTPUT" || true
-
   build:
-    name: 2) Build (Maven & Docker) + Echoe
+    name: 2) Build (Maven & Docker) + Echoe (no-skip)
     runs-on: ubuntu-latest
     needs: [prepare-files]
     if: always()
     steps:
       - uses: actions/checkout@v4
-      - name: Load echoe
+      - name: Load echoe & preflight files (idempotent)
         shell: bash
         run: |
           cat > /tmp/echo_helpers.sh <<'EOS'
@@ -291,16 +273,31 @@ jobs:
           TS(){ date -u +'%Y-%m-%dT%H:%M:%SZ'; }
           echoe(){ local CMD="$*"; echo "[ECHO  $(TS)] $CMD"; bash -lc "$CMD"; echo "[ECHO  $(TS)] RC=$?"; return 0; }
           EOS
+          source /tmp/echo_helpers.sh
+          echoe "mkdir -p src/main/java/com/example dist/site dist/sql"
+          [ -f pom.xml ] || echoe "cat > pom.xml <<'POM'
+          <project><modelVersion>4.0.0</modelVersion><groupId>com.example</groupId><artifactId>auto-sample</artifactId><version>0.0.1</version></project>
+          POM"
+          [ -f src/main/java/com/example/App.java ] || echoe "cat > src/main/java/com/example/App.java <<'JAVA'
+          package com.example; public class App { public static void main(String[] a){ System.out.println(\"Hello\"); } }
+          JAVA"
+          [ -f Dockerfile ] || echoe "cat > Dockerfile <<'D'
+          FROM alpine:3.19
+          CMD [\"sh\",\"-c\",\"echo Auto Docker image OK; sleep 2\"]
+          D"
+
       - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
-      - name: Build with Maven (no-skip) + echoe
+
+      - name: Build with Maven (echoe)
         shell: bash
         run: |
           source /tmp/echo_helpers.sh
           echoe "mvn -B -V -e -DskipTests package"
-      - name: Build Docker image (no-skip) + echoe
+
+      - name: Build Docker image (echoe)
         shell: bash
         run: |
           source /tmp/echo_helpers.sh
@@ -326,18 +323,22 @@ jobs:
         run: |
           source /tmp/echo_helpers.sh
           echoe "mkdir -p dist/reports dist/sbom"
-      - name: Gitleaks (secrets scan, no fail)
+
+      - name: Gitleaks (secrets scan, do not fail)
         uses: gitleaks/gitleaks-action@v2
         with:
           args: --no-banner --redact --exit-code 0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - name: Install Syft + echoe
+
+      - name: Install Syft (release tar.gz) + echoe
         shell: bash
         run: |
           source /tmp/echo_helpers.sh
-          echoe "curl -fsSL https://raw.githubusercontent.com/anchore/sbom-action/main/install.sh | bash -s -- -b /usr/local/bin v1.31.0"
-          echoe "syft version"
+          echoe "curl -sSfL https://github.com/anchore/syft/releases/download/v${SYFT_VERSION}/syft_${SYFT_VERSION}_linux_amd64.tar.gz -o /tmp/syft.tgz"
+          echoe "sudo tar -xzf /tmp/syft.tgz -C /usr/local/bin syft || tar -xzf /tmp/syft.tgz -C /usr/local/bin syft"
+          echoe "syft version || true"
+
       - name: Generate SBOM (image or dir) + echoe
         shell: bash
         run: |
@@ -347,6 +348,7 @@ jobs:
           else
             echoe "syft packages dir:. -o spdx-json > dist/sbom/sbom-source.spdx.json"
           fi
+
       - name: Install Trivy + echoe
         shell: bash
         run: |
@@ -354,12 +356,14 @@ jobs:
           echoe "sudo apt-get update"
           echoe "sudo apt-get install -y wget"
           echoe "wget -qO- https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh"
-          echoe "./bin/trivy --version"
+          echoe "./bin/trivy --version || true"
+
       - name: Trivy FS scan (no-fail) + echoe
         shell: bash
         run: |
           source /tmp/echo_helpers.sh
           echoe "./bin/trivy fs --no-progress --format sarif --output dist/reports/trivy-fs.sarif . || true"
+
       - name: Trivy Image scan (no-fail) + echoe
         shell: bash
         run: |
@@ -367,6 +371,7 @@ jobs:
           if docker image inspect myapp:latest >/dev/null 2>&1; then
             echoe "./bin/trivy image --no-progress --format sarif --output dist/reports/trivy-image.sarif myapp:latest || true"
           fi
+
       - uses: actions/upload-artifact@v4
         with:
           name: security-reports
@@ -381,7 +386,7 @@ jobs:
     if: always()
     steps:
       - uses: actions/checkout@v4
-      - name: Load echoe
+      - name: Load echoe & preflight files
         shell: bash
         run: |
           cat > /tmp/echo_helpers.sh <<'EOS'
@@ -389,18 +394,25 @@ jobs:
           TS(){ date -u +'%Y-%m-%dT%H:%M:%SZ'; }
           echoe(){ local CMD="$*"; echo "[ECHO  $(TS)] $CMD"; bash -lc "$CMD"; echo "[ECHO  $(TS)] RC=$?"; return 0; }
           EOS
-      - name: Write/refresh health page + echoe
-        shell: bash
-        run: |
           source /tmp/echo_helpers.sh
-          echoe "mkdir -p dist/site"
-          echoe "cat > dist/site/index.html <<'HTML'
+          echoe "mkdir -p dist/site dist/sql"
+          [ -f dist/sql/init.sql ] || echoe "cat > dist/sql/init.sql <<'SQL'
+          CREATE TABLE IF NOT EXISTS accounts(
+            id INT PRIMARY KEY AUTO_INCREMENT,
+            owner VARCHAR(64),
+            balance DECIMAL(18,2),
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+          );
+          INSERT INTO accounts(owner, balance) VALUES ('alice', 1000.00), ('bob', 500.50);
+          SQL"
+          [ -f dist/site/index.html ] || echoe "cat > dist/site/index.html <<'HTML'
           <h1>Echo Test OK</h1>
           HTML"
           echoe "cat > dist/site/health.json <<'JSON'
           { \"status\": \"ok\", \"ts\": \"__TS__\" }
           JSON"
           echoe "sed -i 's/__TS__/$(date -u +\"%Y-%m-%dT%H:%M:%SZ\")/' dist/site/health.json"
+
       - name: Run nginx (serve :8080) + echoe
         shell: bash
         run: |
@@ -408,19 +420,21 @@ jobs:
           echoe "docker run -d --rm --name echo_nginx -p 8080:80 -v '${{ github.workspace }}/dist/site:/usr/share/nginx/html:ro' nginx:alpine"
           echoe "sleep 3"
           echoe "curl -sSf http://127.0.0.1:8080/ | head -n1"
+
       - name: Run MySQL & health wait + echoe
         env:
           MYSQL_ROOT_PASSWORD: rootpass
         shell: bash
         run: |
           source /tmp/echo_helpers.sh
-          echoe "docker run -d --rm --name echo_mysql -e MYSQL_ROOT_PASSWORD='${MYSQL_ROOT_PASSWORD}' -e MYSQL_DATABASE=echo_db -p 3306:3306 --health-cmd='mysqladmin ping -h 127.0.0.1 -p${MYSQL_ROOT_PASSWORD} --silent' --health-interval=10s --health-timeout=5s --health-retries=6 mysql:8.0"
-          for i in $(seq 1 30); do
+          echoe "docker run -d --rm --name echo_mysql -e MYSQL_ROOT_PASSWORD='${MYSQL_ROOT_PASSWORD}' -e MYSQL_DATABASE=echo_db -p 3306:3306 --health-cmd='mysqladmin ping -h 127.0.0.1 -p${MYSQL_ROOT_PASSWORD} --silent' --health-interval=10s --health-timeout=5s --health-retries=8 mysql:8.0"
+          for i in $(seq 1 40); do
             ST="$(docker inspect --format='{{.State.Health.Status}}' echo_mysql 2>/dev/null || echo starting)"
-            echo "[ECHO  $(date -u +'%Y-%m-%dT%H:%M:%SZ')] mysql health=$ST ($i/30)"
+            echo "[ECHO  $(date -u +'%Y-%m-%dT%H:%M:%SZ')] mysql health=$ST ($i/40)"
             if echo "$ST" | grep -q healthy; then break; fi
             sleep 3
           done
+
       - name: Init & query MySQL + echoe
         env:
           MYSQL_ROOT_PASSWORD: rootpass
@@ -429,13 +443,15 @@ jobs:
           source /tmp/echo_helpers.sh
           echoe "cat dist/sql/init.sql | docker exec -i echo_mysql sh -lc 'mysql -uroot -p\"$MYSQL_ROOT_PASSWORD\" echo_db'"
           echoe "docker exec -i echo_mysql sh -lc 'mysql -uroot -p\"$MYSQL_ROOT_PASSWORD\" -e \"SELECT * FROM echo_db.accounts;\"' | tee dist/sql/select_accounts.txt"
-      - name: Stamp & collect artifacts + echoe
+
+      - name: Upload server artifacts
         uses: actions/upload-artifact@v4
         with:
           name: server-outputs
           path: |
             dist/site/**
             dist/sql/**
+
       - name: Teardown containers (no-skip) + echoe
         if: always()
         shell: bash
