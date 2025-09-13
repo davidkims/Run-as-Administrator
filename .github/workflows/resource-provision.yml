@@ -6,7 +6,7 @@ on:
 jobs:
   expand:
     runs-on: ubuntu-latest
-    timeout-minutes: 1800
+    timeout-minutes: 30  # 작업 완료 보장을 위한 타임아웃 설정
     steps:
       - name: 🧹 Free Disk Space
         run: |
@@ -14,16 +14,29 @@ jobs:
           sudo rm -rf /usr/share/dotnet
           sudo rm -rf /opt/ghc
           sudo docker system prune -af || true
+          sudo apt clean
+          sudo rm -rf /var/lib/apt/lists/*
           df -h
+
       - name: 🧮 Add Swap for Memory
         run: |
-          sudo fallocate -l 10G /swapfile
+          # 기존 스왑 비활성화 및 제거 (존재할 경우)
+          sudo swapoff -a
+          sudo rm -f /swapfile
+
+          # 새로운 20GB 스왑 파일 생성 및 활성화
+          sudo fallocate -l 20G /swapfile
           sudo chmod 600 /swapfile
           sudo mkswap /swapfile
           sudo swapon /swapfile
+          echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
           free -h
-      - name: ⏳ Keep Runner Alive
-        run: |
-          echo "Sleeping for up to 30 hours to keep the runner active"
-          sleep 108000
 
+      - name: 📈 Extend Disk Space (임시 볼륨 확장)
+        run: |
+          # 임시 디렉토리를 더 큰 디스크 공간이 있는 곳으로 이동
+          sudo mkdir -p /mnt/temp
+          sudo mount -t tmpfs -o size=10G tmpfs /mnt/temp
+          export TEMP=/mnt/temp
+          export TMPDIR=/mnt/temp
+          df -h
