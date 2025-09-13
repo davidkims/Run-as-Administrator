@@ -1,3 +1,4 @@
+# .github/workflows/validate-workflows.yml
 name: "✅ Validate Workflow Syntax (strict, guaranteed dump)"
 
 on:
@@ -5,43 +6,58 @@ on:
     paths: [".github/workflows/**", ".yamllint"]
   pull_request:
     paths: [".github/workflows/**", ".yamllint"]
+  schedule:
+    - cron: "0 18 * * *"   # 매일 KST 03:00 (UTC 18:00)
+    - cron: "0 18 * * 6"   # 매주 일요일 KST 03:00 (UTC 토요일 18:00)
+  workflow_dispatch: {}
 
 permissions:
   contents: read
+
+concurrency:
+  group: "validate-workflows-${{ github.ref }}"
+  cancel-in-progress: true
 
 jobs:
   validate:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
-      LOG_DIR: ./.lint-dump           # 숨김 원본
-      STAGING_DIR: ./lint-dump        # 비숨김 스테이징
+      LOG_DIR: ./.lint-dump         # 숨김 원본
+      STAGING_DIR: ./lint-dump      # 비숨김 스테이징
       BIN_DIR: ./bin
-      ACTIONLINT_VERSION: "1.7.1"
+      ACTIONLINT_VERSION: "1.7.1"   # 재현성 위해 고정(원하면 latest)
 
     steps:
       - name: 📥 Checkout
         uses: actions/checkout@v4
 
+      # ── 덤프 디렉토리/바이너리 경로 선보장 ──────────────────────────────────────
       - name: 📁 Prepare dump/bin dirs
         shell: bash
         run: |
           set -Eeuo pipefail
           mkdir -p "$LOG_DIR" "$BIN_DIR"
           echo "Start lint run at $(date -u)" > "$LOG_DIR/README.txt"
+          {
+            echo "Runner: $(uname -a)"
+            echo "Kernel: $(uname -r)"
+            echo "TS: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } > "$LOG_DIR/env.txt"
 
+      # ── actionlint 설치 (공식 스크립트 → tarball 폴백), 실패해도 진행 ──────────
       - name: 🔧 Install actionlint (script + fallback)
         shell: bash
         continue-on-error: true
         run: |
           set -Eeuo pipefail
-          mkdir -p "$LOG_DIR" "$BIN_DIR"
           : > "$LOG_DIR/actionlint-install.log"
           curl -sSfL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash \
             -o /tmp/download-actionlint.bash
           if bash /tmp/download-actionlint.bash "${ACTIONLINT_VERSION}" "$BIN_DIR" >>"$LOG_DIR/actionlint-install.log" 2>&1; then
-            :
+            echo "[OK] actionlint installed via script" >> "$LOG_DIR/actionlint-install.log"
           else
+            echo "[WARN] script failed; fallback to tarball" >> "$LOG_DIR/actionlint-install.log"
             V="${ACTIONLINT_VERSION}"; PV="v${ACTIONLINT_VERSION}"
             OS="linux"
             case "$(uname -m)" in x86_64) ARCH=amd64;; aarch64|arm64) ARCH=arm64;; *) ARCH=amd64;; esac
@@ -68,6 +84,7 @@ jobs:
             echo "[SKIP] actionlint binary missing" | tee "$LOG_DIR/actionlint.log"
           fi
 
+      # ── yamllint 설치 + 레포에 .yamllint 없으면 엄격 규칙 자동 생성 ────────────
       - name: 🧰 Install yamllint
         continue-on-error: true
         run: |
@@ -76,9 +93,9 @@ jobs:
 
       - name: 🧷 Ensure STRICT yamllint config (auto-create if absent)
         shell: bash
+        continue-on-error: true
         run: |
           set -Eeuo pipefail
-          mkdir -p "$LOG_DIR"
           cat > "$LOG_DIR/yamllint.strict.yml" <<'YAML'
           extends: default
           rules:
@@ -106,6 +123,7 @@ jobs:
             echo "[SKIP] yamllint not installed" | tee "$LOG_DIR/yamllint.log"
           fi
 
+      # ── 심화 검사: 중복 키 + inputs ≤ 10 (실패해도 진행) ───────────────────────
       - name: 🐍 Deep Validate (duplicate keys, inputs<=10)
         shell: bash
         continue-on-error: true
@@ -164,7 +182,7 @@ jobs:
             sys.exit(1)
           PY
 
-      # ── 덤프 보장: 비어 있으면 placeholder 작성
+      # ── 반드시 무언가 남도록 보장 ───────────────────────────────────────────────
       - name: 🧷 Ensure dump presence (always)
         if: ${{ always() }}
         shell: bash
@@ -172,7 +190,7 @@ jobs:
           mkdir -p "$LOG_DIR"
           [ -s "$LOG_DIR/README.txt" ] || echo "Lint dump placeholder." > "$LOG_DIR/README.txt"
 
-      # ── 숨김폴더 업로드 문제 해결: 스테이징 후 업로드
+      # ── 숨김 폴더 업로드 이슈 회피: 스테이징 → 업로드 ───────────────────────────
       - name: 📦 Stage dump to non-hidden dir (always)
         if: ${{ always() }}
         shell: bash
@@ -180,11 +198,9 @@ jobs:
           set -Eeuo pipefail
           rm -rf "$STAGING_DIR"
           mkdir -p "$STAGING_DIR"
-          # .lint-dump 존재/내용 유무와 상관없이 스테이징 생성
           if [ -d "$LOG_DIR" ]; then
             cp -a "$LOG_DIR/." "$STAGING_DIR/" || true
           fi
-          # 최종적으로 비어 있어도 최소 파일 1개 보장
           if [ -z "$(ls -A "$STAGING_DIR" 2>/dev/null)" ]; then
             echo "No logs produced." > "$STAGING_DIR/README.txt"
           fi
@@ -195,6 +211,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: workflow-lint-dump
-          path: ./lint-dump/**    # ← 비숨김 스테이징 경로
+          path: ./lint-dump/**
           if-no-files-found: error
           retention-days: 7
