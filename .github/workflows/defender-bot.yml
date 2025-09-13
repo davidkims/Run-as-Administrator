@@ -2,7 +2,7 @@ name: Dependabot Updates via Proxy + Full Scan & Servers
 
 on:
   schedule:
-    - cron: '0 0 * * 1'   # 매주 월요일 00:00
+    - cron: '0 0 * * 1'   # 매주 월요일 00:00 KST
   workflow_dispatch:
   pull_request:
     types: [opened, reopened, synchronize]
@@ -16,10 +16,10 @@ on:
 permissions:
   contents: write
   pull-requests: write
-  security-events: write  # (선택) Code scanning 업로드 시 필요
+  security-events: write
 
-# 전역 프록시(대문자만)
 env:
+  # 대문자 프록시 환경변수만 전역으로 노출
   HTTP_PROXY: ${{ secrets.HTTP_PROXY }}
   HTTPS_PROXY: ${{ secrets.HTTPS_PROXY }}
   NO_PROXY: ${{ secrets.NO_PROXY }}
@@ -27,47 +27,23 @@ env:
   PROXY_PORT: ${{ secrets.PROXY_PORT }}
 
 jobs:
-  run-dependabot:
-    name: Run Dependabot via Proxy (Maven & Docker)
-    if: ${{ github.event_name != 'pull_request' }}  # 스케줄/수동 실행에서만
+  # ⚠️ Dependabot 실행 자체는 dependabot.yml이 담당.
+  # 이 잡은 "구성 검증 + 트리거 힌트"만 제공 (옵셔널).
+  check-config:
+    name: Check dependabot.yml presence
+    if: ${{ github.event_name != 'pull_request' }}
     runs-on: ubuntu-latest
     steps:
-      - name: Configure apt proxy (system-wide)
+      - uses: actions/checkout@v4
+      - name: Ensure .github/dependabot.yml exists
         run: |
-          if [ -n "${HTTP_PROXY}" ]; then
-            echo "Acquire::http::Proxy \"${HTTP_PROXY}\";" | sudo tee /etc/apt/apt.conf.d/99proxy
-          fi
-          if [ -n "${HTTPS_PROXY}" ]; then
-            echo "Acquire::https::Proxy \"${HTTPS_PROXY}\";" | sudo tee -a /etc/apt/apt.conf.d/99proxy
-          fi
-
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Export JVM/Maven proxy to $GITHUB_ENV
+          test -f .github/dependabot.yml || {
+            echo "::error::missing .github/dependabot.yml"
+            exit 1
+          }
+      - name: Show dependabot.yml (redacted)
         run: |
-          echo "MAVEN_OPTS=-Dhttp.proxyHost=${PROXY_HOST} -Dhttp.proxyPort=${PROXY_PORT} -Dhttps.proxyHost=${PROXY_HOST} -Dhttps.proxyPort=${PROXY_PORT}" >> "$GITHUB_ENV"
-          echo "JAVA_TOOL_OPTIONS=-Dhttp.proxyHost=${PROXY_HOST} -Dhttp.proxyPort=${PROXY_PORT} -Dhttps.proxyHost=${PROXY_HOST} -Dhttps.proxyPort=${PROXY_PORT}" >> "$GITHUB_ENV"
-
-      - name: Dependabot for Maven (via proxy)
-        run: |
-          docker run --rm \
-            -e GITHUB_ACCESS_TOKEN=${{ secrets.GITHUB_TOKEN }} \
-            -e HTTP_PROXY="${HTTP_PROXY}" \
-            -e HTTPS_PROXY="${HTTPS_PROXY}" \
-            -e NO_PROXY="${NO_PROXY}" \
-            -v "${{ github.workspace }}":/home/dependabot/app \
-            ghcr.io/dependabot/dependabot-core update maven /home/dependabot/app
-
-      - name: Dependabot for Docker (via proxy)
-        run: |
-          docker run --rm \
-            -e GITHUB_ACCESS_TOKEN=${{ secrets.GITHUB_TOKEN }} \
-            -e HTTP_PROXY="${HTTP_PROXY}" \
-            -e HTTPS_PROXY="${HTTPS_PROXY}" \
-            -e NO_PROXY="${NO_PROXY}" \
-            -v "${{ github.workspace }}":/home/dependabot/app \
-            ghcr.io/dependabot/dependabot-core update docker /home/dependabot/app
+          sed -E 's/(token|password|username):.*/\1: ***REDACTED***/' .github/dependabot.yml || true
 
   validate-pr:
     name: Validate Dependabot PR (Build & Image)
@@ -83,8 +59,7 @@ jobs:
             echo "Acquire::https::Proxy \"${HTTPS_PROXY}\";" | sudo tee -a /etc/apt/apt.conf.d/99proxy
           fi
 
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Export JVM/Maven proxy to $GITHUB_ENV
         run: |
@@ -112,6 +87,7 @@ jobs:
     name: Full Security Scans (Gitleaks + SBOM + Trivy)
     runs-on: ubuntu-latest
     needs: [validate-pr]
+    if: ${{ always() && needs.validate-pr.result != 'skipped' }}
     steps:
       - name: Configure apt proxy (system-wide)
         run: |
@@ -122,19 +98,15 @@ jobs:
             echo "Acquire::https::Proxy \"${HTTPS_PROXY}\";" | sudo tee -a /etc/apt/apt.conf.d/99proxy
           fi
 
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Prepare dirs
-        run: |
-          mkdir -p dist/reports dist/sbom
+        run: mkdir -p dist/reports dist/sbom
 
       - name: Gitleaks (secrets scan)
         uses: gitleaks/gitleaks-action@v2
         with:
-          # 기본 detect; 실패 시 워크플로우 실패 방지하려면 args: "--no-banner --redact --exit-code 0"
-          # 여기서는 실패 시 알리기 위해 기본 설정 유지
-          args: --redact -v
+          args: --no-banner --redact --exit-code 1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -167,8 +139,7 @@ jobs:
           ./bin/trivy --version
 
       - name: Trivy (FS scan)
-        run: |
-          ./bin/trivy fs --no-progress --format sarif --output dist/reports/trivy-fs.sarif .
+        run: ./bin/trivy fs --no-progress --format sarif --output dist/reports/trivy-fs.sarif .
 
       - name: Trivy (Image scan, if built)
         run: |
@@ -189,10 +160,10 @@ jobs:
   servers:
     name: Spin-up Test Servers (nginx + MySQL via containers)
     runs-on: ubuntu-latest
-    needs: [run-dependabot, security-scans]
+    needs: [validate-pr, security-scans]
+    if: ${{ always() && needs.validate-pr.result != 'skipped' }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Create example files (configs, health pages)
         run: |
@@ -223,7 +194,6 @@ jobs:
             --health-cmd="mysqladmin ping -h 127.0.0.1 -p${MYSQL_ROOT_PASSWORD} --silent" \
             --health-interval=10s --health-timeout=5s --health-retries=6 \
             mysql:8.0
-          # 대기
           for i in $(seq 1 30); do
             if docker inspect --format='{{.State.Health.Status}}' echo_mysql 2>/dev/null | grep -q healthy; then
               echo "MySQL healthy"; break
