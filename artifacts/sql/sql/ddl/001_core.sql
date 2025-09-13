@@ -15,7 +15,6 @@ create table if not exists journal_entries (
   memo text
 );
 create index if not exists ix_journal_account_ts on journal_entries(account_no, ts);
-
 create table if not exists transactions (
   txn_id bigserial primary key,
   ts timestamptz not null default now(),
@@ -27,7 +26,6 @@ create table if not exists transactions (
   note text
 );
 create index if not exists ix_txn_account_ts on transactions(account_no, ts);
-
 create table if not exists balances (
   account_no varchar(32) primary key,
   balance numeric(18,2) not null default 0

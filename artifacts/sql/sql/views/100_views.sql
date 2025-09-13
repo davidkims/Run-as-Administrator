@@ -6,12 +6,9 @@ select date_trunc('day', ts) as d,
 from transactions
 group by 1
 order by 1;
-
 create or replace view v_balance_sheet as
 select sum(balance) as total_assets
 from balances;
-
--- TD-Sim: Teradata 스타일 요약 뷰(간단)
 create or replace view td_sim_daily as
 select date_trunc('day', ts) as d,
        count(*) as txn_cnt,
