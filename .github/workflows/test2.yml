@@ -245,8 +245,8 @@ jobs:
                 SUM_TYPE="sha256"
                 SUM_URL="https://download.rockylinux.org/pub/rocky/9/isos/x86_64/CHECKSUM";;
               alma|rhel)
-                ISO_URL="https://repo.almalinux.org/almalinux/9/isos/x86_64/AlmaLinux-9-latest-x86_64-minimal.iso"
-                FILE_NAME="AlmaLinux-9-latest-x86_64-minimal.iso"
+                ISO_URL="https://repo.almalinux.org/almalinux/9/isos/x86_64/AlmaLinux-9-latest_x86_64-minimal.iso"
+                FILE_NAME="AlmaLinux-9-latest_x86_64-minimal.iso"
                 SUM_TYPE="sha256"
                 SUM_URL="https://repo.almalinux.org/almalinux/9/isos/x86_64/CHECKSUM"
                 [ "$d" = "rhel" ] && FALLBACK_NOTE="Requested 'rhel' but used AlmaLinux (auth required for RHEL).";;
@@ -581,8 +581,6 @@ jobs:
       - name: Guard:S3 config present?
         id: guard
         shell: bash
-        env:
-          ECHO_S3_BUCKET: ${{ secrets.ECHO_S3_BUCKET }}
         run: |
           if [ -n "${ECHO_S3_BUCKET:-}" ]; then
             echo "run=true" >> "$GITHUB_OUTPUT"
@@ -605,11 +603,11 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
 
-      - name: Sync dist/ → s3://${{ secrets.ECHO_S3_BUCKET }}/
+      - name: Sync dist/ → s3://${{ env.ECHO_S3_BUCKET }}/
         if: ${{ steps.guard.outputs.run == 'true' }}
         shell: bash
         run: |
-          aws s3 sync "dist/" "s3://${{ secrets.ECHO_S3_BUCKET }}/" --delete || true
+          aws s3 sync "dist/" "s3://${ECHO_S3_BUCKET}/" --delete || true
 
   deploy-azure:
     name: "Deploy to Azure Blob (small dist)"
@@ -619,10 +617,6 @@ jobs:
       - name: Guard:Azure config present?
         id: guard
         shell: bash
-        env:
-          AZURE_STORAGE_ACCOUNT: ${{ secrets.AZURE_STORAGE_ACCOUNT }}
-          AZURE_STORAGE_KEY: ${{ secrets.AZURE_STORAGE_KEY }}
-          ECHO_AZURE_CONTAINER: ${{ secrets.ECHO_AZURE_CONTAINER }}
         run: |
           if [ -n "${AZURE_STORAGE_ACCOUNT:-}" ] && [ -n "${AZURE_STORAGE_KEY:-}" ] && [ -n "${ECHO_AZURE_CONTAINER:-}" ]; then
             echo "run=true" >> "$GITHUB_OUTPUT"
@@ -642,9 +636,9 @@ jobs:
         run: |
           curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash || true
           az storage blob upload-batch \
-            --account-name "${{ secrets.AZURE_STORAGE_ACCOUNT }}" \
-            --account-key "${{ secrets.AZURE_STORAGE_KEY }}" \
-            -d "${{ secrets.ECHO_AZURE_CONTAINER }}" \
+            --account-name "${AZURE_STORAGE_ACCOUNT}" \
+            --account-key "${AZURE_STORAGE_KEY}" \
+            -d "${ECHO_AZURE_CONTAINER}" \
             -s "dist" --overwrite true || true
 
   deploy-gcs:
@@ -655,8 +649,6 @@ jobs:
       - name: Guard:GCS bucket present?
         id: guard
         shell: bash
-        env:
-          ECHO_GCS_BUCKET: ${{ secrets.ECHO_GCS_BUCKET }}
         run: |
           if [ -n "${ECHO_GCS_BUCKET:-}" ]; then
             echo "run=true" >> "$GITHUB_OUTPUT"
@@ -670,14 +662,26 @@ jobs:
         with:
           name: dist-small-merged-${{ github.run_id }}
 
+      # NEW: guard WIF in a step (no secrets.* in expressions)
+      - name: Guard:GCP WIF present?
+        id: guard_wif
+        if: ${{ steps.guard.outputs.run == 'true' }}
+        shell: bash
+        run: |
+          if [ -n "${GCP_WORKLOAD_IDENTITY_PROVIDER:-}" ] && [ -n "${GCP_SERVICE_ACCOUNT:-}" ]; then
+            echo "wif=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "wif=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Auth (optional WIF)
         id: wif
-        if: ${{ steps.guard.outputs.run == 'true' && secrets.GCP_WORKLOAD_IDENTITY_PROVIDER != '' && secrets.GCP_SERVICE_ACCOUNT != '' }}
+        if: ${{ steps.guard.outputs.run == 'true' && steps.guard_wif.outputs.wif == 'true' }}
         uses: google-github-actions/auth@v2
         with:
-          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
-          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
-          project_id: ${{ secrets.GCP_PROJECT_ID }}
+          workload_identity_provider: ${{ env.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ env.GCP_SERVICE_ACCOUNT }}
+          project_id: ${{ env.GCP_PROJECT_ID }}
 
       - name: Setup gcloud
         if: ${{ steps.guard.outputs.run == 'true' }}
@@ -686,8 +690,6 @@ jobs:
       - name: rsync to GCS
         if: ${{ steps.guard.outputs.run == 'true' }}
         shell: bash
-        env:
-          ECHO_GCS_BUCKET: ${{ secrets.ECHO_GCS_BUCKET }}
         run: |
           gsutil -m rsync -d -r "dist" "gs://${ECHO_GCS_BUCKET}" || true
 
