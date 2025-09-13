@@ -14,7 +14,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
-      LOG_DIR: ./.lint-dump
+      LOG_DIR: ./.lint-dump           # 숨김 원본
+      STAGING_DIR: ./lint-dump        # 비숨김 스테이징
       BIN_DIR: ./bin
       ACTIONLINT_VERSION: "1.7.1"
 
@@ -22,7 +23,6 @@ jobs:
       - name: 📥 Checkout
         uses: actions/checkout@v4
 
-      # ───── 모든 단계에서 덤프 디렉토리 미리 생성 ─────
       - name: 📁 Prepare dump/bin dirs
         shell: bash
         run: |
@@ -30,59 +30,171 @@ jobs:
           mkdir -p "$LOG_DIR" "$BIN_DIR"
           echo "Start lint run at $(date -u)" > "$LOG_DIR/README.txt"
 
-      - name: 🔧 Install actionlint
+      - name: 🔧 Install actionlint (script + fallback)
         shell: bash
         continue-on-error: true
         run: |
+          set -Eeuo pipefail
           mkdir -p "$LOG_DIR" "$BIN_DIR"
-          echo "Installing actionlint..." >> "$LOG_DIR/README.txt"
+          : > "$LOG_DIR/actionlint-install.log"
           curl -sSfL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash \
             -o /tmp/download-actionlint.bash
-          bash /tmp/download-actionlint.bash "${ACTIONLINT_VERSION}" "$BIN_DIR" \
-            >> "$LOG_DIR/actionlint-install.log" 2>&1 || true
+          if bash /tmp/download-actionlint.bash "${ACTIONLINT_VERSION}" "$BIN_DIR" >>"$LOG_DIR/actionlint-install.log" 2>&1; then
+            :
+          else
+            V="${ACTIONLINT_VERSION}"; PV="v${ACTIONLINT_VERSION}"
+            OS="linux"
+            case "$(uname -m)" in x86_64) ARCH=amd64;; aarch64|arm64) ARCH=arm64;; *) ARCH=amd64;; esac
+            TARBALL="actionlint_${V}_${OS}_${ARCH}.tar.gz"
+            URL="https://github.com/rhysd/actionlint/releases/download/${PV}/${TARBALL}"
+            curl -fL "$URL" -o "/tmp/${TARBALL}" >>"$LOG_DIR/actionlint-install.log" 2>&1 || true
+            tar -xzf "/tmp/${TARBALL}" -C "$BIN_DIR" >>"$LOG_DIR/actionlint-install.log" 2>&1 || true
+            chmod +x "$BIN_DIR/actionlint" || true
+          fi
+          if [ -x "$BIN_DIR/actionlint" ]; then
+            "$BIN_DIR/actionlint" --version >> "$LOG_DIR/env.txt" 2>&1
+          else
+            echo "[FAIL] actionlint not installed" >> "$LOG_DIR/actionlint-install.log"
+          fi
 
-      - name: 🔍 Run actionlint
+      - name: 🔍 Run actionlint (STRICT)
         shell: bash
         continue-on-error: true
         run: |
-          mkdir -p "$LOG_DIR"
+          set -Eeuo pipefail
           if [ -x "$BIN_DIR/actionlint" ]; then
-            "$BIN_DIR/actionlint" -color -shellcheck= \
-              2>&1 | tee "$LOG_DIR/actionlint.log"
+            "$BIN_DIR/actionlint" -color -shellcheck= 2>&1 | tee "$LOG_DIR/actionlint.log"
           else
-            echo "actionlint missing" > "$LOG_DIR/actionlint.log"
+            echo "[SKIP] actionlint binary missing" | tee "$LOG_DIR/actionlint.log"
           fi
 
       - name: 🧰 Install yamllint
+        continue-on-error: true
         run: |
           python3 -m pip install --upgrade pip
           pip install yamllint
 
-      - name: 🧪 Run yamllint
+      - name: 🧷 Ensure STRICT yamllint config (auto-create if absent)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p "$LOG_DIR"
+          cat > "$LOG_DIR/yamllint.strict.yml" <<'YAML'
+          extends: default
+          rules:
+            document-start: {present: true}
+            truthy:
+              allowed-values: ['true', 'false']
+              check-keys: true
+            line-length:
+              max: 80
+              level: error
+              allow-non-breakable-words: false
+              allow-non-breakable-inline-mappings: false
+          YAML
+
+      - name: 🧪 Run yamllint (STRICT)
         shell: bash
         continue-on-error: true
         run: |
-          mkdir -p "$LOG_DIR"
-          yamllint -f standard -s .github/workflows \
-            2>&1 | tee "$LOG_DIR/yamllint.log" || true
+          set -Eeuo pipefail
+          if command -v yamllint >/dev/null 2>&1; then
+            CONF=".yamllint"; [ -f ".yamllint" ] || CONF="$LOG_DIR/yamllint.strict.yml"
+            echo "[INFO] using config: $CONF" | tee "$LOG_DIR/yamllint.cfg.txt"
+            yamllint -c "$CONF" -f standard -s .github/workflows 2>&1 | tee "$LOG_DIR/yamllint.log"
+          else
+            echo "[SKIP] yamllint not installed" | tee "$LOG_DIR/yamllint.log"
+          fi
 
-      # ───── 항상 덤프 디렉토리에 최소 1개 파일 존재 보장 ─────
-      - name: 🧷 Ensure dump presence
+      - name: 🐍 Deep Validate (duplicate keys, inputs<=10)
+        shell: bash
+        continue-on-error: true
+        run: |
+          set -Eeuo pipefail
+          python3 -m pip install -q ruamel.yaml pyyaml || true
+          python3 - <<'PY' 2>&1 | tee "$LOG_DIR/deep-validate.log"
+          import sys, glob, json
+          from pathlib import Path
+          import yaml
+          from ruamel.yaml import YAML
+          from ruamel.yaml.constructor import DuplicateKeyError
+
+          files = sorted(glob.glob(".github/workflows/*.yml") + glob.glob(".github/workflows/*.yaml"))
+          print("FILES:", files)
+          if not files:
+            print("No workflow files found."); sys.exit(0)
+
+          ru = YAML(typ='rt')
+          errors, summary = [], []
+          for f in files:
+            p = Path(f)
+            try:
+              with p.open(encoding="utf-8") as fh:
+                ru.load(fh)
+            except DuplicateKeyError as e:
+              errors.append(f"[{f}] Duplicate key: {e}"); continue
+            except Exception as e:
+              errors.append(f"[{f}] ruamel parse error: {e}"); continue
+
+            try:
+              with p.open(encoding="utf-8") as fh:
+                data = yaml.safe_load(fh) or {}
+            except Exception as e:
+              errors.append(f"[{f}] PyYAML parse error: {e}"); continue
+
+            def count_inputs(kind):
+              on = data.get("on") or {}
+              sect = on.get(kind) or {}
+              inputs = sect.get("inputs") or {}
+              return len(inputs) if isinstance(inputs, dict) else 0
+
+            wc = count_inputs("workflow_call")
+            wd = count_inputs("workflow_dispatch")
+            if wc > 10: errors.append(f"[{f}] workflow_call.inputs={wc} (>10)")
+            if wd > 10: errors.append(f"[{f}] workflow_dispatch.inputs={wd} (>10)")
+
+            summary.append({"file": f, "workflow_call_inputs": wc, "workflow_dispatch_inputs": wd})
+
+          print("=== Inputs Summary ===")
+          for row in summary:
+            print(json.dumps(row, ensure_ascii=False))
+          if errors:
+            print("\n=== ERRORS ===")
+            for e in errors: print(e)
+            sys.exit(1)
+          PY
+
+      # ── 덤프 보장: 비어 있으면 placeholder 작성
+      - name: 🧷 Ensure dump presence (always)
         if: ${{ always() }}
         shell: bash
         run: |
           mkdir -p "$LOG_DIR"
-          if [ -z "$(ls -A "$LOG_DIR")" ]; then
-            echo "Lint dump placeholder. Some steps produced no output." > "$LOG_DIR/README.txt"
-          fi
+          [ -s "$LOG_DIR/README.txt" ] || echo "Lint dump placeholder." > "$LOG_DIR/README.txt"
 
-      # ───── 숨김 폴더 업로드 허용 ─────
-      - name: ⬆️ Upload lint dump
+      # ── 숨김폴더 업로드 문제 해결: 스테이징 후 업로드
+      - name: 📦 Stage dump to non-hidden dir (always)
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          rm -rf "$STAGING_DIR"
+          mkdir -p "$STAGING_DIR"
+          # .lint-dump 존재/내용 유무와 상관없이 스테이징 생성
+          if [ -d "$LOG_DIR" ]; then
+            cp -a "$LOG_DIR/." "$STAGING_DIR/" || true
+          fi
+          # 최종적으로 비어 있어도 최소 파일 1개 보장
+          if [ -z "$(ls -A "$STAGING_DIR" 2>/dev/null)" ]; then
+            echo "No logs produced." > "$STAGING_DIR/README.txt"
+          fi
+          ls -al "$STAGING_DIR" || true
+
+      - name: ⬆️ Upload lint dump (always)
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
           name: workflow-lint-dump
-          path: ./.lint-dump/**
-          include-hidden-files: true     # ← 중요!
-          if-no-files-found: error       # ← 반드시 생성되게 강제
+          path: ./lint-dump/**    # ← 비숨김 스테이징 경로
+          if-no-files-found: error
           retention-days: 7
