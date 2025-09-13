@@ -1,4 +1,4 @@
-name: "🏦 FinOps + EchoOps v8.1.0 (Docker+TD-Sim+Kafka+Obs+Vault+Backup+SBOM+Scan)"
+name: "🏦 FinOps + EchoOps v8.1.1 (SimWrite Verified: DB+Kafka+Reports+Vault+Obs+SBOM+Scan)"
 
 on:
   workflow_dispatch:
@@ -7,6 +7,38 @@ on:
         description: "시뮬레이션 거래 건수"
         required: true
         default: "2000"
+      rows_per_commit:
+        description: "배치 커밋 크기(직접 DB 모드)"
+        required: true
+        default: "500"
+      seed:
+        description: "난수 시드(빈값=랜덤)"
+        required: false
+        default: ""
+      strict_writes:
+        description: "쓰기 검증 불일치시 실패(true/false)"
+        required: true
+        default: "true"
+      parquet_outputs:
+        description: "CSV 외 Parquet 산출물 생성(true/false)"
+        required: true
+        default: "true"
+      run_kafka:
+        description: "Kafka/ZK + 스트리밍 파이프라인 실행 (true/false)"
+        required: true
+        default: "false"
+      extra_accounts:
+        description: "추가 가상계좌 수(기본 50 + N)"
+        required: true
+        default: "150"
+      encrypt_outputs:
+        description: "산출물 AES-256 암호화(zip.enc) (true/false)"
+        required: true
+        default: "true"
+      enc_pass:
+        description: "암호화 비밀번호(선택, 미지정시 랜덤)"
+        required: false
+        default: ""
       commit_changes:
         description: "에코 산출물 커밋/푸시 (true/false)"
         required: true
@@ -23,22 +55,6 @@ on:
         description: "Teradata Docker 토큰(선택)"
         required: false
         default: ""
-      run_kafka:
-        description: "Kafka/ZK + 스트리밍 파이프라인 실행 (true/false)"
-        required: true
-        default: "false"
-      encrypt_outputs:
-        description: "산출물 AES-256 암호화(zip.enc) (true/false)"
-        required: true
-        default: "true"
-      enc_pass:
-        description: "암호화 비밀번호(선택, 미지정시 랜덤)"
-        required: false
-        default: ""
-      extra_accounts:
-        description: "추가 가상계좌 수(기본 50 + N)"
-        required: true
-        default: "150"
 
 permissions:
   contents: write
@@ -52,6 +68,8 @@ jobs:
   finops:
     runs-on: ubuntu-latest
     timeout-minutes: 180
+    env:
+      TZ: UTC
 
     steps:
       - name: Checkout
@@ -81,12 +99,12 @@ jobs:
           SH
           chmod +x /tmp/echo_helpers.sh
 
-      - name: Echo + Massive Directories
+      - name: Echo + Massive Directories (+RUN_ID)
         shell: bash
         run: |
           set -Eeuo pipefail
           source /tmp/echo_helpers.sh
-          echoe "대량 디렉토리 생성"
+          echoe "디렉토리/메타 생성"
           mkdir -p \
             .github/echo/{logs,sql,bin,configs,imgs,reports,tmp,crypto,mass,monitoring} \
             .github/echo_db/{ddl,dml,seed,views,backup} \
@@ -94,7 +112,11 @@ jobs:
             site/{reports,imgs,logs,sql,docs} \
             artifacts/{imgs,reports,sql,logs,zip,db,sbom,scan}
           for d in $(seq 1 20); do mkdir -p ".github/echo/mass/dir_$d/sub_$d"; done
-          printf "%s\n" "started=$(date -u +%FT%TZ)" "actor=$GITHUB_ACTOR" "rows=${{ inputs.rows }}" > .github/echo/logs/run.meta
+          RID="$(uuidgen 2>/dev/null || cat /proc/sys/kernel/random/uuid)"
+          echo "$RID" > .github/echo/logs/run.id
+          echo "RUN_ID=$RID" >> "$GITHUB_ENV"
+          echo "RUN_LABEL=echo-$(date -u +%Y%m%dT%H%M%SZ)-$RID" >> "$GITHUB_ENV"
+          printf "%s\n" "started=$(date -u +%FT%TZ)" "actor=$GITHUB_ACTOR" "rows=${{ inputs.rows }}" "run_id=$RID" > .github/echo/logs/run.meta
 
       - name: Install/Upgrade Docker (official repo)
         shell: bash
@@ -187,32 +209,19 @@ jobs:
           IMG_FALLBACK_1="hashicorp/vault:1.16"
           IMG_FALLBACK_2="hashicorp/vault:latest"
           CNTR="finops-vault"
-
           docker rm -f "$CNTR" >/dev/null 2>&1 || true
           run "docker network inspect '$NET' >/dev/null 2>&1 || docker network create '$NET'"
-
           pull_try(){ retry 4 4 "docker pull $1"; }
           if ! pull_try "$IMG_PRIMARY"; then
-            warn "fallback to $IMG_FALLBACK_1"
-            if ! pull_try "$IMG_FALLBACK_1"; then
-              warn "fallback to $IMG_FALLBACK_2"
-              pull_try "$IMG_FALLBACK_2"
-            fi
-          fi
-
+            warn "fallback to $IMG_FALLBACK_1"; if ! pull_try "$IMG_FALLBACK_1"; then
+              warn "fallback to $IMG_FALLBACK_2"; pull_try "$IMG_FALLBACK_2"; fi; fi
           if docker image inspect "$IMG_PRIMARY" >/dev/null 2>&1; then USE_IMG="$IMG_PRIMARY";
-          elif docker image inspect "$IMG_FALLBACK_1" >/dev/null 2>&1; then USE_IMG="$IMG_FALLBACK_1";
-          else USE_IMG="$IMG_FALLBACK_2"; fi
+          elif docker image inspect "$IMG_FALLBACK_1" >/dev/null 2>&1; then USE_IMG="$IMG_FALLBACK_1"; else USE_IMG="$IMG_FALLBACK_2"; fi
           echoe "using image: $USE_IMG"
-
           run "docker run -d --name '$CNTR' --network '$NET' -p 8200:8200 -e VAULT_DEV_ROOT_TOKEN_ID=root -e VAULT_ADDR=http://0.0.0.0:8200 '$USE_IMG'"
-
           for i in $(seq 1 20); do
-            if docker exec "$CNTR" sh -lc "apk add --no-cache curl >/dev/null 2>&1 || (apt-get update -y >/dev/null 2>&1 && apt-get install -y curl >/dev/null 2>&1 || true); curl -s http://127.0.0.1:8200/v1/sys/health >/dev/null 2>&1"; then
-              echoe "Vault ready"; break; fi
-            echoe "waiting vault...($i)"; sleep 2
-          done
-
+            if docker exec "$CNTR" sh -lc "apk add --no-cache curl >/dev/null 2>&1 || (apt-get update -y >/dev/null 2>&1 && apt-get install -y curl >/dev/null 2>&1 || true); curl -s http://127.0.0.1:8200/v1/sys/health >/dev/null 2>&1"; then echoe "Vault ready"; break; fi
+            echoe "waiting vault...($i)"; sleep 2; done
           PASS_FILE=".github/echo/crypto/enc.pass"
           if [ -f "$PASS_FILE" ]; then
             ENC="$(sed -n 's/^enc_pass=//p' "$PASS_FILE" | head -n1)"
@@ -245,35 +254,18 @@ jobs:
           source /tmp/echo_helpers.sh
           for i in $(seq 1 40); do
             if docker exec finops-db pg_isready -U finops -d finops >/dev/null 2>&1; then echoe "Postgres ready"; break; fi
-            echoe "waiting postgres...($i)"; sleep 3
-          done
+            echoe "waiting postgres...($i)"; sleep 3; done
           run "sudo apt-get update -y"
           run "sudo apt-get install -y postgresql-client"
 
-      - name: (Optional) Teradata Attempt (logs only if no token)
-        if: ${{ inputs.enable_teradata == 'true' }}
-        shell: bash
-        env:
-          TD_TOKEN: ${{ inputs.teradata_token }}
-        run: |
-          set -Eeuo pipefail
-          source /tmp/echo_helpers.sh
-          echoe "Teradata 컨테이너는 라이선스/토큰/동의가 필요합니다."
-          if [ -z "${TD_TOKEN:-}" ]; then
-            warn "teradata_token 미제공: 공식 이미지 풀/실행 건너뜀 → TD-Sim(PostgreSQL)로 진행."
-            exit 0
-          fi
-          {
-            echo "docker login <teradata-registry> -u token -p ${TD_TOKEN}"
-            echo "docker pull <teradata-registry>/teradata:latest"
-            echo "docker run -d --name teradata --network finops_net <teradata-registry>/teradata:latest"
-          } | tee .github/echo/logs/teradata.login.txt
-
-      - name: Generate DDL/Views
+      - name: Generate DDL/Views (with RUN tables/columns)
         shell: bash
         run: |
           set -Eeuo pipefail
           source /tmp/echo_helpers.sh
+          cat > .github/echo_db/ddl/000_extensions.sql <<'SQL'
+          create extension if not exists pgcrypto;
+          SQL
           cat > .github/echo_db/ddl/001_core.sql <<'SQL'
           create table if not exists accounts (
             account_id bigserial primary key,
@@ -289,9 +281,11 @@ jobs:
             type varchar(8) not null check (type in ('DEBIT','CREDIT')),
             amount numeric(18,2) not null check (amount>=0),
             currency varchar(8) not null default 'KRW',
-            memo text
+            memo text,
+            run_id uuid
           );
           create index if not exists ix_journal_account_ts on journal_entries(account_no, ts);
+          create index if not exists ix_journal_run on journal_entries(run_id);
           create table if not exists transactions (
             txn_id bigserial primary key,
             ts timestamptz not null default now(),
@@ -300,12 +294,27 @@ jobs:
             amount numeric(18,2) not null check (amount>=0),
             balance_after numeric(18,2) not null,
             ref varchar(64),
-            note text
+            note text,
+            run_id uuid
           );
           create index if not exists ix_txn_account_ts on transactions(account_no, ts);
+          create index if not exists ix_txn_run on transactions(run_id);
           create table if not exists balances (
             account_no varchar(32) primary key,
             balance numeric(18,2) not null default 0
+          );
+          SQL
+          cat > .github/echo_db/ddl/002_sim.sql <<'SQL'
+          create table if not exists sim_runs (
+            run_id uuid primary key,
+            started_at timestamptz not null default now(),
+            finished_at timestamptz,
+            actor text,
+            mode text,
+            rows_target int not null,
+            rows_written int default 0,
+            status text default 'RUNNING',
+            notes text
           );
           SQL
           cat > .github/echo_db/views/100_views.sql <<'SQL'
@@ -335,7 +344,9 @@ jobs:
         run: |
           set -Eeuo pipefail
           source /tmp/echo_helpers.sh
+          run "PGPASSWORD=finops psql -h 127.0.0.1 -U finops -d finops -f .github/echo_db/ddl/000_extensions.sql"
           run "PGPASSWORD=finops psql -h 127.0.0.1 -U finops -d finops -f .github/echo_db/ddl/001_core.sql"
+          run "PGPASSWORD=finops psql -h 127.0.0.1 -U finops -d finops -f .github/echo_db/ddl/002_sim.sql"
           run "PGPASSWORD=finops psql -h 127.0.0.1 -U finops -d finops -f .github/echo_db/views/100_views.sql"
 
       - name: Seed Accounts (50 + extra) via generate_series
@@ -357,9 +368,11 @@ jobs:
           SQL
           run "PGPASSWORD=finops psql -h 127.0.0.1 -U finops -d finops -v ACC=\"$ACC\" -f .github/echo_db/seed/accounts.sql"
 
-      - name: Write Simulators (Kafka mode)
+      - name: Write Simulators (Kafka mode) – includes RUN_ID
         if: ${{ inputs.run_kafka == 'true' }}
         shell: bash
+        env:
+          RUN_ID: ${{ env.RUN_ID }}
         run: |
           set -Eeuo pipefail
           source /tmp/echo_helpers.sh
@@ -369,11 +382,16 @@ jobs:
           from datetime import datetime, timedelta
           from kafka import KafkaProducer
           ROWS=int(os.getenv("ROWS","2000"))
+          RUN_ID=os.getenv("RUN_ID")
+          EXTRA=int(os.getenv("EXTRA","150"))
           producer=KafkaProducer(bootstrap_servers="localhost:9092", value_serializer=lambda v: json.dumps(v, default=str).encode())
-          accts=[f"V{str(i).zfill(6)}" for i in range(1, 50+int(os.getenv("EXTRA","150"))+1)]
+          accts=[f"V{str(i).zfill(6)}" for i in range(1, 50+EXTRA+1)]
+          seed=os.getenv("SEED")
+          if seed: random.seed(int(seed))
           base=datetime.utcnow()-timedelta(days=3)
           for i in range(ROWS):
             msg={
+              "run_id": RUN_ID,
               "ts": (base+timedelta(seconds=i*(3*24*3600/ROWS))).isoformat(),
               "account_no": random.choice(accts),
               "direction": random.choice(["IN","OUT"]),
@@ -392,80 +410,137 @@ jobs:
           cur=conn.cursor()
           for msg in consumer:
             r=msg.value
+            rid=r.get("run_id")
             acc=r["account_no"]; direction=r["direction"]; amount=float(r["amount"]); ts=r["ts"]
             cur.execute("select balance from balances where account_no=%s",(acc,))
             row=cur.fetchone(); bal=float(row[0]) if row else 0.0
             new_bal=bal+amount if direction=="IN" else max(0.0, bal-amount)
-            cur.execute("""insert into transactions(account_no,direction,amount,balance_after,ref,note,ts)
-                           values(%s,%s,%s,%s,%s,%s,%s)""",(acc,direction,amount,new_bal,r.get("ref","kafka"),"kafka",ts))
+            cur.execute("""insert into transactions(account_no,direction,amount,balance_after,ref,note,ts,run_id)
+                           values(%s,%s,%s,%s,%s,%s,%s,%s)""",(acc,direction,amount,new_bal,r.get("ref","kafka"),"kafka",ts,rid))
             jtype="DEBIT" if direction=="IN" else "CREDIT"
-            cur.execute("""insert into journal_entries(account_no,type,amount,ts,memo)
-                           values(%s,%s,%s,%s,%s)""",(acc,jtype,amount,ts,"kafka"))
+            cur.execute("""insert into journal_entries(account_no,type,amount,ts,memo,run_id)
+                           values(%s,%s,%s,%s,%s,%s)""",(acc,jtype,amount,ts,"kafka",rid))
             cur.execute("""insert into balances(account_no,balance)
                            values(%s,%s)
                            on conflict (account_no) do update set balance=excluded.balance""",(acc,new_bal))
             conn.commit()
           PY
 
-      - name: Write Simulator (direct DB fallback)
+      - name: Write Simulator (direct DB mode, batched) – includes RUN_ID
         if: ${{ inputs.run_kafka != 'true' }}
         shell: bash
+        env:
+          RUN_ID: ${{ env.RUN_ID }}
         run: |
           set -Eeuo pipefail
           source /tmp/echo_helpers.sh
           cat > .github/echo/requirements.txt <<'PIP'
           psycopg2-binary
           matplotlib
+          pyarrow
           PIP
           cat > .github/echo/bin/simulate.py <<'PY'
-          import os, random, csv
+          import os, random, csv, json
           from datetime import datetime, timedelta
-          import psycopg2, matplotlib.pyplot as plt
+          import psycopg2, psycopg2.extras
+          import matplotlib.pyplot as plt
           ROWS=int(os.getenv("ROWS","2000"))
+          RUN_ID=os.getenv("RUN_ID")
+          ROWS_PER_COMMIT=int(os.getenv("ROWS_PER_COMMIT","500"))
+          SEED=os.getenv("SEED")
+          if SEED: random.seed(int(SEED))
           conn=psycopg2.connect(host="127.0.0.1",user="finops",password="finops",dbname="finops")
           cur=conn.cursor()
+          # run 메타 시작
+          MODE="direct-db"
+          ACTOR=os.getenv("GITHUB_ACTOR","unknown")
+          cur.execute("insert into sim_runs(run_id, actor, mode, rows_target, status, notes) values(%s,%s,%s,%s,'RUNNING',%s) on conflict (run_id) do nothing",
+                      (RUN_ID, ACTOR, MODE, ROWS, "started"))
+          conn.commit()
+          # 계좌 조회
           cur.execute("select account_no from accounts order by account_no;")
           accts=[r[0] for r in cur.fetchall()]
           base=datetime.utcnow()-timedelta(days=10)
           rows=[]
+          tx_batch=[]
+          je_batch=[]
           for i in range(ROWS):
             acc=random.choice(accts)
             ts=base+timedelta(seconds=i*(10*24*3600/ROWS))
             direction=random.choice(["IN","OUT"])
             amount=round(random.uniform(10, 800000),2)
+            # 잔액 조회
             cur.execute("select balance from balances where account_no=%s",(acc,))
             row=cur.fetchone(); bal=float(row[0]) if row else 0.0
             new_bal=bal+amount if direction=="IN" else max(0.0, bal-amount)
-            cur.execute("""insert into transactions(account_no,direction,amount,balance_after,ref,note,ts)
-                           values(%s,%s,%s,%s,%s,%s,%s)""",(acc,direction,amount,new_bal,f"REF{i}","sim",ts))
+            # 배치 기록
+            tx_batch.append((ts,acc,direction,amount,new_bal,f"REF{i}","sim",RUN_ID))
             jtype="DEBIT" if direction=="IN" else "CREDIT"
-            cur.execute("""insert into journal_entries(account_no,type,amount,ts,memo)
-                           values(%s,%s,%s,%s,%s)""",(acc,jtype,amount,ts,"sim"))
+            je_batch.append((acc,jtype,amount,ts,"sim",RUN_ID))
+            rows.append((ts,acc,direction,amount,new_bal))
+            # 즉시 잔액 업서트
             cur.execute("""insert into balances(account_no,balance)
                            values(%s,%s)
                            on conflict (account_no) do update set balance=excluded.balance""",(acc,new_bal))
-            rows.append((ts,acc,direction,amount,new_bal))
-            if i%500==0: conn.commit()
-          conn.commit()
-          cur.execute("select d,revenue,expense,profit from v_income_statement order by d;")
-          D=[(r[0],float(r[1]),float(r[2]),float(r[3])) for r in cur.fetchall()]
+            if len(tx_batch)>=ROWS_PER_COMMIT:
+              psycopg2.extras.execute_values(cur,
+                """insert into transactions(ts,account_no,direction,amount,balance_after,ref,note,run_id)
+                   values %s""", tx_batch)
+              psycopg2.extras.execute_values(cur,
+                """insert into journal_entries(account_no,type,amount,ts,memo,run_id)
+                   values %s""", je_batch)
+              conn.commit()
+              tx_batch.clear(); je_batch.clear()
+          if tx_batch:
+            psycopg2.extras.execute_values(cur,
+              """insert into transactions(ts,account_no,direction,amount,balance_after,ref,note,run_id)
+                 values %s""", tx_batch)
+            psycopg2.extras.execute_values(cur,
+              """insert into journal_entries(account_no,type,amount,ts,memo,run_id)
+                 values %s""", je_batch)
+            conn.commit()
+          # charts
+          cur.execute("select date_trunc('day', ts) as d, sum(case when direction='IN' then amount else 0 end) as rev, \
+                       sum(case when direction='OUT' then amount else 0 end) as exp, \
+                       sum(case when direction='IN' then amount else -amount end) as prof \
+                       from transactions where run_id=%s group by 1 order by 1;", (RUN_ID,))
+          D=[(r[0],float(r[1] or 0),float(r[2] or 0),float(r[3] or 0)) for r in cur.fetchall()]
           dates=[r[0] for r in D]; rev=[r[1] for r in D]; exp=[r[2] for r in D]; prof=[r[3] for r in D]
-          import matplotlib.pyplot as plt, os
+          import os
           os.makedirs("site/imgs",exist_ok=True)
           plt.figure(); plt.plot(dates,rev,label="Revenue"); plt.plot(dates,exp,label="Expense"); plt.plot(dates,prof,label="Profit"); plt.legend(); plt.tight_layout()
           plt.savefig("site/imgs/income_statement.png")
-          cur.execute("select total_assets from v_balance_sheet;"); assets=float(cur.fetchone()[0] or 0)
+          cur.execute("select sum(balance) from balances;"); assets=float(cur.fetchone()[0] or 0)
           plt.figure(); plt.bar(["Assets"],[assets]); plt.tight_layout(); plt.savefig("site/imgs/balance_sheet.png")
-          cur.close(); conn.close()
+          # CSV/Parquet
           os.makedirs("site/reports",exist_ok=True)
           with open("site/reports/transactions.csv","w",newline="",encoding="utf-8") as f:
             w=csv.writer(f); w.writerow(["ts","account_no","direction","amount","balance_after"]); w.writerows(rows)
+          if os.getenv("PARQUET","true").lower()=="true":
+            try:
+              import pyarrow as pa, pyarrow.parquet as pq
+              table=pa.Table.from_pylist([{"ts":r[0],"account_no":r[1],"direction":r[2],"amount":r[3],"balance_after":r[4]} for r in rows])
+              pq.write_table(table,"site/reports/transactions.parquet")
+            except Exception as e:
+              print("parquet write skipped:", e)
+          # run 메타 종료 전 갯수 확인
+          cur.execute("select count(*) from transactions where run_id=%s",(RUN_ID,)); txn_count=cur.fetchone()[0]
+          cur.execute("update sim_runs set rows_written=%s, finished_at=now(), status='DONE' where run_id=%s",(txn_count, RUN_ID))
+          conn.commit(); cur.close(); conn.close()
+          # 리포트 JSON
+          report={"run_id":RUN_ID,"mode":MODE,"rows_target":ROWS,"rows_written":int(txn_count)}
+          with open("site/reports/write_report.json","w",encoding="utf-8") as f: json.dump(report,f,ensure_ascii=False,indent=2)
           PY
 
-      - name: Install Python deps & Run
+      - name: Install Python deps & Run simulators
         shell: bash
         env:
           ROWS: ${{ inputs.rows }}
+          ROWS_PER_COMMIT: ${{ inputs.rows_per_commit }}
+          SEED: ${{ inputs.seed }}
+          PARQUET: ${{ inputs.parquet_outputs }}
+          EXTRA: ${{ inputs.extra_accounts }}
+          RUN_ID: ${{ env.RUN_ID }}
         run: |
           set -Eeuo pipefail
           source /tmp/echo_helpers.sh
@@ -475,12 +550,49 @@ jobs:
           run "pip install -r .github/echo/requirements-common.txt || true"
           if [ "${{ inputs.run_kafka }}" = "true" ]; then
             run "pip install -r .github/echo/requirements-extra.txt"
-            run "python .github/echo/bin/kafka_consumer.py >/tmp/kafka_consumer.log 2>&1 &"
-            run "EXTRA='${{ inputs.extra_accounts }}' ROWS='${{ inputs.rows }}' python .github/echo/bin/kafka_producer.py"
+            run "python .github/echo/bin/kafka_consumer.py >/tmp/kafka_consumer.log 2>&1 & echo \$! > /tmp/kafka_consumer.pid"
+            run "EXTRA='${{ inputs.extra_accounts }}' ROWS='${{ inputs.rows }}' SEED='${{ inputs.seed }}' RUN_ID='${RUN_ID}' python .github/echo/bin/kafka_producer.py"
             sleep 5; cp /tmp/kafka_consumer.log .github/echo/logs/kafka_consumer.log || true
           else
             run "pip install -r .github/echo/requirements.txt"
-            run "python .github/echo/bin/simulate.py"
+            run "ROWS_PER_COMMIT='${{ inputs.rows_per_commit }}' SEED='${{ inputs.seed }}' RUN_ID='${RUN_ID}' python .github/echo/bin/simulate.py"
+          fi
+
+      - name: Verify Simulation Writes (poll until match)
+        shell: bash
+        env:
+          RUN_ID: ${{ env.RUN_ID }}
+          ROWS: ${{ inputs.rows }}
+          STRICT: ${{ inputs.strict_writes }}
+        run: |
+          set -Eeuo pipefail
+          source /tmp/echo_helpers.sh
+          cat > .github/echo/bin/verify.py <<'PY'
+          import os, time, json, psycopg2
+          RUN_ID=os.getenv("RUN_ID"); TARGET=int(os.getenv("ROWS","0"))
+          STRICT=os.getenv("STRICT","true").lower()=="true"
+          conn=psycopg2.connect(host="127.0.0.1", user="finops", password="finops", dbname="finops")
+          cur=conn.cursor()
+          ok=False
+          for _ in range(60):  # 최대 60초 폴링 (Kafka 소비 보정)
+            cur.execute("select count(*) from transactions where run_id=%s",(RUN_ID,)); c1=cur.fetchone()[0]
+            cur.execute("select count(*) from journal_entries where run_id=%s",(RUN_ID,)); c2=cur.fetchone()[0]
+            if c1==TARGET and c2==TARGET:
+              ok=True; break
+            time.sleep(1)
+          cur.execute("select min(ts), max(ts) from transactions where run_id=%s",(RUN_ID,)); tmin,tmax=cur.fetchone()
+          report={"run_id":RUN_ID,"target":TARGET,"txn_count":int(c1),"journal_count":int(c2),"time_range":[str(tmin),str(tmax)],"strict":STRICT,"ok":ok}
+          os.makedirs("site/reports",exist_ok=True)
+          with open("site/reports/write_verify.json","w") as f: json.dump(report,f,indent=2)
+          cur.close(); conn.close()
+          if STRICT and not ok:
+            raise SystemExit("STRICT write verification failed: target=%d, txn=%d, journal=%d"%(TARGET,c1,c2))
+          PY
+          python .github/echo/bin/verify.py
+
+          # Kafka consumer 종료(있다면)
+          if [ -f /tmp/kafka_consumer.pid ]; then
+            kill "$(cat /tmp/kafka_consumer.pid)" 2>/dev/null || true
           fi
 
       - name: MinIO Client (mc) & Upload results to bucket
@@ -541,11 +653,10 @@ jobs:
         run: |
           set -Eeuo pipefail
           source /tmp/echo_helpers.sh
-          # Trivy (deprecated 옵션 교체: config -> misconfig)
+          # Trivy (config -> misconfig)
           run "curl -fsSL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin"
           run "trivy fs --scanners vuln,misconfig,secret --format json --output artifacts/scan/trivy.json ."
-
-          # ✅ Gitleaks: 최신 릴리스 자산을 API로 찾아서 설치 (404 방지)
+          # Gitleaks 최신 릴리스 자산 탐색 설치
           API="https://api.github.com/repos/gitleaks/gitleaks/releases/latest"
           ASSET_URL="$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" "$API" \
             | jq -r '.assets[] | select(.name | test("linux_x64.*\\.tar\\.gz$")) | .browser_download_url' | head -n1)"
@@ -559,7 +670,6 @@ jobs:
             (tar -xzf /tmp/gitleaks.tgz -C /tmp && mv /tmp/gitleaks*/gitleaks /usr/local/bin/)
           chmod +x /usr/local/bin/gitleaks
           run "gitleaks version || true"
-          # SARIF 출력 (실패 무시)
           run "gitleaks detect --redact -v --no-git -o artifacts/scan/gitleaks.sarif --report-format sarif || true"
 
       - name: Encrypt outputs (optional AES-256)
@@ -584,7 +694,7 @@ jobs:
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: finops-echoops-v810
+          name: finops-echoops-v811
           path: |
             artifacts/**
             site/**
@@ -608,7 +718,7 @@ jobs:
           run "git config user.email \"$GIT_AUTHOR_EMAIL\""
           run "git add -A"
           if git diff --cached --quiet; then echoe "변경 없음 → 푸시 스킵"; exit 0; fi
-          run "git commit -m \"[ECHO] v8.1.0 outputs (imgs,csv,sql,minio,backup,obs,kafka=${{ inputs.run_kafka }},encrypt=${{ inputs.encrypt_outputs }},rows=${{ inputs.rows }})\""
+          run "git commit -m \"[ECHO] v8.1.1 (sim-write verified) rows=${{ inputs.rows }}, kafka=${{ inputs.run_kafka }}, strict=${{ inputs.strict_writes }}\""
           run "git fetch --tags --force origin"
           run "git push origin \"refs/heads/${BRANCH}:refs/heads/${BRANCH}\" --force-with-lease"
 
@@ -616,8 +726,8 @@ jobs:
         if: ${{ inputs.create_release == 'true' }}
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: finops-echoops-v810-${{ github.run_number }}
-          name: "FinOps EchoOps v8.1.0 • Run #${{ github.run_number }}"
+          tag_name: finops-echoops-v811-${{ github.run_number }}
+          name: "FinOps EchoOps v8.1.1 • Run #${{ github.run_number }}"
           draft: false
           prerelease: false
           files: |
