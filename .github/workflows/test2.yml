@@ -578,7 +578,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: [sbom-hash]
     steps:
-      - name: Guard: S3 config present?
+      - name: Guard:S3 config present?
         id: guard
         shell: bash
         env:
@@ -616,7 +616,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: [sbom-hash]
     steps:
-      - name: Guard: Azure config present?
+      - name: Guard:Azure config present?
         id: guard
         shell: bash
         env:
@@ -652,7 +652,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: [sbom-hash]
     steps:
-      - name: Guard: GCS bucket present?
+      - name: Guard:GCS bucket present?
         id: guard
         shell: bash
         env:
