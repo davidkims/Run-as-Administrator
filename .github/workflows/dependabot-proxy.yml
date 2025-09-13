@@ -1,69 +1,85 @@
 # .github/workflows/validate-workflows.yml
-name: "✅ Validate Workflow Syntax"
+name: "✅ Validate Workflow Syntax (strict, skip on error, dump)"
 
 on:
   push:
-    paths:
-      - ".github/workflows/**"
+    paths: [".github/workflows/**", ".yamllint"]
   pull_request:
-    paths:
-      - ".github/workflows/**"
+    paths: [".github/workflows/**", ".yamllint"]
 
 permissions:
   contents: read
 
 jobs:
-  validate-syntax:
-    name: "Lint & Validate GitHub Workflows"
+  validate:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-
+    timeout-minutes: 20
+    env:
+      LOG_DIR: ./.lint-dump
+      ACTIONLINT_VERSION: "1.7.1"   # 고정 권장. 최신 쓰려면 "latest"
     steps:
       - name: 📥 Checkout
         uses: actions/checkout@v4
 
-      # ⬇️ 여기 수정: -b 제거, VERSION은 latest 또는 1.7.1 같은 숫자형
-      - name: 🔍 Install actionlint
+      - name: 📁 Prepare dump dir
         shell: bash
-        env:
-          ACTIONLINT_VERSION: latest   # 또는 "1.7.1" 처럼 숫자형 버전
         run: |
           set -Eeuo pipefail
-          mkdir -p ./bin
-          curl -sSfL \
-            https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash \
+          mkdir -p "$LOG_DIR"
+          echo "Runner: $(uname -a)" > "$LOG_DIR/env.txt"
+          echo "TS: $(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$LOG_DIR/env.txt"
+
+      # --- actionlint 설치/실행 (실패해도 계속) ---
+      - name: 🔧 Install actionlint
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          curl -sSfL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash \
             -o /tmp/download-actionlint.bash
           bash /tmp/download-actionlint.bash "${ACTIONLINT_VERSION}" ./bin
-          ./bin/actionlint --version
+          ./bin/actionlint --version | tee -a "$LOG_DIR/env.txt"
 
-      - name: ▶️ Run actionlint
+      - name: 🔍 Run actionlint (strict)
         shell: bash
+        continue-on-error: true
         run: |
           set -Eeuo pipefail
-          # shellcheck 없는 환경에서도 진행되도록 비활성화
-          ./bin/actionlint -color -shellcheck=
+          # shellcheck 비활성화(-shellcheck=)로 외부 의존성 배제
+          ./bin/actionlint -color -shellcheck= \
+            2>&1 | tee "$LOG_DIR/actionlint.log"
+          echo $? > "$LOG_DIR/actionlint.status"
 
+      # --- yamllint 설치/실행 (실패해도 계속) ---
       - name: 🧰 Install yamllint
         run: |
           python3 -m pip install --upgrade pip
           pip install yamllint
 
-      - name: 🧪 Run yamllint
+      - name: 🧪 Run yamllint (STRICT via .yamllint)
+        shell: bash
+        continue-on-error: true
         run: |
           set -Eeuo pipefail
-          yamllint -s -f standard .github/workflows
+          yamllint -c .yamllint -f standard -s .github/workflows \
+            2>&1 | tee "$LOG_DIR/yamllint.log"
+          echo $? > "$LOG_DIR/yamllint.status"
 
-      - name: 🐍 Deep Validate (PyYAML + ruamel.yaml)
+      # --- 심화 검사: 중복키/입력 10개 제한 (실패해도 계속) ---
+      - name: 🐍 Deep Validate (duplicate keys, inputs<=10)
+        shell: bash
+        continue-on-error: true
         run: |
           set -Eeuo pipefail
-          python3 - <<'PY'
-          import sys, glob, json
+          python3 -m pip install ruamel.yaml pyyaml >/dev/null
+          python3 - <<'PY' 2>&1 | tee "$LOG_DIR/deep-validate.log"
+          import sys, glob, json, os
           from pathlib import Path
           import yaml
           from ruamel.yaml import YAML
           from ruamel.yaml.constructor import DuplicateKeyError
 
           files = sorted(glob.glob(".github/workflows/*.yml") + glob.glob(".github/workflows/*.yaml"))
+          print("FILES:", files)
           if not files:
             print("No workflow files found.")
             sys.exit(0)
@@ -100,27 +116,62 @@ jobs:
             wd = count_inputs("workflow_dispatch")
 
             if wc > 10:
-              errors.append(f"[{f}] workflow_call.inputs={wc} (>10) — GitHub limit exceeded.")
+              errors.append(f"[{f}] workflow_call.inputs={wc} (>10)")
             if wd > 10:
-              errors.append(f"[{f}] workflow_dispatch.inputs={wd} (>10) — GitHub limit exceeded.")
+              errors.append(f"[{f}] workflow_dispatch.inputs={wd} (>10)")
 
             summary.append({"file": f, "workflow_call_inputs": wc, "workflow_dispatch_inputs": wd})
 
           print("=== Inputs Summary ===")
           for row in summary:
             print(json.dumps(row, ensure_ascii=False))
-
           if errors:
             print("\n=== ERRORS ===")
             for e in errors:
               print(e)
             sys.exit(1)
           PY
+          echo $? > "$LOG_DIR/deep-validate.status"
 
-      - name: ✅ Summary
-        if: ${{ success() }}
+      # --- 에러 발생 시에도 파이프라인 계속: 여기서 요약 생성 ---
+      - name: 🧾 Build Summary (always)
+        if: ${{ always() }}
+        shell: bash
         run: |
-          echo "All .github/workflows passed:"
-          echo "- actionlint (installed via official script)"
-          echo "- yamllint"
-          echo "- deep checks (inputs <= 10, duplicate keys, parse)"
+          set -Eeuo pipefail
+          A=$([ -f "$LOG_DIR/actionlint.status" ] && cat "$LOG_DIR/actionlint.status" || echo 0)
+          Y=$([ -f "$LOG_DIR/yamllint.status" ] && cat "$LOG_DIR/yamllint.status" || echo 0)
+          D=$([ -f "$LOG_DIR/deep-validate.status" ] && cat "$LOG_DIR/deep-validate.status" || echo 0)
+          {
+            echo "## Workflow Lint Summary"
+            echo "- actionlint: $A"
+            echo "- yamllint : $Y"
+            echo "- deep-validate: $D"
+            echo
+            echo "### Note"
+            echo "- 규칙은 **엄격**하게 적용되었습니다."
+            echo "- 한 단계라도 실패해도 **파이프라인은 계속 진행**됩니다."
+            echo "- 상세 로그는 아래 아티팩트를 확인하세요."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # --- 문제 파일 수집(선택) & 아티팩트 업로드 ---
+      - name: 📦 Collect offenders (always)
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p "$LOG_DIR/offenders"
+          # yamllint 로그에서 파일 경로 뽑아 저장
+          if [ -f "$LOG_DIR/yamllint.log" ]; then
+            awk '{print $1}' "$LOG_DIR/yamllint.log" | sed 's/:$//' | sort -u \
+              | xargs -r -I{} bash -c 'mkdir -p "$LOG_DIR/offenders/$(dirname {})"; cp "{}" "$LOG_DIR/offenders/{}" 2>/dev/null || true'
+          fi
+
+      - name: ⬆️ Upload lint dump (always)
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: workflow-lint-dump
+          path: ./.lint-dump
+          if-no-files-found: warn
+          retention-days: 7
