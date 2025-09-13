@@ -519,7 +519,6 @@ jobs:
           run "cp -a .github/echo_db/backup artifacts/db/"
           (cd artifacts && zip -r zip/finops_outputs.zip imgs reports sql logs db >/dev/null)
 
-      # ✅ FIXED: SBOM 설치/생성 (syft 공식 인스톨러 + 폴백)
       - name: SBOM (syft)
         shell: bash
         run: |
@@ -537,12 +536,30 @@ jobs:
 
       - name: Security Scan (Trivy + Gitleaks)
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -Eeuo pipefail
           source /tmp/echo_helpers.sh
+          # Trivy (deprecated 옵션 교체: config -> misconfig)
           run "curl -fsSL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin"
-          run "trivy fs --scanners vuln,config,secret --format json --output artifacts/scan/trivy.json ."
-          run "curl -fsSL https://github.com/zricethezav/gitleaks/releases/latest/download/gitleaks_linux_x64.tar.gz | tar xz -C /usr/local/bin gitleaks"
+          run "trivy fs --scanners vuln,misconfig,secret --format json --output artifacts/scan/trivy.json ."
+
+          # ✅ Gitleaks: 최신 릴리스 자산을 API로 찾아서 설치 (404 방지)
+          API="https://api.github.com/repos/gitleaks/gitleaks/releases/latest"
+          ASSET_URL="$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" "$API" \
+            | jq -r '.assets[] | select(.name | test("linux_x64.*\\.tar\\.gz$")) | .browser_download_url' | head -n1)"
+          if [ -z "$ASSET_URL" ] || [ "$ASSET_URL" = "null" ]; then
+            warn "latest asset not found via API, fallback to v8.18.4"
+            ASSET_URL="https://github.com/gitleaks/gitleaks/releases/download/v8.18.4/gitleaks_8.18.4_linux_x64.tar.gz"
+          fi
+          echoe "Gitleaks asset: $ASSET_URL"
+          curl -fsSL "$ASSET_URL" -o /tmp/gitleaks.tgz
+          tar -xzf /tmp/gitleaks.tgz -C /usr/local/bin gitleaks || \
+            (tar -xzf /tmp/gitleaks.tgz -C /tmp && mv /tmp/gitleaks*/gitleaks /usr/local/bin/)
+          chmod +x /usr/local/bin/gitleaks
+          run "gitleaks version || true"
+          # SARIF 출력 (실패 무시)
           run "gitleaks detect --redact -v --no-git -o artifacts/scan/gitleaks.sarif --report-format sarif || true"
 
       - name: Encrypt outputs (optional AES-256)
