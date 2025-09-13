@@ -22,15 +22,18 @@ jobs:
       - name: 📥 Checkout
         uses: actions/checkout@v4
 
-      # 1) actionlint 설치 (공식 스크립트) + 실행
+      # ⬇️ 여기 수정: -b 제거, VERSION은 latest 또는 1.7.1 같은 숫자형
       - name: 🔍 Install actionlint
         shell: bash
         env:
-          ACTIONLINT_VERSION: v1.7.1   # 필요 시 최신으로 고정 갱신
+          ACTIONLINT_VERSION: latest   # 또는 "1.7.1" 처럼 숫자형 버전
         run: |
           set -Eeuo pipefail
-          curl -sSfL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash \
-            | bash -s -- -b ./bin "${ACTIONLINT_VERSION}"
+          mkdir -p ./bin
+          curl -sSfL \
+            https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash \
+            -o /tmp/download-actionlint.bash
+          bash /tmp/download-actionlint.bash "${ACTIONLINT_VERSION}" ./bin
           ./bin/actionlint --version
 
       - name: ▶️ Run actionlint
@@ -40,20 +43,19 @@ jobs:
           # shellcheck 없는 환경에서도 진행되도록 비활성화
           ./bin/actionlint -color -shellcheck=
 
-      # 2) yamllint (일반 YAML 문법/스타일)
       - name: 🧰 Install yamllint
         run: |
           python3 -m pip install --upgrade pip
           pip install yamllint
+
       - name: 🧪 Run yamllint
         run: |
-          set -euo pipefail
+          set -Eeuo pipefail
           yamllint -s -f standard .github/workflows
 
-      # 3) 심화 검사: inputs 10개 제한, 중복 키 탐지, 파서 이중 체크
       - name: 🐍 Deep Validate (PyYAML + ruamel.yaml)
         run: |
-          set -euo pipefail
+          set -Eeuo pipefail
           python3 - <<'PY'
           import sys, glob, json
           from pathlib import Path
@@ -71,7 +73,6 @@ jobs:
 
           for f in files:
             p = Path(f)
-            # 중복 키 감지
             try:
               with p.open(encoding="utf-8") as fh:
                 ru.load(fh)
@@ -82,7 +83,6 @@ jobs:
               errors.append(f"[{f}] ruamel parse error: {e}")
               continue
 
-            # PyYAML 로드
             try:
               with p.open(encoding="utf-8") as fh:
                 data = yaml.safe_load(fh) or {}
@@ -121,6 +121,6 @@ jobs:
         if: ${{ success() }}
         run: |
           echo "All .github/workflows passed:"
-          echo "- actionlint (downloaded binary)"
+          echo "- actionlint (installed via official script)"
           echo "- yamllint"
           echo "- deep checks (inputs <= 10, duplicate keys, parse)"
