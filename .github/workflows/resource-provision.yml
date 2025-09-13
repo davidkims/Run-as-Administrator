@@ -1,4 +1,4 @@
-name: Increase Disk and Memory
+name: Increase Disk + Memory + No-Key Installs + Perms + Echo (Unified)
 
 on:
   workflow_dispatch:
@@ -6,37 +6,202 @@ on:
 jobs:
   expand:
     runs-on: ubuntu-latest
-    timeout-minutes: 30  # 작업 완료 보장을 위한 타임아웃 설정
+    timeout-minutes: 45
+    permissions:
+      contents: read   # 아티팩트 업로드만 하면 read로 충분
+
     steps:
-      - name: 🧹 Free Disk Space
+      - name: 🔎 Runner Info (before)
+        shell: bash
         run: |
-          sudo rm -rf /usr/local/lib/android
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /opt/ghc
+          set -euxo pipefail
+          uname -a
+          id
+          df -hT
+          lsblk
+
+      - name: 🧹 Free Disk Space (safe)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo rm -rf /usr/local/lib/android || true
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /opt/ghc || true
+          sudo docker ps -aq | xargs -r sudo docker rm -f || true
           sudo docker system prune -af || true
-          sudo apt clean
-          sudo rm -rf /var/lib/apt/lists/*
-          df -h
+          sudo docker builder prune -af || true
+          sudo apt-get clean
+          sudo rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/* || true
+          echo "::group::Disk after cleanup"
+          df -hT
+          echo "::endgroup::"
 
-      - name: 🧮 Add Swap for Memory
+      - name: 🧮 Add 20G Swap (with fallback)
+        shell: bash
         run: |
-          # 기존 스왑 비활성화 및 제거 (존재할 경우)
-          sudo swapoff -a
-          sudo rm -f /swapfile
-
-          # 새로운 20GB 스왑 파일 생성 및 활성화
-          sudo fallocate -l 20G /swapfile
+          set -euxo pipefail
+          sudo swapoff -a || true
+          sudo rm -f /swapfile || true
+          if sudo fallocate -l 20G /swapfile; then
+            echo "fallocate OK"
+          else
+            echo "fallocate failed; fallback to dd"
+            sudo dd if=/dev/zero of=/swapfile bs=1M count=$((20*1024)) status=progress
+          fi
           sudo chmod 600 /swapfile
           sudo mkswap /swapfile
           sudo swapon /swapfile
-          echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
+          echo 'vm.swappiness=60' | sudo tee /etc/sysctl.d/99-swap.conf >/dev/null
+          sudo sysctl --system
+          echo "::group::Memory after swap"
+          free -h
+          cat /proc/swaps || true
+          echo "::endgroup::"
+
+      - name: 📦 Create 10G tmpfs Scratch (RAM/SWAP-backed)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo mkdir -p /mnt/temp
+          sudo mount -t tmpfs -o size=10G,mode=1777 tmpfs /mnt/temp
+          echo "TMPDIR=/mnt/temp" >> $GITHUB_ENV
+          echo "TEMP=/mnt/temp"   >> $GITHUB_ENV
+          echo "TMP=/mnt/temp"    >> $GITHUB_ENV
+          df -hT /mnt/temp || true
+
+      - name: 🧰 No-Key Package Installs (APT only)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update -y
+          # 키/토큰 불필요 설치군 (필요시 추가/삭제 가능)
+          sudo apt-get install -y --no-install-recommends \
+            build-essential git wget curl unzip tar gzip bzip2 xz-utils \
+            jq moreutils yq \
+            python3 python3-pip \
+            openjdk-17-jdk maven gradle \
+            net-tools iputils-ping traceroute telnet dnsutils openssh-client rsync netcat-openbsd \
+            mysql-client postgresql-client sqlite3 \
+            tree lsof strace ncdu htop
+          # 버전 정보 스냅샷
+          mkdir -p .github/echo_setup/versions
+          {
+            echo "# Installed Versions"
+            date -u +"%Y-%m-%dT%H:%M:%SZ"
+            echo
+            echo "## Core"
+            git --version || true
+            curl --version | head -n1 || true
+            wget --version | head -n1 || true
+            jq --version || true
+            yq --version || true
+            echo
+            echo "## Languages & Build"
+            python3 --version || true
+            pip3 --version || true
+            javac -version || true
+            mvn -v || true
+            gradle -v | sed -n '1,3p' || true
+            echo
+            echo "## DB Clients"
+            mysql --version || true
+            psql --version || true
+            sqlite3 --version || true
+          } | tee .github/echo_setup/versions/installed.md
+
+      - name: 🧾 Echo Files & Required Structure
+        shell: bash
+        run: |
+          set -euxo pipefail
+          ROOT=".github/echo_setup"
+          mkdir -p "$ROOT"/{logs,perms,bin,samples,docs}
+          # 샘플 스크립트(권한/디스크/메모리 리포트)
+          cat > "$ROOT/bin/report.sh" <<'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          {
+            echo "=== REPORT @ $(date -u +"%Y-%m-%dT%H:%M:%SZ")==="
+            echo
+            echo "[ID]"
+            id
+            echo
+            echo "[DISK]"
+            df -hT
+            echo
+            echo "[MEMORY]"
+            free -h || true
+            echo
+            echo "[MOUNTS]"
+            mount | grep -E '/mnt/temp|/mnt/loopfs' || true
+            echo
+            echo "[SWAP]"
+            cat /proc/swaps || true
+          } | tee ".github/echo_setup/logs/report-$(date -u +%Y%m%d%H%M%S).log"
+          EOF
+          chmod 0755 "$ROOT/bin/report.sh"
+
+          # 샘플 설정 파일들(에코 생성)
+          cat > "$ROOT/docs/README.md" <<'EOF'
+          # Echo Setup Pack
+          - No-key installs via APT
+          - Swap & tmpfs scratch
+          - Permission snapshot
+          - Reports & version captures
+          > Runner는 일회성 VM입니다. fstab/영구 계정 변경은 비권장입니다.
+          EOF
+
+          cat > "$ROOT/samples/sample.env" <<'EOF'
+          # Sample environment file (echo)
+          APP_ENV=dev
+          LOG_LEVEL=INFO
+          EOF
+
+          # 실행 리포트 1회 생성
+          "$ROOT/bin/report.sh"
+
+      - name: 🔐 Permissions Setup & Snapshot
+        shell: bash
+        run: |
+          set -euxo pipefail
+          ROOT=".github/echo_setup"
+          # 퍼미션 정책(러너 사용자에게 실행권한 보장)
+          chmod -R u+rwX,go-rwx "$ROOT"
+          chmod -R a+r "$ROOT/docs"         # 문서는 읽기 허용
+          chmod a+rx "$ROOT/bin"            # 실행 스크립트 디렉터리
+          # 권한 스냅샷
+          {
+            echo "=== PERMISSIONS @ $(date -u +"%Y-%m-%dT%H:%M:%SZ")==="
+            echo
+            echo "[Tree]"
+            (cd "$ROOT" && find . -maxdepth 3 -printf "%M %u:%g %p\n" | sort)
+          } | tee "$ROOT/perms/permissions-$(date -u +%Y%m%d%H%M%S).txt"
+
+      - name: 🔎 Runner Info (after)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          df -hT
           free -h
 
-      - name: 📈 Extend Disk Space (임시 볼륨 확장)
+      - name: 📦 Upload Echo Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: echo-setup-pack
+          path: .github/echo_setup/
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: ♻️ Cleanup (swap off / unmount tmpfs)
+        if: ${{ always() }}
+        shell: bash
         run: |
-          # 임시 디렉토리를 더 큰 디스크 공간이 있는 곳으로 이동
-          sudo mkdir -p /mnt/temp
-          sudo mount -t tmpfs -o size=10G tmpfs /mnt/temp
-          export TEMP=/mnt/temp
-          export TMPDIR=/mnt/temp
-          df -h
+          set -euxo pipefail
+          if mountpoint -q /mnt/temp; then
+            sudo umount /mnt/temp
+          fi
+          sudo swapoff -a || true
+          sudo rm -f /swapfile || true
+          echo "::group::Final state"
+          df -hT
+          free -h
+          echo "::endgroup::"
