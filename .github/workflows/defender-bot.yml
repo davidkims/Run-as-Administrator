@@ -1,9 +1,14 @@
-name: Dependabot Updates via Proxy + Full Scan & Servers
+name: Dependabot Updates via Proxy + Full Scan & Servers (Auto Files)
 
 on:
   schedule:
-    - cron: '0 0 * * 1'   # 매주 월요일 00:00
+    - cron: '0 0 * * 1'   # 매주 월요일 00:00 KST
   workflow_dispatch:
+    inputs:
+      commit_changes:
+        description: "자동 생성된 파일을 커밋/푸시할까요? (true/false)"
+        required: true
+        default: "true"
   pull_request:
     types: [opened, reopened, synchronize]
     branches: [main]
@@ -16,10 +21,10 @@ on:
 permissions:
   contents: write
   pull-requests: write
-  security-events: write  # (선택) Code scanning 업로드 시 필요
+  security-events: write
 
-# 전역 프록시(대문자만)
 env:
+  # 전역 프록시
   HTTP_PROXY: ${{ secrets.HTTP_PROXY }}
   HTTPS_PROXY: ${{ secrets.HTTPS_PROXY }}
   NO_PROXY: ${{ secrets.NO_PROXY }}
@@ -27,10 +32,12 @@ env:
   PROXY_PORT: ${{ secrets.PROXY_PORT }}
 
 jobs:
-  run-dependabot:
-    name: Run Dependabot via Proxy (Maven & Docker)
-    if: ${{ github.event_name != 'pull_request' }}  # 스케줄/수동 실행에서만
+  prepare-files:
+    name: Prepare (Create all required files if missing)
+    if: ${{ github.event_name != 'pull_request' }}  # 스케줄/수동일 때만
     runs-on: ubuntu-latest
+    outputs:
+      created_any: ${{ steps.flags.outputs.created_any }}
     steps:
       - name: Configure apt proxy (system-wide)
         run: |
@@ -41,33 +48,208 @@ jobs:
             echo "Acquire::https::Proxy \"${HTTPS_PROXY}\";" | sudo tee -a /etc/apt/apt.conf.d/99proxy
           fi
 
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Export JVM/Maven proxy to $GITHUB_ENV
+      - name: Ensure directories
         run: |
-          echo "MAVEN_OPTS=-Dhttp.proxyHost=${PROXY_HOST} -Dhttp.proxyPort=${PROXY_PORT} -Dhttps.proxyHost=${PROXY_HOST} -Dhttps.proxyPort=${PROXY_PORT}" >> "$GITHUB_ENV"
-          echo "JAVA_TOOL_OPTIONS=-Dhttp.proxyHost=${PROXY_HOST} -Dhttp.proxyPort=${PROXY_PORT} -Dhttps.proxyHost=${PROXY_HOST} -Dhttps.proxyPort=${PROXY_PORT}" >> "$GITHUB_ENV"
+          mkdir -p .github dist/site dist/sql src/main/java/com/example
 
-      - name: Dependabot for Maven (via proxy)
+      - name: Create .gitignore if missing
         run: |
-          docker run --rm \
-            -e GITHUB_ACCESS_TOKEN=${{ secrets.GITHUB_TOKEN }} \
-            -e HTTP_PROXY="${HTTP_PROXY}" \
-            -e HTTPS_PROXY="${HTTPS_PROXY}" \
-            -e NO_PROXY="${NO_PROXY}" \
-            -v "${{ github.workspace }}":/home/dependabot/app \
-            ghcr.io/dependabot/dependabot-core update maven /home/dependabot/app
+          if [ ! -f .gitignore ]; then
+            cat > .gitignore <<'GIT'
+            target/
+            dist/
+            *.log
+            .DS_Store
+            GIT
+            echo "::notice::.gitignore created"
+          fi
 
-      - name: Dependabot for Docker (via proxy)
+      - name: Create .dockerignore if missing
         run: |
-          docker run --rm \
-            -e GITHUB_ACCESS_TOKEN=${{ secrets.GITHUB_TOKEN }} \
-            -e HTTP_PROXY="${HTTP_PROXY}" \
-            -e HTTPS_PROXY="${HTTPS_PROXY}" \
-            -e NO_PROXY="${NO_PROXY}" \
-            -v "${{ github.workspace }}":/home/dependabot/app \
-            ghcr.io/dependabot/dependabot-core update docker /home/dependabot/app
+          if [ ! -f .dockerignore ]; then
+            cat > .dockerignore <<'DOCKERIGNORE'
+            .git
+            dist
+            target
+            *.log
+            DOCKERIGNORE
+            echo "::notice::.dockerignore created"
+          fi
+
+      - name: Create README.md if missing
+        run: |
+          if [ ! -f README.md ]; then
+            cat > README.md <<'MD'
+            # Auto-Initialized Repo
+
+            This repository is auto-prepared by GitHub Actions to ensure:
+            - Dependabot config
+            - Minimal Maven project
+            - Safe Dockerfile
+            - Security scans + Test servers
+            MD
+            echo "::notice::README.md created"
+          fi
+
+      - name: Create Dependabot config if missing
+        run: |
+          mkdir -p .github
+          if [ ! -f .github/dependabot.yml ]; then
+            cat > .github/dependabot.yml <<'YML'
+            version: 2
+            updates:
+              - package-ecosystem: "maven"
+                directory: "/"
+                schedule:
+                  interval: "weekly"
+                  day: "monday"
+                  time: "00:00"
+                  timezone: "Asia/Seoul"
+                open-pull-requests-limit: 10
+              - package-ecosystem: "docker"
+                directory: "/"
+                schedule:
+                  interval: "weekly"
+                  day: "monday"
+                  time: "00:00"
+                  timezone: "Asia/Seoul"
+                open-pull-requests-limit: 10
+            YML
+            echo "::notice::.github/dependabot.yml created"
+          fi
+
+      - name: Create minimal Maven project if missing
+        run: |
+          if ! ls **/pom.xml 2>/dev/null | grep -q .; then
+            cat > pom.xml <<'POM'
+            <?xml version="1.0" encoding="UTF-8"?>
+            <project xmlns="http://maven.apache.org/POM/4.0.0"
+                     xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                     xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+              <modelVersion>4.0.0</modelVersion>
+              <groupId>com.example</groupId>
+              <artifactId>auto-sample</artifactId>
+              <version>0.0.1</version>
+              <name>auto-sample</name>
+              <properties>
+                <maven.compiler.source>17</maven.compiler.source>
+                <maven.compiler.target>17</maven.compiler.target>
+              </properties>
+              <build>
+                <plugins>
+                  <plugin>
+                    <groupId>org.apache.maven.plugins</groupId>
+                    <artifactId>maven-jar-plugin</artifactId>
+                    <version>3.3.0</version>
+                    <configuration>
+                      <archive>
+                        <manifest>
+                          <mainClass>com.example.App</mainClass>
+                        </manifest>
+                      </archive>
+                    </configuration>
+                  </plugin>
+                </plugins>
+              </build>
+            </project>
+            POM
+            cat > src/main/java/com/example/App.java <<'JAVA'
+            package com.example;
+            public class App {
+              public static void main(String[] args) {
+                System.out.println("Hello from auto-sample!");
+              }
+            }
+            JAVA
+            echo "::notice::pom.xml + sample App.java created"
+          fi
+
+      - name: Create safe Dockerfile if missing
+        run: |
+          if ! ls Dockerfile */Dockerfile 2>/dev/null | grep -q .; then
+            cat > Dockerfile <<'DOCKER'
+            FROM alpine:3.19
+            RUN adduser -D appuser
+            USER appuser
+            CMD ["sh", "-c", "echo Auto Docker image OK; sleep 5"]
+            DOCKER
+            echo "::notice::Dockerfile created"
+          fi
+
+      - name: Create site & SQL samples
+        run: |
+          echo "<h1>Echo Test OK - $(date -u +'%Y-%m-%dT%H:%M:%SZ')</h1>" > dist/site/index.html
+          cat > dist/site/health.json << 'JSON'
+          { "status": "ok", "ts": "__TS__" }
+          JSON
+          sed -i "s/__TS__/$(date -u +'%Y-%m-%dT%H:%M:%SZ')/" dist/site/health.json
+          cat > dist/sql/init.sql <<'SQL'
+          CREATE TABLE IF NOT EXISTS accounts(
+            id INT PRIMARY KEY AUTO_INCREMENT,
+            owner VARCHAR(64),
+            balance DECIMAL(18,2),
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+          );
+          INSERT INTO accounts(owner, balance) VALUES ('alice', 1000.00), ('bob', 500.50);
+          SQL
+
+      - name: Detect changes & optionally commit
+        id: commit
+        env:
+          DO_COMMIT: ${{ github.event.inputs.commit_changes || 'true' }}
+        run: |
+          set -e
+          CHANGED="false"
+          git status --porcelain
+          if [ -n "$(git status --porcelain)" ]; then
+            CHANGED="true"
+            if [ "${DO_COMMIT}" = "true" ]; then
+              git config user.name "github-actions[bot]"
+              git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+              git add -A
+              git commit -m "[AUTO] Initialize required files (dependabot/maven/docker/site/sql)"
+              git push || true
+              echo "::notice::Changes committed & pushed."
+            else
+              echo "::notice::Changes detected but not committed (commit_changes=false)."
+            fi
+          else
+            echo "::notice::No changes to commit."
+          fi
+          echo "created_any=${CHANGED}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload generated files (artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: prepared-files
+          path: |
+            .github/dependabot.yml
+            pom.xml
+            src/**
+            Dockerfile
+            .dockerignore
+            .gitignore
+            README.md
+            dist/site/**
+            dist/sql/**
+
+      - name: Set created_any flag
+        id: flags
+        run: echo "created_any=${{ steps.commit.outputs.created_any }}" >> "$GITHUB_OUTPUT"
+
+  check-config:
+    name: Check dependabot.yml presence
+    needs: [prepare-files]
+    if: ${{ github.event_name != 'pull_request' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          test -f .github/dependabot.yml || { echo "::error::missing .github/dependabot.yml"; exit 1; }
+          sed -E 's/(token|password|username):.*/\1: ***REDACTED***/' .github/dependabot.yml || true
 
   validate-pr:
     name: Validate Dependabot PR (Build & Image)
@@ -83,8 +265,7 @@ jobs:
             echo "Acquire::https::Proxy \"${HTTPS_PROXY}\";" | sudo tee -a /etc/apt/apt.conf.d/99proxy
           fi
 
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Export JVM/Maven proxy to $GITHUB_ENV
         run: |
@@ -100,18 +281,14 @@ jobs:
       - name: Build with Maven
         run: mvn -B -V -e -DskipTests package
 
-      - name: Build Docker image (if Dockerfile exists)
-        run: |
-          if ls Dockerfile */Dockerfile >/dev/null 2>&1; then
-            docker build -t myapp:latest .
-          else
-            echo "No Dockerfile found, skipping image build."
-          fi
+      - name: Build Docker image (always exists now)
+        run: docker build -t myapp:latest .
 
   security-scans:
     name: Full Security Scans (Gitleaks + SBOM + Trivy)
     runs-on: ubuntu-latest
     needs: [validate-pr]
+    if: ${{ always() && needs.validate-pr.result != 'skipped' }}
     steps:
       - name: Configure apt proxy (system-wide)
         run: |
@@ -122,19 +299,15 @@ jobs:
             echo "Acquire::https::Proxy \"${HTTPS_PROXY}\";" | sudo tee -a /etc/apt/apt.conf.d/99proxy
           fi
 
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Prepare dirs
-        run: |
-          mkdir -p dist/reports dist/sbom
+        run: mkdir -p dist/reports dist/sbom
 
       - name: Gitleaks (secrets scan)
         uses: gitleaks/gitleaks-action@v2
         with:
-          # 기본 detect; 실패 시 워크플로우 실패 방지하려면 args: "--no-banner --redact --exit-code 0"
-          # 여기서는 실패 시 알리기 위해 기본 설정 유지
-          args: --redact -v
+          args: --no-banner --redact --exit-code 1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -143,21 +316,8 @@ jobs:
           curl -fsSL https://raw.githubusercontent.com/anchore/sbom-action/main/install.sh | bash -s -- -b /usr/local/bin v1.31.0
           syft version
 
-      - name: Build Docker image for scanning (if missing)
-        run: |
-          if ! docker image inspect myapp:latest >/dev/null 2>&1; then
-            if ls Dockerfile */Dockerfile >/dev/null 2>&1; then
-              docker build -t myapp:latest .
-            fi
-          fi
-
-      - name: Generate SBOM (image or dir)
-        run: |
-          if docker image inspect myapp:latest >/dev/null 2>&1; then
-            syft scan "docker:myapp:latest" -o spdx-json > dist/sbom/sbom-image.spdx.json
-          else
-            syft packages dir:. -o spdx-json > dist/sbom/sbom-source.spdx.json
-          fi
+      - name: Generate SBOM (image)
+        run: syft scan "docker:myapp:latest" -o spdx-json > dist/sbom/sbom-image.spdx.json
 
       - name: Install Trivy
         run: |
@@ -167,16 +327,10 @@ jobs:
           ./bin/trivy --version
 
       - name: Trivy (FS scan)
-        run: |
-          ./bin/trivy fs --no-progress --format sarif --output dist/reports/trivy-fs.sarif .
+        run: ./bin/trivy fs --no-progress --format sarif --output dist/reports/trivy-fs.sarif .
 
-      - name: Trivy (Image scan, if built)
-        run: |
-          if docker image inspect myapp:latest >/dev/null 2>&1; then
-            ./bin/trivy image --no-progress --format sarif --output dist/reports/trivy-image.sarif myapp:latest
-          else
-            echo "Image not built; skipping Trivy image scan."
-          fi
+      - name: Trivy (Image scan)
+        run: ./bin/trivy image --no-progress --format sarif --output dist/reports/trivy-image.sarif myapp:latest
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -189,12 +343,12 @@ jobs:
   servers:
     name: Spin-up Test Servers (nginx + MySQL via containers)
     runs-on: ubuntu-latest
-    needs: [run-dependabot, security-scans]
+    needs: [validate-pr, security-scans]
+    if: ${{ always() && needs.validate-pr.result != 'skipped' }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Create example files (configs, health pages)
+      - name: Create example files (always)
         run: |
           mkdir -p dist/site
           echo "<h1>Echo Test OK - $(date -u +'%Y-%m-%dT%H:%M:%SZ')</h1>" > dist/site/index.html
@@ -223,7 +377,6 @@ jobs:
             --health-cmd="mysqladmin ping -h 127.0.0.1 -p${MYSQL_ROOT_PASSWORD} --silent" \
             --health-interval=10s --health-timeout=5s --health-retries=6 \
             mysql:8.0
-          # 대기
           for i in $(seq 1 30); do
             if docker inspect --format='{{.State.Health.Status}}' echo_mysql 2>/dev/null | grep -q healthy; then
               echo "MySQL healthy"; break
@@ -231,18 +384,8 @@ jobs:
             echo "Waiting MySQL ($i/30)"; sleep 3
           done
 
-      - name: Create MySQL init SQL & run
+      - name: Init & query MySQL
         run: |
-          mkdir -p dist/sql
-          cat > dist/sql/init.sql <<'SQL'
-          CREATE TABLE IF NOT EXISTS accounts(
-            id INT PRIMARY KEY AUTO_INCREMENT,
-            owner VARCHAR(64),
-            balance DECIMAL(18,2),
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-          );
-          INSERT INTO accounts(owner, balance) VALUES ('alice', 1000.00), ('bob', 500.50);
-          SQL
           docker exec -i echo_mysql sh -lc 'mysql -uroot -p"$MYSQL_ROOT_PASSWORD" echo_db' < dist/sql/init.sql
           docker exec -i echo_mysql sh -lc 'mysql -uroot -p"$MYSQL_ROOT_PASSWORD" -e "SELECT * FROM echo_db.accounts;"' | tee dist/sql/select_accounts.txt
 
