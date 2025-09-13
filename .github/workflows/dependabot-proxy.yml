@@ -1,4 +1,4 @@
-# 파일 경로: .github/workflows/validate-workflows.yml
+# .github/workflows/validate-workflows.yml
 name: "✅ Validate Workflow Syntax"
 
 on:
@@ -22,97 +22,90 @@ jobs:
       - name: 📥 Checkout
         uses: actions/checkout@v4
 
-      # 1) actionlint (GitHub Actions 구문/표현식 전용 린터)
-      - name: 🔍 actionlint
-        uses: rhysd/actionlint@v1
-        with:
-          # 셸체커 설치(가능하면). 실패해도 린트는 계속 진행
-          args: >
-            -color
-            -shellcheck=
-        continue-on-error: false
+      # 1) actionlint 설치 (공식 스크립트) + 실행
+      - name: 🔍 Install actionlint
+        shell: bash
+        env:
+          ACTIONLINT_VERSION: v1.7.1   # 필요 시 최신으로 고정 갱신
+        run: |
+          set -Eeuo pipefail
+          curl -sSfL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash \
+            | bash -s -- -b ./bin "${ACTIONLINT_VERSION}"
+          ./bin/actionlint --version
+
+      - name: ▶️ Run actionlint
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          # shellcheck 없는 환경에서도 진행되도록 비활성화
+          ./bin/actionlint -color -shellcheck=
 
       # 2) yamllint (일반 YAML 문법/스타일)
-      - name: 🧰 Install yamllint (pip)
+      - name: 🧰 Install yamllint
         run: |
           python3 -m pip install --upgrade pip
           pip install yamllint
       - name: 🧪 Run yamllint
         run: |
           set -euo pipefail
-          # 기본 규칙 + 장황한 출력, 필요하면 .yamllint 추가 가능
-          yamllint -s -f standard .github/workflows || (echo "yamllint failed" && exit 1)
+          yamllint -s -f standard .github/workflows
 
-      # 3) 심화 검사: inputs 10개 제한, 중복 키 탐지, on: 구조 점검
+      # 3) 심화 검사: inputs 10개 제한, 중복 키 탐지, 파서 이중 체크
       - name: 🐍 Deep Validate (PyYAML + ruamel.yaml)
         run: |
           set -euo pipefail
-
           python3 - <<'PY'
-          import sys, os, glob, json
+          import sys, glob, json
           from pathlib import Path
-
-          # PyYAML 로드
           import yaml
-          # ruamel.yaml로 중복 키 감지
           from ruamel.yaml import YAML
           from ruamel.yaml.constructor import DuplicateKeyError
 
-          workflows = sorted(list(glob.glob(".github/workflows/*.yml")) + list(glob.glob(".github/workflows/*.yaml")))
-          if not workflows:
-            print("No workflow files found under .github/workflows/. Nothing to validate.")
+          files = sorted(glob.glob(".github/workflows/*.yml") + glob.glob(".github/workflows/*.yaml"))
+          if not files:
+            print("No workflow files found.")
             sys.exit(0)
 
-          yaml_ruamel = YAML(typ='rt')  # round-trip for duplicate key detection
+          ru = YAML(typ='rt')
+          errors, summary = [], []
 
-          errors = []
-          summary = []
-
-          for wf in workflows:
-            p = Path(wf)
-            # 3-1) 중복 키 탐지 (ruamel)
+          for f in files:
+            p = Path(f)
+            # 중복 키 감지
             try:
-              with open(p, "r", encoding="utf-8") as f:
-                yaml_ruamel.load(f)
+              with p.open(encoding="utf-8") as fh:
+                ru.load(fh)
             except DuplicateKeyError as e:
-              errors.append(f"[{wf}] Duplicate key found: {e}")
+              errors.append(f"[{f}] Duplicate key: {e}")
               continue
             except Exception as e:
-              errors.append(f"[{wf}] YAML parse error (ruamel): {e}")
+              errors.append(f"[{f}] ruamel parse error: {e}")
               continue
 
-            # 3-2) 일반 로딩(PyYAML) 후 구조 점검
+            # PyYAML 로드
             try:
-              with open(p, "r", encoding="utf-8") as f:
-                data = yaml.safe_load(f) or {}
+              with p.open(encoding="utf-8") as fh:
+                data = yaml.safe_load(fh) or {}
             except Exception as e:
-              errors.append(f"[{wf}] YAML parse error (PyYAML): {e}")
+              errors.append(f"[{f}] PyYAML parse error: {e}")
               continue
 
-            # on.workflow_call.inputs / on.workflow_dispatch.inputs 의 개수 확인 (각각 최대 10)
-            def count_inputs(section_name):
+            def count_inputs(kind):
               on = data.get("on") or {}
-              sect = on.get(section_name) or {}
+              sect = on.get(kind) or {}
               inputs = sect.get("inputs") or {}
-              if isinstance(inputs, dict):
-                return len(inputs)
-              return 0
+              return len(inputs) if isinstance(inputs, dict) else 0
 
             wc = count_inputs("workflow_call")
             wd = count_inputs("workflow_dispatch")
 
             if wc > 10:
-              errors.append(f"[{wf}] workflow_call.inputs has {wc} (>10) — GitHub limit exceeded.")
+              errors.append(f"[{f}] workflow_call.inputs={wc} (>10) — GitHub limit exceeded.")
             if wd > 10:
-              errors.append(f"[{wf}] workflow_dispatch.inputs has {wd} (>10) — GitHub limit exceeded.")
+              errors.append(f"[{f}] workflow_dispatch.inputs={wd} (>10) — GitHub limit exceeded.")
 
-            summary.append({
-              "file": wf,
-              "workflow_call_inputs": wc,
-              "workflow_dispatch_inputs": wd,
-            })
+            summary.append({"file": f, "workflow_call_inputs": wc, "workflow_dispatch_inputs": wd})
 
-          # 결과 출력
           print("=== Inputs Summary ===")
           for row in summary:
             print(json.dumps(row, ensure_ascii=False))
@@ -124,11 +117,10 @@ jobs:
             sys.exit(1)
           PY
 
-      # 4) 사람 친화적 요약 출력 (문제 없을 때)
       - name: ✅ Summary
         if: ${{ success() }}
         run: |
-          echo "All workflow files under .github/workflows passed:"
-          echo "- actionlint (GitHub Actions-aware lint)"
-          echo "- yamllint (YAML syntax/style)"
-          echo "- Deep checks (inputs <= 10, duplicate keys, structure)"
+          echo "All .github/workflows passed:"
+          echo "- actionlint (downloaded binary)"
+          echo "- yamllint"
+          echo "- deep checks (inputs <= 10, duplicate keys, parse)"
