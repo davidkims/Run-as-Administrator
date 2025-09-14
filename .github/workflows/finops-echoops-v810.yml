@@ -1,4 +1,4 @@
-name: "🏦 FinOps + EchoOps v8.1.0 • XL (HealthGate+PostHook+Summary+Grype+Cosign+Checksums+PipCache+Grafana+OTel+LokiRetention+OptionsJSON+PartitionsCOPY+Formats+Verify)"
+name: "🏦 FinOps + EchoOps v8.1.0 • XL (HealthGate+PostHook+Summary+Grype+Cosign+Checksums+PipCache+Grafana+OTel+LokiRetention+OptionsJSON+PartitionsCOPY+Formats+Verify+DBTune+PgBouncer)"
 
 on:
   workflow_dispatch:
@@ -43,6 +43,55 @@ on:
         description: "고급 옵션(JSON: parquet_outputs, jsonl_outputs, enc_pass, enable_teradata, teradata_token)"
         required: false
         default: ""
+      # --- DB Tuning & Partitions ---
+      db_tune_mode:
+        description: "DB 튜닝 모드(auto/manual)"
+        required: true
+        default: "auto"
+      db_shared_buffers_mb:
+        description: "manual 모드: shared_buffers (MB)"
+        required: false
+        default: ""
+      db_work_mem_mb:
+        description: "manual 모드: work_mem (MB)"
+        required: false
+        default: ""
+      db_maintenance_work_mem_mb:
+        description: "manual 모드: maintenance_work_mem (MB)"
+        required: false
+        default: ""
+      db_effective_cache_size_mb:
+        description: "manual 모드: effective_cache_size (MB)"
+        required: false
+        default: ""
+      db_max_connections:
+        description: "manual 모드: max_connections"
+        required: false
+        default: ""
+      db_autovacuum:
+        description: "autovacuum (on/off)"
+        required: true
+        default: "on"
+      db_wal_keep_size_mb:
+        description: "WAL 보존 사이즈(MB)"
+        required: false
+        default: "256"
+      part_days_back:
+        description: "파티션 과거 일수(기본 60)"
+        required: false
+        default: "60"
+      part_days_forward:
+        description: "파티션 미래 일수(기본 7)"
+        required: false
+        default: "7"
+      enable_pgbouncer:
+        description: "PgBouncer 연결풀러 활성화(true/false)"
+        required: true
+        default: "false"
+      pgbouncer_pool_size:
+        description: "PgBouncer 풀 사이즈(per db/user)"
+        required: false
+        default: "50"
 
 permissions:
   contents: write
@@ -118,28 +167,45 @@ jobs:
           python-version: "3.11"
           cache: "pip"
 
-      # 옵션 JSON 파서(환경변수 반영) + Vault 폴백 준비
+      # 옵션 JSON 파서(환경변수 반영)
       - name: Parse options_json → ENV (echo)
         shell: bash
         env:
           OPTS_JSON: ${{ inputs.options_json }}
         run: |
+          set -Eeuo pipefail
+          source /tmp/echo_helpers.sh
+          echoe "parsing options_json..."
           python - <<'PY'
 import os, json, sys
-opts=os.environ.get("OPTS_JSON","").strip()
-d={"parquet_outputs": True, "jsonl_outputs": False, "enc_pass":"", "enable_teradata": False, "teradata_token":""}
+opts = os.environ.get("OPTS_JSON","").strip()
+
+cfg = {
+  "parquet_outputs": True,
+  "jsonl_outputs": False,
+  "enc_pass": "",
+  "enable_teradata": False,
+  "teradata_token": ""
+}
+
 if opts:
   try:
-    d.update(json.loads(opts))
+    parsed = json.loads(opts)
+    if isinstance(parsed, dict):
+      cfg.update(parsed)
+    else:
+      print("[WARN] options_json must be an object (dict). Ignored.", file=sys.stderr)
   except Exception as e:
     print(f"[WARN] options_json parse error: {e}", file=sys.stderr)
-with open(os.environ["GITHUB_ENV"],"a") as f:
-  f.write(f"PARQUET={str(d['parquet_outputs']).lower()}\n")
-  f.write(f"JSONL={str(d['jsonl_outputs']).lower()}\n")
-  f.write(f"ENC_PASS_OPT={d['enc_pass']}\n")
-  f.write(f"ENABLE_TERADATA_OPT={str(d['enable_teradata']).lower()}\n")
-  f.write(f"TERADATA_TOKEN_OPT={d['teradata_token']}\n")
+
+with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
+  f.write(f"PARQUET={'true' if cfg['parquet_outputs'] else 'false'}\n")
+  f.write(f"JSONL={'true' if cfg['jsonl_outputs'] else 'false'}\n")
+  f.write(f"ENC_PASS_OPT={str(cfg['enc_pass']).strip()}\n")
+  f.write(f"ENABLE_TERADATA_OPT={'true' if cfg['enable_teradata'] else 'false'}\n")
+  f.write(f"TERADATA_TOKEN_OPT={str(cfg['teradata_token']).strip()}\n")
 PY
+          echoe "options_json → ENV completed"
 
       - name: Echo + Massive Directories
         shell: bash
@@ -166,17 +232,22 @@ PY
           run 'docker --version'
           run 'docker compose version || true'
 
+      # Core DB/Tools + HealthGate
       - name: Start Core DB & Tools (Postgres + Adminer + MinIO)
         shell: bash
         run: |
           NET="finops_net"
+          VOL_PG="finops_pgdata"
           run "docker network inspect '$NET' >/dev/null 2>&1 || docker network create '$NET'"
           run "docker rm -f finops-db finops-adminer finops-minio >/dev/null 2>&1 || true"
-          run "docker run -d --name finops-db --network '$NET' -e POSTGRES_PASSWORD=finops -e POSTGRES_USER=finops -e POSTGRES_DB=finops -p 5432:5432 postgres:16"
+          run "docker volume inspect '$VOL_PG' >/dev/null 2>&1 || docker volume create '$VOL_PG' >/dev/null"
+          run "docker run -d --name finops-db --network '$NET' \
+               -e POSTGRES_PASSWORD=finops -e POSTGRES_USER=finops -e POSTGRES_DB=finops \
+               -v '$VOL_PG':/var/lib/postgresql/data -p 5432:5432 postgres:16"
           run "docker run -d --name finops-adminer --network '$NET' -e ADMINER_DEFAULT_SERVER=finops-db -p 8080:8080 adminer:4"
-          run "docker run -d --name finops-minio --network '$NET' -e MINIO_ROOT_USER=admin -e MINIO_ROOT_PASSWORD=admin12345 -p 9000:9000 -p 9001:9001 minio/minio server /data --console-address ':9001'"
-
-          # 🔎 HealthGate (즉시 실패 + 일부 로그 덤프)
+          run "docker run -d --name finops-minio --network '$NET' \
+               -e MINIO_ROOT_USER=admin -e MINIO_ROOT_PASSWORD=admin12345 \
+               -p 9000:9000 -p 9001:9001 minio/minio server /data --console-address ':9001'"
           retry 30 2 "docker exec finops-db pg_isready -U finops -d finops"
           if ! curl -fsS -o /dev/null http://127.0.0.1:8080; then
             warn "Adminer health failed"; docker logs --tail=200 finops-adminer || true; fail "Adminer not ready"
@@ -212,7 +283,7 @@ PY
             - name: echo-alerts
               rules:
                 - alert: PostgresDown
-                  expr: up{job="prometheus"}==1 and absent(up{job="postgres"}) # placeholder
+                  expr: up{job="prometheus"}==1 and absent(up{job="postgres"})
                   for: 2m
                   labels: { severity: warning }
                   annotations: { summary: "Postgres may be down" }
@@ -237,7 +308,6 @@ PY
           exporters: { logging: {} }
           service: { pipelines: { traces: { receivers: [otlp], exporters: [logging] } } }
           YML
-
           run "docker rm -f prometheus grafana loki promtail cadvisor node-exporter otel >/dev/null 2>&1 || true"
           run "docker run -d --name prometheus --network '$NET' -p 9090:9090 \
                -v '$PWD/.github/echo/monitoring/prometheus.yml':/etc/prometheus/prometheus.yml \
@@ -258,7 +328,6 @@ PY
           run "docker run -d --name otel --network '$NET' -p 4318:4318 \
                -v '$PWD/.github/echo/monitoring/otel-config.yml':/etc/otelcol/config.yml otel/opentelemetry-collector:0.98.0 \
                --config=/etc/otelcol/config.yml"
-
           # HealthGate
           retry 30 2 "curl -fsS http://127.0.0.1:9090/-/ready >/dev/null"
           retry 30 2 "curl -fsS http://127.0.0.1:3000/api/health >/dev/null"
@@ -292,7 +361,7 @@ PY
           run "sudo apt-get install -y postgresql-client"
           run "PGPASSWORD=finops psql -h 127.0.0.1 -U finops -d finops -c 'select 1'"
 
-      # Teradata 옵션(로그만) + Vault dev + 폴백 시크릿
+      # Vault + enc_pass 결정(입력/options_json/Secrets 폴백)
       - name: Vault (dev) + enc_pass seed (options/secret fallback)
         shell: bash
         env:
@@ -300,7 +369,6 @@ PY
           ENC_PASS_OPT: ${{ env.ENC_PASS_OPT }}
           ENC_PASS_FALLBACK: ${{ secrets.ENC_PASS_FALLBACK }}
         run: |
-          # enc_pass 결정: 입력 > options_json > GitHub Secret(폴백)
           PASS="${ENC_PASS_INPUT:-}"
           [ -z "$PASS" ] && PASS="${ENC_PASS_OPT:-}"
           [ -z "$PASS" ] && PASS="${ENC_PASS_FALLBACK:-}"
@@ -310,7 +378,6 @@ PY
           else
             warn "enc_pass not provided; will generate later if encryption enabled"
           fi
-
           NET="finops_net"
           IMG="hashicorp/vault:1.17"
           CNTR="finops-vault"
@@ -432,6 +499,148 @@ PY
           SQL
           ACC=$((50 + ${{ inputs.extra_accounts }}))
           run "PGPASSWORD=finops psql -h 127.0.0.1 -U finops -d finops -v ACC=\"$ACC\" -f .github/echo_db/seed/accounts.sql"
+
+      # === DB 튜닝(자동/수동) → ALTER SYSTEM → 재기동/검증 ===
+      - name: DB Tuning Profile • generate (auto/manual)
+        shell: bash
+        env:
+          MODE: ${{ inputs.db_tune_mode }}
+          SBUFF: ${{ inputs.db_shared_buffers_mb }}
+          WMEM: ${{ inputs.db_work_mem_mb }}
+          MW_MEM: ${{ inputs.db_maintenance_work_mem_mb }}
+          ECACHE: ${{ inputs.db_effective_cache_size_mb }}
+          MAXCONN: ${{ inputs.db_max_connections }}
+          AUTOVAC: ${{ inputs.db_autovacuum }}
+          WALKEEP: ${{ inputs.db_wal_keep_size_mb }}
+        run: |
+          set -Eeuo pipefail
+          source /tmp/echo_helpers.sh
+          mem_total_kb=$(grep MemTotal /proc/meminfo | awk '{print $2}')
+          mem_total_mb=$((mem_total_kb/1024))
+          cpu_cnt=$(nproc)
+
+          auto_shared=$(( mem_total_mb * 25 / 100 ))
+          (( auto_shared < 256 )) && auto_shared=256
+          auto_ecache=$(( mem_total_mb * 60 / 100 ))
+          (( auto_ecache < 512 )) && auto_ecache=512
+          auto_wmem=$(( (mem_total_mb * 1) / (100 * cpu_cnt) ))
+          (( auto_wmem < 4 )) && auto_wmem=4
+          auto_mwmem=$(( mem_total_mb * 5 / 100 ))
+          (( auto_mwmem < 64 )) && auto_mwmem=64
+          auto_maxconn=$(( 100 + cpu_cnt*50 ))
+          wal_keep="${WALKEEP:-256}"
+
+          if [ "${MODE}" = "manual" ]; then
+            shared="${SBUFF:-$auto_shared}"
+            wmem="${WMEM:-$auto_wmem}"
+            mwmem="${MW_MEM:-$auto_mwmem}"
+            ecache="${ECACHE:-$auto_ecache}"
+            maxconn="${MAXCONN:-$auto_maxconn}"
+          else
+            shared="${SBUFF:-$auto_shared}"
+            wmem="${WMEM:-$auto_wmem}"
+            mwmem="${MW_MEM:-$auto_mwmem}"
+            ecache="${ECACHE:-$auto_ecache}"
+            maxconn="${MAXCONN:-$auto_maxconn}"
+          fi
+
+          echoe "DB Profile: shared_buffers=${shared}MB, work_mem=${wmem}MB, maintenance_work_mem=${mwmem}MB, effective_cache_size=${ecache}MB, max_connections=${maxconn}, autovacuum=${AUTOVAC}, wal_keep_size=${wal_keep}MB"
+          {
+            echo "shared_buffers = '${shared}MB'"
+            echo "work_mem = '${wmem}MB'"
+            echo "maintenance_work_mem = '${mwmem}MB'"
+            echo "effective_cache_size = '${ecache}MB'"
+            echo "max_connections = ${maxconn}"
+            echo "autovacuum = ${AUTOVAC:-on}"
+            echo "wal_keep_size = '${wal_keep}MB'"
+            echo "random_page_cost = 1.1"
+            echo "effective_io_concurrency = 256"
+            echo "max_wal_size = '2GB'"
+            echo "min_wal_size = '512MB'"
+            echo "checkpoint_completion_target = 0.9"
+          } > .github/echo_db/ddl/postgres.tune.conf
+          cat .github/echo_db/ddl/postgres.tune.conf | sed 's/^/[ECHO] cfg: /' || true
+
+      - name: DB Parameters • apply via ALTER SYSTEM + restart + health
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          source /tmp/echo_helpers.sh
+          while IFS= read -r line; do
+            key=$(echo "$line" | awk -F '=' '{print $1}' | xargs)
+            val=$(echo "$line" | cut -d'=' -f2- | xargs)
+            [ -z "$key" ] && continue
+            run "PGPASSWORD=finops psql -h 127.0.0.1 -U finops -d finops -c \"alter system set ${key} = ${val};\""
+          done < .github/echo_db/ddl/postgres.tune.conf
+          run "PGPASSWORD=finops psql -h 127.0.0.1 -U finops -d finops -c 'select pg_reload_conf();' || true"
+          run "docker restart finops-db"
+          retry 40 3 "docker exec finops-db pg_isready -U finops -d finops"
+          run "PGPASSWORD=finops psql -h 127.0.0.1 -U finops -d finops -c \"select name, setting from pg_settings where name in ('shared_buffers','work_mem','maintenance_work_mem','effective_cache_size','max_connections','autovacuum','wal_keep_size');\""
+
+      - name: Partitions • scale horizon by inputs
+        shell: bash
+        env:
+          BACK: ${{ inputs.part_days_back }}
+          FWD:  ${{ inputs.part_days_forward }}
+        run: |
+          set -Eeuo pipefail
+          source /tmp/echo_helpers.sh
+          DB_B="${BACK:-60}"; DB_F="${FWD:-7}"
+          echoe "partition horizon: back=${DB_B}d, forward=${DB_F}d"
+          cat > .github/echo_db/ddl/003_partitions_scaled.sql <<SQL
+          do \$\$
+          declare d date := (current_date - interval '${DB_B} days')::date;
+                  endd date := (current_date + interval '${DB_F} days')::date;
+          begin
+            while d <= endd loop
+              execute format('create table if not exists transactions_p%s partition of transactions
+                              for values from (%L) to (%L);',
+                              to_char(d,'YYYYMMDD'), d::timestamptz, (d+1)::timestamptz);
+              execute format('create index if not exists ix_txn_%s_acc_ts on transactions_p%s (account_no, ts);',
+                              to_char(d,'YYYYMMDD'), to_char(d,'YYYYMMDD'));
+              execute format('create table if not exists journal_entries_p%s partition of journal_entries
+                              for values from (%L) to (%L);',
+                              to_char(d,'YYYYMMDD'), d::timestamptz, (d+1)::timestamptz);
+              execute format('create index if not exists ix_je_%s_acc_ts on journal_entries_p%s (account_no, ts);',
+                              to_char(d,'YYYYMMDD'), to_char(d,'YYYYMMDD'));
+              d := d + 1;
+            end loop;
+          end\$\$;
+          SQL
+          run "PGPASSWORD=finops psql -h 127.0.0.1 -U finops -d finops -f .github/echo_db/ddl/003_partitions_scaled.sql"
+
+      - name: PgBouncer • optional scale-out connection pooler
+        if: ${{ inputs.enable_pgbouncer == 'true' }}
+        shell: bash
+        env:
+          PGB_POOL: ${{ inputs.pgbouncer_pool_size }}
+        run: |
+          set -Eeuo pipefail
+          source /tmp/echo_helpers.sh
+          NET="finops_net"
+          run "docker rm -f pgbouncer >/dev/null 2>&1 || true"
+          run "mkdir -p .github/echo/pgbouncer"
+          cat > .github/echo/pgbouncer/pgbouncer.ini <<INI
+          [databases]
+          finops = host=finops-db port=5432 dbname=finops user=finops password=finops
+
+          [pgbouncer]
+          listen_addr = 0.0.0.0
+          listen_port = 6432
+          auth_type = plain
+          auth_file = /etc/pgbouncer/userlist.txt
+          pool_mode = transaction
+          max_client_conn = 2000
+          default_pool_size = ${PGB_POOL:-50}
+          server_reset_query = DISCARD ALL
+          INI
+          echo "\"finops\" \"finops\"" > .github/echo/pgbouncer/userlist.txt
+          run "docker run -d --name pgbouncer --network '$NET' -p 6432:6432 \
+               -v '$PWD/.github/echo/pgbouncer/pgbouncer.ini':/etc/pgbouncer/pgbouncer.ini \
+               -v '$PWD/.github/echo/pgbouncer/userlist.txt':/etc/pgbouncer/userlist.txt \
+               edoburu/pgbouncer"
+          retry 20 2 "bash -lc '</dev/tcp/127.0.0.1/6432' || exit 1"
+          echoe "PgBouncer ready on 6432 (use host=localhost port=6432)"
 
       # 시뮬레이터 (Kafka 또는 COPY Bulk)
       - name: Kafka simulators (if enabled)
@@ -576,12 +785,11 @@ PY
               for r in rows:
                 r2 = dict(r); r2["ts"]=r2["ts"].isoformat(); f.write(json.dumps(r2,ensure_ascii=False)+"\n")
           PY
-
           run "python -m pip install --upgrade pip"
           run "pip install -r .github/echo/requirements.txt"
           run "ROWS='${{ matrix.rows }}' PARQUET='${PARQUET}' JSONL='${JSONL}' python .github/echo/bin/simulate.py"
 
-      # 검증(강화) + 요약
+      # 검증(강화) + Step Summary
       - name: Verify Simulation Writes (strong checks)
         shell: bash
         env:
@@ -604,14 +812,11 @@ PY
           if not ok: sys.exit("Verification failed: counts/time_range invalid")
           PY
           run "python .github/echo/bin/verify.py"
-
-          # Step Summary
-          ENC="${{ matrix.encrypt_outputs }}"
           echo "| Key | Value |" >> "$GITHUB_STEP_SUMMARY"
           echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
           echo "| Rows | ${{ matrix.rows }} |" >> "$GITHUB_STEP_SUMMARY"
           echo "| Kafka | ${{ matrix.run_kafka }} |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Encrypt | $ENC |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Encrypt | ${{ matrix.encrypt_outputs }} |" >> "$GITHUB_STEP_SUMMARY"
           echo "| Reports dir | \`artifacts/reports\`, \`site/reports\` |" >> "$GITHUB_STEP_SUMMARY"
 
       - name: MinIO (mc) mirror outputs
@@ -656,8 +861,6 @@ PY
           fi
           run "syft version"
           run "syft dir:. -o spdx-json > artifacts/sbom/repo.spdx.json"
-
-          # Grype
           if curl -fsSL https://raw.githubusercontent.com/anchore/grype/main/install.sh | bash -s -- -b /usr/local/bin; then
             run "grype version"
             run "grype dir:. -o sarif > artifacts/scan/grype.sarif || true"
@@ -724,9 +927,7 @@ PY
         env:
           COSIGN_EXPERIMENTAL: "1"
         run: |
-          # install cosign
           curl -fsSL https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-amd64 -o /usr/local/bin/cosign && chmod +x /usr/local/bin/cosign || { warn "cosign install failed"; exit 0; }
-          # provenance (간단 메타)
           cat > artifacts/checks/provenance.json <<'JSON'
           {
             "schema":"io.echoops.provenance/v1",
@@ -735,7 +936,6 @@ PY
             "inputs":["rows","run_kafka","encrypt_outputs","extra_accounts","options_json"]
           }
           JSON
-          # sign-blob (zip & enc zip / checksum / provenance)
           for f in artifacts/zip/finops_outputs.zip artifacts/zip/finops_outputs.zip.enc artifacts/checks/*.sha256 artifacts/checks/*.sha512 artifacts/checks/provenance.json; do
             [ -f "$f" ] || continue
             echoe "cosign sign $f"
@@ -756,7 +956,7 @@ PY
           run "git config user.email \"$GIT_AUTHOR_EMAIL\""
           run "git add -A"
           if git diff --cached --quiet; then echoe "변경 없음 → 푸시 스킵"; exit 0; fi
-          run "git commit -m \"[ECHO] v8.1.0 XL (health+summary+sbom/grype+cosign+checksums+partitions+copy+formats+verify), rows=${{ matrix.rows }}, kafka=${{ matrix.run_kafka }}, enc=${{ matrix.encrypt_outputs }}\""
+          run "git commit -m \"[ECHO] v8.1.0 XL (health+summary+sbom/grype+cosign+checksums+dbtune+pgbouncer+partitions+copy+formats+verify), rows=${{ matrix.rows }}, kafka=${{ matrix.run_kafka }}, enc=${{ matrix.encrypt_outputs }}\""
           run "git fetch --tags --force origin"
           run "git push origin \"refs/heads/${BRANCH}:refs/heads/${BRANCH}\" --force-with-lease"
 
@@ -782,7 +982,7 @@ PY
         run: |
           mkdir -p artifacts/logs/post
           (docker ps -a || true) > artifacts/logs/post/docker.ps.txt
-          for c in finops-db finops-adminer finops-minio prometheus grafana loki promtail cadvisor node-exporter finops-zk finops-kafka otel; do
+          for c in finops-db finops-adminer finops-minio prometheus grafana loki promtail cadvisor node-exporter finops-zk finops-kafka otel pgbouncer; do
             docker logs --tail=200 "$c" > "artifacts/logs/post/${c}.log" 2>&1 || true
           done
           (df -h || true) > artifacts/logs/post/df_h.txt
