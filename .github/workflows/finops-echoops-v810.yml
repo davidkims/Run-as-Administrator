@@ -52,17 +52,17 @@ jobs:
   finops:
     runs-on: ubuntu-latest
     timeout-minutes: 180
+    env:
+      # 원격 템플릿/스크립트 오버라이드 베이스 URL (미지정 시 로컬 heredoc 사용)
+      ECHO_FETCH_BASE: ""
+      ECHO_XTRACE: "true"
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Toolchain (Python 3.11)
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Bootstrap Echo Helpers
+      # 🔧 EchoOps: 전역 에코 & 헬퍼 자동 주입(BASH_ENV) + 원격 템플릿 오버라이드 헬퍼
+      - name: EchoOps – enable global echo & helpers
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -78,42 +78,62 @@ jobs:
                      if eval "$*"; then return 0; fi
                      warn "retry $i/$n: $*"; sleep "$s"
                    done; return 1; }
+          # fetch_or_fail <remote_rel_path> <dest_path>
+          fetch_or_fail(){
+            local rel="$1"; local dest="$2"
+            if [ -n "${ECHO_FETCH_BASE:-}" ]; then
+              local url="${ECHO_FETCH_BASE%/}/$rel"
+              echoe "fetch $url -> $dest"
+              curl -fsSL "$url" -o "$dest"
+            else
+              return 1
+            fi
+          }
           SH
           chmod +x /tmp/echo_helpers.sh
+          cat > /tmp/echo_env <<'ENV'
+          set -Eeuo pipefail
+          if [ "${ECHO_XTRACE:-true}" = "true" ]; then
+            export PS4='+ [$(date "+%Y-%m-%d %H:%M:%S%z")] [TRACE] '
+            set -x
+          fi
+          source /tmp/echo_helpers.sh
+          ENV
+          echo "BASH_ENV=/tmp/echo_env" >> "$GITHUB_ENV"
+
+      - name: Toolchain (Python 3.11)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
       - name: Echo + Massive Directories
         shell: bash
         run: |
-          set -Eeuo pipefail
-          source /tmp/echo_helpers.sh
-          echoe "대량 디렉토리 생성"
-          mkdir -p \
-            .github/echo/{logs,sql,bin,configs,imgs,reports,tmp,crypto,mass,monitoring} \
-            .github/echo_db/{ddl,dml,seed,views,backup} \
-            .github/echo_td/{sim,docs,logs} \
-            site/{reports,imgs,logs,sql,docs} \
-            artifacts/{imgs,reports,sql,logs,zip,db,sbom,scan}
-          for d in $(seq 1 20); do mkdir -p ".github/echo/mass/dir_$d/sub_$d"; done
+          run 'mkdir -p .github/echo/{logs,sql,bin,configs,imgs,reports,tmp,crypto,mass,monitoring}'
+          run 'mkdir -p .github/echo_db/{ddl,dml,seed,views,backup}'
+          run 'mkdir -p .github/echo_td/{sim,docs,logs}'
+          run 'mkdir -p site/{reports,imgs,logs,sql,docs}'
+          run 'mkdir -p artifacts/{imgs,reports,sql,logs,zip,db,sbom,scan}'
+          for d in $(seq 1 20); do run "mkdir -p .github/echo/mass/dir_$d/sub_$d"; done
+          echoe "write .github/echo/logs/run.meta"
           printf "%s\n" "started=$(date -u +%FT%TZ)" "actor=$GITHUB_ACTOR" "rows=${{ inputs.rows }}" > .github/echo/logs/run.meta
+
       - name: Install/Upgrade Docker (official repo)
         shell: bash
         run: |
-          set -Eeuo pipefail
-          source /tmp/echo_helpers.sh
           run 'docker --version || true'
           run 'sudo apt-get update -y'
           run 'sudo apt-get install -y apt-transport-https ca-certificates curl gnupg lsb-release jq unzip zip openssl'
           run 'curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --yes --dearmor -o /usr/share/keyrings/docker.gpg'
-          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo $VERSION_CODENAME) stable" \
-            | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+          run 'bash -lc "echo \"deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo $VERSION_CODENAME) stable\" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null"'
           run 'sudo apt-get update -y'
           run 'sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin'
           run 'docker --version'
           run 'docker compose version || true'
+
       - name: Start Core DB & Tools (Postgres + Adminer + MinIO)
         shell: bash
         run: |
-          set -Eeuo pipefail
-          source /tmp/echo_helpers.sh
           NET="finops_net"
           run "docker network inspect '$NET' >/dev/null 2>&1 || docker network create '$NET'"
           run "docker rm -f finops-db finops-adminer finops-minio >/dev/null 2>&1 || true"
@@ -121,14 +141,16 @@ jobs:
           run "docker run -d --name finops-adminer --network '$NET' -e ADMINER_DEFAULT_SERVER=finops-db -p 8080:8080 adminer:4"
           run "docker run -d --name finops-minio --network '$NET' -e MINIO_ROOT_USER=admin -e MINIO_ROOT_PASSWORD=admin12345 -p 9000:9000 -p 9001:9001 minio/minio server /data --console-address ':9001'"
           run "docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}'"
+
       - name: Observability Stack (Prometheus + Grafana + Loki + Promtail + cAdvisor + node-exporter)
         shell: bash
         run: |
-          set -Eeuo pipefail
-          source /tmp/echo_helpers.sh
           NET="finops_net"
-          mkdir -p .github/echo/monitoring
-          cat > .github/echo/monitoring/prometheus.yml <<'YML'
+          run 'mkdir -p .github/echo/monitoring'
+          # prometheus.yml
+          if ! fetch_or_fail ".github/echo/monitoring/prometheus.yml" ".github/echo/monitoring/prometheus.yml"; then
+            echoe "write .github/echo/monitoring/prometheus.yml"
+            cat > .github/echo/monitoring/prometheus.yml <<'YML'
           global:
             scrape_interval: 15s
           scrape_configs:
@@ -139,7 +161,11 @@ jobs:
             - job_name: 'cadvisor'
               static_configs: [{ targets: ['cadvisor:8080'] }]
           YML
-          cat > .github/echo/monitoring/promtail-config.yml <<'YML'
+          fi
+          # promtail-config.yml
+          if ! fetch_or_fail ".github/echo/monitoring/promtail-config.yml" ".github/echo/monitoring/promtail-config.yml"; then
+            echoe "write .github/echo/monitoring/promtail-config.yml"
+            cat > .github/echo/monitoring/promtail-config.yml <<'YML'
           server:
             http_listen_port: 9080
             grpc_listen_port: 0
@@ -155,6 +181,7 @@ jobs:
                     job: docker
                     __path__: /var/lib/docker/containers/*/*-json.log
           YML
+          fi
           run "docker rm -f prometheus grafana loki promtail cadvisor node-exporter >/dev/null 2>&1 || true"
           run "docker run -d --name prometheus --network '$NET' -p 9090:9090 -v '$PWD/.github/echo/monitoring/prometheus.yml':/etc/prometheus/prometheus.yml prom/prometheus"
           run "docker run -d --name grafana --network '$NET' -p 3000:3000 -e GF_SECURITY_ADMIN_PASSWORD=admin grafana/grafana"
@@ -162,56 +189,55 @@ jobs:
           run "docker run -d --name promtail --network '$NET' -v /var/lib/docker/containers:/var/lib/docker/containers:ro -v '$PWD/.github/echo/monitoring/promtail-config.yml':/etc/promtail/config.yml -p 9080:9080 grafana/promtail:2.9.4 -config.file=/etc/promtail/config.yml"
           run "docker run -d --name cadvisor --network '$NET' -p 8081:8080 --privileged -v /:/rootfs:ro -v /var/run:/var/run:ro -v /sys:/sys:ro -v /var/lib/docker/:/var/lib/docker:ro gcr.io/cadvisor/cadvisor:v0.47.2"
           run "docker run -d --name node-exporter --network '$NET' -p 9100:9100 quay.io/prometheus/node-exporter"
+
       - name: (Optional) Pre-write enc_pass from input
         shell: bash
         run: |
-          set -Eeuo pipefail
-          source /tmp/echo_helpers.sh
           if [ -n "${{ inputs.enc_pass }}" ]; then
-            echoe "enc_pass 프리시드"
+            echoe "write .github/echo/crypto/enc.pass"
             printf "enc_pass=%s\n" "${{ inputs.enc_pass }}" > .github/echo/crypto/enc.pass
+          else
+            warn "enc_pass not provided; will generate later if needed"
           fi
+
       - name: Vault (dev) – robust pull + fallback + store enc_pass
         shell: bash
         run: |
-          set -Eeuo pipefail
-          source /tmp/echo_helpers.sh
           NET="finops_net"
           IMG_PRIMARY="hashicorp/vault:1.17"
           IMG_FALLBACK_1="hashicorp/vault:1.16"
           IMG_FALLBACK_2="hashicorp/vault:latest"
           CNTR="finops-vault"
-          docker rm -f "$CNTR" >/dev/null 2>&1 || true
+          run "docker rm -f '$CNTR' >/dev/null 2>&1 || true"
           run "docker network inspect '$NET' >/dev/null 2>&1 || docker network create '$NET'"
           pull_try(){ retry 4 4 "docker pull $1"; }
           if ! pull_try "$IMG_PRIMARY"; then
             warn "fallback to $IMG_FALLBACK_1"
             if ! pull_try "$IMG_FALLBACK_1"; then
-              warn "fallback to $IMG_FALLBACK_2"
-              pull_try "$IMG_FALLBACK_2"
+              warn "fallback to $IMG_FALLBACK_2"; pull_try "$IMG_FALLBACK_2"
             fi
           fi
           if docker image inspect "$IMG_PRIMARY" >/dev/null 2>&1; then USE_IMG="$IMG_PRIMARY";
-          elif docker image inspect "$IMG_FALLBACK_1" >/dev/null 2>&1; then USE_IMG="$IMG_FALLBACK_1";
-          else USE_IMG="$IMG_FALLBACK_2"; fi
+          elif docker image inspect "$IMG_FALLBACK_1" >/dev/null 2>&1; then USE_IMG="$IMG_FALLBACK_1"; else USE_IMG="$IMG_FALLBACK_2"; fi
           echoe "using image: $USE_IMG"
           run "docker run -d --name '$CNTR' --network '$NET' -p 8200:8200 -e VAULT_DEV_ROOT_TOKEN_ID=root -e VAULT_ADDR=http://0.0.0.0:8200 '$USE_IMG'"
           for i in $(seq 1 20); do
-            if docker exec "$CNTR" sh -lc "apk add --no-cache curl >/dev/null 2>&1 || (apt-get update -y >/dev/null 2>&1 && apt-get install -y curl >/dev/null 2>&1 || true); curl -s http://127.0.0.1:8200/v1/sys/health >/dev/null 2>&1"; then
-              echoe "Vault ready"; break; fi
+            if docker exec "$CNTR" sh -lc "apk add --no-cache curl >/dev/null 2>&1 || (apt-get update -y >/dev/null 2>&1 && apt-get install -y curl >/dev/null 2>&1 || true); curl -s http://127.0.0.1:8200/v1/sys/health >/dev/null 2>&1"; then echoe "Vault ready"; break; fi
             echoe "waiting vault...($i)"; sleep 2
           done
           PASS_FILE=".github/echo/crypto/enc.pass"
           if [ -f "$PASS_FILE" ]; then
             ENC="$(sed -n 's/^enc_pass=//p' "$PASS_FILE" | head -n1)"
-            docker exec "$CNTR" sh -lc "curl -s --header 'X-Vault-Token: root' --request POST --data '{\"data\":{\"enc_pass\":\"${ENC}\"}}' http://127.0.0.1:8200/v1/secret/data/finops_enc >/dev/null 2>&1 && echo '[ECHO] enc_pass stored in dev Vault'"
+            run "docker exec '$CNTR' sh -lc \"curl -s --header 'X-Vault-Token: root' --request POST --data '{\\\"data\\\":{\\\"enc_pass\\\":\\\"${ENC}\\\"}}' http://127.0.0.1:8200/v1/secret/data/finops_enc >/dev/null 2>&1\""
+            echoe "enc_pass stored in dev Vault"
+          else
+            warn "no PASS_FILE to store"
           fi
+
       - name: (Optional) Kafka + ZooKeeper + Topics
         if: ${{ inputs.run_kafka == 'true' }}
         shell: bash
         run: |
-          set -Eeuo pipefail
-          source /tmp/echo_helpers.sh
           NET="finops_net"
           run "docker rm -f finops-zk finops-kafka >/dev/null 2>&1 || true"
           run "docker run -d --name finops-zk --network '$NET' -p 2181:2181 -e ALLOW_ANONYMOUS_LOGIN=yes bitnami/zookeeper:3.9"
@@ -224,41 +250,25 @@ jobs:
                bitnami/kafka:3.7"
           retry 20 3 "docker exec finops-kafka /opt/bitnami/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null 2>&1"
           run "docker exec finops-kafka /opt/bitnami/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --create --if-not-exists --topic transactions --replication-factor 1 --partitions 3"
+
       - name: Wait for Postgres & Install DB clients
         shell: bash
         run: |
-          set -Eeuo pipefail
-          source /tmp/echo_helpers.sh
           for i in $(seq 1 40); do
             if docker exec finops-db pg_isready -U finops -d finops >/dev/null 2>&1; then echoe "Postgres ready"; break; fi
             echoe "waiting postgres...($i)"; sleep 3
           done
           run "sudo apt-get update -y"
           run "sudo apt-get install -y postgresql-client"
-      - name: (Optional) Teradata Attempt (logs only if no token)
-        if: ${{ inputs.enable_teradata == 'true' }}
-        shell: bash
-        env:
-          TD_TOKEN: ${{ inputs.teradata_token }}
-        run: |
-          set -Eeuo pipefail
-          source /tmp/echo_helpers.sh
-          echoe "Teradata 컨테이너는 라이선스/토큰/동의가 필요합니다."
-          if [ -z "${TD_TOKEN:-}" ]; then
-            warn "teradata_token 미제공: 공식 이미지 풀/실행 건너뜀 → TD-Sim(PostgreSQL)로 진행."
-            exit 0
-          fi
-          {
-            echo "docker login <teradata-registry> -u token -p ${TD_TOKEN}"
-            echo "docker pull <teradata-registry>/teradata:latest"
-            echo "docker run -d --name teradata --network finops_net <teradata-registry>/teradata:latest"
-          } | tee .github/echo/logs/teradata.login.txt
-      - name: Generate DDL/Views
+
+      - name: Generate DDL/Views (remote override supported)
         shell: bash
         run: |
-          set -Eeuo pipefail
-          source /tmp/echo_helpers.sh
-          cat > .github/echo_db/ddl/001_core.sql <<'SQL'
+          run 'mkdir -p .github/echo_db/{ddl,views}'
+          # 001_core.sql
+          if ! fetch_or_fail ".github/echo_db/ddl/001_core.sql" ".github/echo_db/ddl/001_core.sql"; then
+            echoe "write .github/echo_db/ddl/001_core.sql"
+            cat > .github/echo_db/ddl/001_core.sql <<'SQL'
           create table if not exists accounts (
             account_id bigserial primary key,
             account_no varchar(32) unique not null,
@@ -292,7 +302,11 @@ jobs:
             balance numeric(18,2) not null default 0
           );
           SQL
-          cat > .github/echo_db/views/100_views.sql <<'SQL'
+          fi
+          # 100_views.sql
+          if ! fetch_or_fail ".github/echo_db/views/100_views.sql" ".github/echo_db/views/100_views.sql"; then
+            echoe "write .github/echo_db/views/100_views.sql"
+            cat > .github/echo_db/views/100_views.sql <<'SQL'
           create or replace view v_income_statement as
           select date_trunc('day', ts) as d,
                  sum(case when direction='IN'  then amount else 0 end) as revenue,
@@ -313,20 +327,21 @@ jobs:
           group by 1
           order by 1;
           SQL
+          fi
+
       - name: Apply Schema (PostgreSQL)
         shell: bash
         run: |
-          set -Eeuo pipefail
-          source /tmp/echo_helpers.sh
           run "PGPASSWORD=finops psql -h 127.0.0.1 -U finops -d finops -f .github/echo_db/ddl/001_core.sql"
           run "PGPASSWORD=finops psql -h 127.0.0.1 -U finops -d finops -f .github/echo_db/views/100_views.sql"
+
       - name: Seed Accounts (50 + extra) via generate_series
         shell: bash
         run: |
-          set -Eeuo pipefail
-          source /tmp/echo_helpers.sh
-          ACC=$((50 + ${{ inputs.extra_accounts }}))
-          cat > .github/echo_db/seed/accounts.sql <<'SQL'
+          run 'mkdir -p .github/echo_db/seed'
+          if ! fetch_or_fail ".github/echo_db/seed/accounts.sql" ".github/echo_db/seed/accounts.sql"; then
+            echoe "write .github/echo_db/seed/accounts.sql"
+            cat > .github/echo_db/seed/accounts.sql <<'SQL'
           \set ACC :ACC
           with s as (select generate_series(1, :ACC) as i)
           insert into accounts(account_no, holder_name)
@@ -337,15 +352,22 @@ jobs:
           select 'V' || to_char(i,'FM000000'), 0 from s
           on conflict (account_no) do nothing;
           SQL
+          fi
+          ACC=$((50 + ${{ inputs.extra_accounts }}))
           run "PGPASSWORD=finops psql -h 127.0.0.1 -U finops -d finops -v ACC=\"$ACC\" -f .github/echo_db/seed/accounts.sql"
+
       - name: Write Simulators (Kafka mode)
         if: ${{ inputs.run_kafka == 'true' }}
         shell: bash
         run: |
-          set -Eeuo pipefail
-          source /tmp/echo_helpers.sh
-          echo "kafka-python" > .github/echo/requirements-extra.txt
-          cat > .github/echo/bin/kafka_producer.py <<'PY'
+          echoe "write .github/echo/requirements-extra.txt"
+          cat > .github/echo/requirements-extra.txt <<'PIP'
+          kafka-python
+          psycopg2-binary
+          PIP
+          if ! fetch_or_fail ".github/echo/bin/kafka_producer.py" ".github/echo/bin/kafka_producer.py"; then
+            echoe "write .github/echo/bin/kafka_producer.py"
+            cat > .github/echo/bin/kafka_producer.py <<'PY'
           import os, json, random
           from datetime import datetime, timedelta
           from kafka import KafkaProducer
@@ -354,18 +376,19 @@ jobs:
           accts=[f"V{str(i).zfill(6)}" for i in range(1, 50+int(os.getenv("EXTRA","150"))+1)]
           base=datetime.utcnow()-timedelta(days=3)
           for i in range(ROWS):
-            msg={
-              "ts": (base+timedelta(seconds=i*(3*24*3600/ROWS))).isoformat(),
-              "account_no": random.choice(accts),
-              "direction": random.choice(["IN","OUT"]),
-              "amount": round(random.uniform(10, 500000),2),
-              "ref": f"KAFKA{i}"
-            }
+            msg={"ts": (base+timedelta(seconds=i*(3*24*3600/ROWS))).isoformat(),
+                 "account_no": random.choice(accts),
+                 "direction": random.choice(["IN","OUT"]),
+                 "amount": round(random.uniform(10, 500000),2),
+                 "ref": f"KAFKA{i}"}
             producer.send("transactions", msg)
             if i%500==0: producer.flush()
           producer.flush()
           PY
-          cat > .github/echo/bin/kafka_consumer.py <<'PY'
+          fi
+          if ! fetch_or_fail ".github/echo/bin/kafka_consumer.py" ".github/echo/bin/kafka_consumer.py"; then
+            echoe "write .github/echo/bin/kafka_consumer.py"
+            cat > .github/echo/bin/kafka_consumer.py <<'PY'
           import json, psycopg2
           from kafka import KafkaConsumer
           consumer=KafkaConsumer("transactions", bootstrap_servers="localhost:9092", value_deserializer=lambda m: json.loads(m.decode()))
@@ -387,17 +410,25 @@ jobs:
                            on conflict (account_no) do update set balance=excluded.balance""",(acc,new_bal))
             conn.commit()
           PY
+          fi
+          run "python -m pip install --upgrade pip"
+          run "pip install -r .github/echo/requirements-extra.txt"
+          run "python .github/echo/bin/kafka_consumer.py >/tmp/kafka_consumer.log 2>&1 &"
+          run "EXTRA='${{ inputs.extra_accounts }}' ROWS='${{ inputs.rows }}' python .github/echo/bin/kafka_producer.py"
+          sleep 5; run "cp /tmp/kafka_consumer.log .github/echo/logs/kafka_consumer.log || true"
+
       - name: Write Simulator (direct DB fallback)
         if: ${{ inputs.run_kafka != 'true' }}
         shell: bash
         run: |
-          set -Eeuo pipefail
-          source /tmp/echo_helpers.sh
+          echoe "write .github/echo/requirements.txt"
           cat > .github/echo/requirements.txt <<'PIP'
           psycopg2-binary
           matplotlib
           PIP
-          cat > .github/echo/bin/simulate.py <<'PY'
+          if ! fetch_or_fail ".github/echo/bin/simulate.py" ".github/echo/bin/simulate.py"; then
+            echoe "write .github/echo/bin/simulate.py"
+            cat > .github/echo/bin/simulate.py <<'PY'
           import os, random, csv
           from datetime import datetime, timedelta
           import psycopg2, matplotlib.pyplot as plt
@@ -413,8 +444,8 @@ jobs:
             ts=base+timedelta(seconds=i*(10*24*3600/ROWS))
             direction=random.choice(["IN","OUT"])
             amount=round(random.uniform(10, 800000),2)
-            cur.execute("select balance from balances where account_no=%s",(acc,))
-            row=cur.fetchone(); bal=float(row[0]) if row else 0.0
+            cur.execute("select balance from balances where account_no=%s",(acc,)); row=cur.fetchone()
+            bal=float(row[0]) if row else 0.0
             new_bal=bal+amount if direction=="IN" else max(0.0, bal-amount)
             cur.execute("""insert into transactions(account_no,direction,amount,balance_after,ref,note,ts)
                            values(%s,%s,%s,%s,%s,%s,%s)""",(acc,direction,amount,new_bal,f"REF{i}","sim",ts))
@@ -427,63 +458,52 @@ jobs:
             rows.append((ts,acc,direction,amount,new_bal))
             if i%500==0: conn.commit()
           conn.commit()
-          cur.execute("select d,revenue,expense,profit from v_income_statement order by d;")
+          cur.execute("select date_trunc('day', ts) as d, \
+                              sum(case when direction='IN' then amount else 0 end) as revenue, \
+                              sum(case when direction='OUT' then amount else 0 end) as expense, \
+                              sum(case when direction='IN' then amount else -amount end) as profit \
+                       from transactions group by 1 order by 1;")
           D=[(r[0],float(r[1]),float(r[2]),float(r[3])) for r in cur.fetchall()]
           dates=[r[0] for r in D]; rev=[r[1] for r in D]; exp=[r[2] for r in D]; prof=[r[3] for r in D]
-          import matplotlib.pyplot as plt, os
+          import os
           os.makedirs("site/imgs",exist_ok=True)
           plt.figure(); plt.plot(dates,rev,label="Revenue"); plt.plot(dates,exp,label="Expense"); plt.plot(dates,prof,label="Profit"); plt.legend(); plt.tight_layout()
           plt.savefig("site/imgs/income_statement.png")
-          cur.execute("select total_assets from v_balance_sheet;"); assets=float(cur.fetchone()[0] or 0)
+          cur.execute("select sum(balance) from balances;"); assets=float(cur.fetchone()[0] or 0)
           plt.figure(); plt.bar(["Assets"],[assets]); plt.tight_layout(); plt.savefig("site/imgs/balance_sheet.png")
           cur.close(); conn.close()
           os.makedirs("site/reports",exist_ok=True)
           with open("site/reports/transactions.csv","w",newline="",encoding="utf-8") as f:
             w=csv.writer(f); w.writerow(["ts","account_no","direction","amount","balance_after"]); w.writerows(rows)
           PY
-      - name: Install Python deps & Run
-        shell: bash
-        env:
-          ROWS: ${{ inputs.rows }}
-        run: |
-          set -Eeuo pipefail
-          source /tmp/echo_helpers.sh
-          run "python -m pip install --upgrade pip"
-          echo "psycopg2-binary" > .github/echo/requirements-common.txt
-          echo "matplotlib" >> .github/echo/requirements-common.txt
-          run "pip install -r .github/echo/requirements-common.txt || true"
-          if [ "${{ inputs.run_kafka }}" = "true" ]; then
-            run "pip install -r .github/echo/requirements-extra.txt"
-            run "python .github/echo/bin/kafka_consumer.py >/tmp/kafka_consumer.log 2>&1 &"
-            run "EXTRA='${{ inputs.extra_accounts }}' ROWS='${{ inputs.rows }}' python .github/echo/bin/kafka_producer.py"
-            sleep 5; cp /tmp/kafka_consumer.log .github/echo/logs/kafka_consumer.log || true
-          else
-            run "pip install -r .github/echo/requirements.txt"
-            run "python .github/echo/bin/simulate.py"
           fi
+          run "python -m pip install --upgrade pip"
+          echoe "install common deps"
+          run "bash -lc 'echo -e \"psycopg2-binary\nmatplotlib\" > .github/echo/requirements-common.txt'"
+          run "pip install -r .github/echo/requirements-common.txt || true"
+          run "pip install -r .github/echo/requirements.txt"
+          run "ROWS='${{ inputs.rows }}' python .github/echo/bin/simulate.py"
+
       - name: MinIO Client (mc) & Upload results to bucket
         shell: bash
         run: |
-          set -Eeuo pipefail
-          source /tmp/echo_helpers.sh
-          run "curl -fsSL https://dl.min.io/client/mc/release/linux-amd64/mc -o mc && chmod +x mc"
+          retry 5 3 "curl -fsSL https://dl.min.io/client/mc/release/linux-amd64/mc -o mc"
+          run "chmod +x mc"
           retry 20 2 "./mc alias set local http://127.0.0.1:9000 admin admin12345"
           run "./mc mb --ignore-existing local/finops"
           run "./mc mirror --overwrite site local/finops/site"
           run "./mc mirror --overwrite .github/echo local/finops/echo"
           run "./mc ls -r local/finops | tee .github/echo/logs/minio.tree"
+
       - name: DB Backup (pg_dumpall)
         shell: bash
         run: |
-          set -Eeuo pipefail
-          source /tmp/echo_helpers.sh
           run "PGPASSWORD=finops pg_dumpall -h 127.0.0.1 -U finops > .github/echo_db/backup/pg_dumpall.sql"
           run "gzip -c .github/echo_db/backup/pg_dumpall.sql > artifacts/db/pg_dumpall.sql.gz"
+
       - name: Package outputs
         shell: bash
         run: |
-          set -Eeuo pipefail
-          source /tmp/echo_helpers.sh
           run "mkdir -p artifacts/zip"
           run "cp -a .github/echo_db/ddl site/sql/"
           run "cp -a .github/echo_db/seed site/sql/ || true"
@@ -493,64 +513,76 @@ jobs:
           run "cp -a site/sql artifacts/sql/"
           run "cp -a .github/echo/logs artifacts/logs/"
           run "cp -a .github/echo_db/backup artifacts/db/"
-          (cd artifacts && zip -r zip/finops_outputs.zip imgs reports sql logs db >/dev/null)
+          run "(cd artifacts && zip -r zip/finops_outputs.zip imgs reports sql logs db >/dev/null)"
+
       - name: SBOM (syft)
         shell: bash
         run: |
-          set -Eeuo pipefail
-          source /tmp/echo_helpers.sh
           SYFT_VER="v1.31.0"
           URL_PRIMARY="https://raw.githubusercontent.com/anchore/syft/main/install.sh"
           URL_FALLBACK="https://raw.githubusercontent.com/anchore/syft/${SYFT_VER}/install.sh"
           if ! curl -fsSL "$URL_PRIMARY" | bash -s -- -b /usr/local/bin "$SYFT_VER"; then
             warn "primary install script failed → try tag-specific"
-            curl -fsSL "$URL_FALLBACK" | bash -s -- -b /usr/local/bin "$SYFT_VER"
+            run "curl -fsSL \"$URL_FALLBACK\" | bash -s -- -b /usr/local/bin \"$SYFT_VER\""
           fi
           run "syft version"
           run "syft dir:. -o spdx-json > artifacts/sbom/repo.spdx.json"
-      - name: Security Scan (Trivy + Gitleaks)
+
+      - name: Security Scan (Trivy + Gitleaks)  # ← v8 호환 플래그 자동 선택 반영
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          set -Eeuo pipefail
-          source /tmp/echo_helpers.sh
-          # Trivy (deprecated 옵션 교체: config -> misconfig)
+          run "mkdir -p artifacts/scan"
+          # Trivy
           run "curl -fsSL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin"
           run "trivy fs --scanners vuln,misconfig,secret --format json --output artifacts/scan/trivy.json ."
-          # ✅ Gitleaks: 최신 릴리스 자산을 API로 찾아서 설치 (404 방지)
+          # Gitleaks 최신 설치 (API 실패시 안전 폴백)
           API="https://api.github.com/repos/gitleaks/gitleaks/releases/latest"
           ASSET_URL="$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" "$API" \
             | jq -r '.assets[] | select(.name | test("linux_x64.*\\.tar\\.gz$")) | .browser_download_url' | head -n1)"
           if [ -z "$ASSET_URL" ] || [ "$ASSET_URL" = "null" ]; then
-            warn "latest asset not found via API, fallback to v8.18.4"
-            ASSET_URL="https://github.com/gitleaks/gitleaks/releases/download/v8.18.4/gitleaks_8.18.4_linux_x64.tar.gz"
+            warn "latest asset not found via API, fallback to v8.28.0"
+            ASSET_URL="https://github.com/gitleaks/gitleaks/releases/download/v8.28.0/gitleaks_8.28.0_linux_x64.tar.gz"
           fi
           echoe "Gitleaks asset: $ASSET_URL"
-          curl -fsSL "$ASSET_URL" -o /tmp/gitleaks.tgz
-          tar -xzf /tmp/gitleaks.tgz -C /usr/local/bin gitleaks || \
-            (tar -xzf /tmp/gitleaks.tgz -C /tmp && mv /tmp/gitleaks*/gitleaks /usr/local/bin/)
-          chmod +x /usr/local/bin/gitleaks
+          run "curl -fsSL \"$ASSET_URL\" -o /tmp/gitleaks.tgz"
+          if ! tar -xzf /tmp/gitleaks.tgz -C /usr/local/bin gitleaks; then
+            run "tar -xzf /tmp/gitleaks.tgz -C /tmp && mv /tmp/gitleaks*/gitleaks /usr/local/bin/"
+          fi
+          run "chmod +x /usr/local/bin/gitleaks"
           run "gitleaks version || true"
-          # SARIF 출력 (실패 무시)
-          run "gitleaks detect --redact -v --no-git -o artifacts/scan/gitleaks.sarif --report-format sarif || true"
+          # 플래그 자동 선택 (신형: --report-path / 구형: -o)
+          if gitleaks detect --help 2>/dev/null | grep -q -- '--report-path'; then
+            echoe "gitleaks: using --report-path/--report-format"
+            run "gitleaks detect --redact --no-git -v \
+                 --report-format sarif \
+                 --report-path artifacts/scan/gitleaks.sarif \
+                 || true"
+          else
+            echoe "gitleaks: using legacy -o/--report-format"
+            run "gitleaks detect --redact --no-git -v \
+                 --report-format sarif \
+                 -o artifacts/scan/gitleaks.sarif \
+                 || true"
+          fi
+
       - name: Encrypt outputs (optional AES-256)
         if: ${{ inputs.encrypt_outputs == 'true' }}
         shell: bash
         run: |
-          set -Eeuo pipefail
-          source /tmp/echo_helpers.sh
           PASS="${{ inputs.enc_pass }}"
           if [ -z "$PASS" ]; then PASS="$(openssl rand -hex 16)"; fi
+          echoe "write .github/echo/crypto/enc.pass"
           printf "%s\n" "enc_pass=$PASS" > .github/echo/crypto/enc.pass
           run "openssl enc -aes-256-cbc -md sha256 -salt -pbkdf2 -in artifacts/zip/finops_outputs.zip -out artifacts/zip/finops_outputs.zip.enc -k '$PASS'"
-          echoe "암호화 완료 → artifacts/zip/finops_outputs.zip.enc (비번: .github/echo/crypto/enc.pass)"
+          echoe "암호화 완료 → artifacts/zip/finops_outputs.zip.enc"
+
       - name: Strip secrets before upload/commit
         shell: bash
         run: |
-          set -Eeuo pipefail
-          source /tmp/echo_helpers.sh
           run "rm -f .github/echo/crypto/enc.pass || true"
+
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
@@ -571,8 +603,6 @@ jobs:
           GIT_COMMITTER_NAME: "github-actions[bot]"
           GIT_COMMITTER_EMAIL: "41898282+github-actions[bot]@users.noreply.github.com"
         run: |
-          set -Eeuo pipefail
-          source /tmp/echo_helpers.sh
           BRANCH="${GITHUB_REF_NAME:-main}"
           run "git config user.name  \"$GIT_AUTHOR_NAME\""
           run "git config user.email \"$GIT_AUTHOR_EMAIL\""
@@ -581,6 +611,7 @@ jobs:
           run "git commit -m \"[ECHO] v8.1.0 outputs (imgs,csv,sql,minio,backup,obs,kafka=${{ inputs.run_kafka }},encrypt=${{ inputs.encrypt_outputs }},rows=${{ inputs.rows }})\""
           run "git fetch --tags --force origin"
           run "git push origin \"refs/heads/${BRANCH}:refs/heads/${BRANCH}\" --force-with-lease"
+
       - name: Create Release (optional)
         if: ${{ inputs.create_release == 'true' }}
         uses: softprops/action-gh-release@v2
@@ -592,8 +623,3 @@ jobs:
           files: |
             artifacts/zip/finops_outputs.zip
             artifacts/zip/finops_outputs.zip.enc
-      # - name: (Optional) Free disk space
-      #   shell: bash
-      #   run: |
-      #     set -Eeuo pipefail
-      #     docker system prune -af || true
