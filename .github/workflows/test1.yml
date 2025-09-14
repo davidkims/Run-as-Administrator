@@ -1,4 +1,4 @@
-name: Test-Server + Spring Boot + Docker (Ultra Integrated - Hardened)
+name: Test-Server + Spring Boot + Docker (Ultra Integrated - Hardened v2)
 
 on:
   schedule:
@@ -98,7 +98,7 @@ jobs:
           du -h .github/workflows/.reserve_space || true
           df -h || true
 
-      - name: 🛠️ numfmt shim (-4 옵션 무시, bash 호환)
+      - name: 🛠️ numfmt shim (-4 무시)
         run: |
           set -Eeuo pipefail
           sudo apt-get update -y || true
@@ -144,88 +144,83 @@ jobs:
           sudo find /var/log -type f -name "*.1" -delete || true
           df -h || true
 
-      - name: 🧩 Install Extras by JSON toggles (hardened)
+      - name: 🧩 Install Extras by JSON toggles (API/fallback 강화)
         env:
           EXTRAS_JSON: ${{ inputs.extras_json }}
         run: |
           set -Eeuo pipefail
-
-          # ---------- Common base tools ----------
           sudo apt-get update -y || true
           sudo apt-get install -y jq unzip tar zstd pigz aria2 p7zip-full git-lfs gh curl ca-certificates gnupg || true
           git lfs install --system || true
 
-          # ---------- Helpers ----------
+          # ------------ helpers ------------
           validate_json () { echo "${1:-}" | jq -e . >/dev/null 2>&1; }
           if ! validate_json "${EXTRAS_JSON}"; then
-            echo "::warning::extras_json is invalid JSON. All extras disabled for safety."
+            echo "::warning::extras_json invalid. disabling extras."
             EXTRAS_JSON="{}"
           fi
           get_flag(){ printf '%s' "${EXTRAS_JSON}" | jq -r ".\"$1\" // false" 2>/dev/null || echo false; }
-
-          dl() { # url out [retries]
-            url="$1"; out="$2"; retries="${3:-3}"
-            for i in $(seq 1 "$retries"); do
-              if curl -fL --retry 3 --retry-connrefused --retry-delay 2 -o "$out" "$url"; then
-                return 0
-              fi
-              echo "::warning::download failed ($i/$retries): $url"
-              sleep 2
-            done
-            return 1
-          }
-          continue_or_warn(){ cmd="$1"; msg="$2"; bash -c "$cmd" || echo "::warning::$msg (ignored)"; }
           gh_api(){ curl -fsSL "https://api.github.com/$1"; }
+          dl() { url="$1"; out="$2"; retries="${3:-3}"; for i in $(seq 1 "$retries"); do curl -fL --retry 3 --retry-connrefused --retry-delay 2 -o "$out" "$url" && exit 0 || echo "::warning::download failed ($i/$retries): $url"; sleep 2; done; return 1; }
+          continue_or_warn(){ bash -c "$1" || echo "::warning::$2"; }
+
+          # 파일명/자산 자동탐색 다운로드
+          gh_dl_asset() { # owner repo filter_substr out
+            owner="$1"; repo="$2"; filt="$3"; out="$4"
+            rel="$(gh_api repos/${owner}/${repo}/releases/latest | jq -r '.tag_name, (.assets // [])[]?.browser_download_url' 2>/dev/null || true)"
+            url="$(echo "$rel" | awk '/^https?:/ {print}' | grep -i "$filt" | head -n1 || true)"
+            [ -z "$url" ] && return 1
+            dl "$url" "$out"
+          }
+
+          # 컨테이너 바이너리 래퍼 생성
+          make_wrapper() { # name image args...
+            name="$1"; shift; image="$1"; shift
+            sudo tee "/usr/local/bin/${name}" >/dev/null <<SH
+            #!/usr/bin/env bash
+            exec docker run --rm -i --net=host -v "\$PWD:/work" -w /work ${image} ${name} "\$@"
+            SH
+            sudo chmod +x "/usr/local/bin/${name}"
+          }
 
           # ============ 1) Container Toolchain ============
           if [ "$(get_flag container_toolchain)" = "true" ]; then
             echo "[extras] Container toolchain"
             sudo apt-get install -y skopeo || true
-
-            # syft
             continue_or_warn "curl -fsSL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sudo bash -s -- -b /usr/local/bin" "syft install failed"
-
-            # grype
             continue_or_warn "curl -fsSL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sudo bash -s -- -b /usr/local/bin" "grype install failed"
+            continue_or_warn "curl -fsSL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin" "trivy install failed"
 
-            # trivy
-            continue_or_warn "curl -fsSL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin" 'trivy install failed'
-
-            # dive (script + fallback)
+            # dive
             if ! curl -fsSL https://raw.githubusercontent.com/wagoodman/dive/master/install.sh | sudo sh -s -- -b /usr/local/bin; then
-              DVER="$(gh_api repos/wagoodman/dive/releases/latest | jq -r .tag_name)"
-              ASSET="dive_${DVER#v}_linux_amd64.tar.gz"
-              if dl "https://github.com/wagoodman/dive/releases/download/${DVER}/${ASSET}" /tmp/dive.tgz; then
-                sudo tar -xzf /tmp/dive.tgz -C /usr/local/bin dive || echo "::warning::dive tar extract failed"
+              if gh_dl_asset wagoodman dive "linux_amd64.*\.tar\.gz" /tmp/dive.tgz; then
+                sudo tar -xzf /tmp/dive.tgz -C /usr/local/bin dive || echo "::warning::dive extract failed"
               else
-                echo "::warning::dive install failed (all methods)."
+                echo "::warning::dive install failed"
               fi
             fi
 
-            # cosign (asset name variants)
-            COSVER="$(gh_api repos/sigstore/cosign/releases/latest | jq -r .tag_name)"
-            if dl "https://github.com/sigstore/cosign/releases/download/${COSVER}/cosign-linux-amd64" /tmp/cosign; then
-              sudo install -m 0755 /tmp/cosign /usr/local/bin/cosign
-            elif dl "https://github.com/sigstore/cosign/releases/download/${COSVER}/cosign_${COSVER#v}_linux_amd64.tar.gz" /tmp/cosign.tgz; then
-              sudo tar -xzf /tmp/cosign.tgz -C /usr/local/bin cosign || echo "::warning::cosign extract failed"
+            # cosign (두 가지 패턴 모두 시도)
+            if ! dl "https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-amd64" /tmp/cosign; then
+              gh_dl_asset sigstore cosign "linux_amd64.*\.tar\.gz" /tmp/cosign.tgz && sudo tar -xzf /tmp/cosign.tgz -C /usr/local/bin cosign || echo "::warning::cosign extract failed"
             else
-              echo "::warning::cosign install failed (404 on assets)."
+              sudo install -m 0755 /tmp/cosign /usr/local/bin/cosign || true
             fi
 
-            # crane
-            CRVER="$(gh_api repos/google/go-containerregistry/releases/latest | jq -r .tag_name)"
-            if dl "https://github.com/google/go-containerregistry/releases/download/${CRVER}/crane_linux_amd64" /tmp/crane; then
-              sudo install -m 0755 /tmp/crane /usr/local/bin/crane
+            # crane (자산 API → 실패 시 컨테이너 래퍼)
+            if ! gh_dl_asset google go-containerregistry "crane_linux_amd64$" /tmp/crane; then
+              echo "::warning::crane binary fetch failed; falling back to container wrapper"
+              docker pull gcr.io/go-containerregistry/crane:debug || true
+              make_wrapper crane gcr.io/go-containerregistry/crane:debug
             else
-              echo "::warning::crane install failed."
+              sudo install -m 0755 /tmp/crane /usr/local/bin/crane || echo "::warning::crane install failed"
             fi
 
             # oras
-            ORVER="$(gh_api repos/oras-project/oras/releases/latest | jq -r .tag_name)"
-            if dl "https://github.com/oras-project/oras/releases/download/${ORVER}/oras_${ORVER#v}_linux_amd64.tar.gz" /tmp/oras.tgz; then
-              sudo tar -xzf /tmp/oras.tgz -C /usr/local/bin oras && sudo chmod +x /usr/local/bin/oras || echo "::warning::oras extract failed"
+            if ! gh_dl_asset oras-project oras "linux_amd64.*\.tar\.gz" /tmp/oras.tgz; then
+              echo "::warning::oras download failed"
             else
-              echo "::warning::oras install failed."
+              sudo tar -xzf /tmp/oras.tgz -C /usr/local/bin oras && sudo chmod +x /usr/local/bin/oras || echo "::warning::oras extract failed"
             fi
           fi
 
@@ -233,33 +228,18 @@ jobs:
           if [ "$(get_flag k8s_toolchain)" = "true" ]; then
             echo "[extras] Cloud & K8s CLI"
             sudo apt-get install -y curl gnupg || true
-            # awscli v2
-            if dl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" awscliv2.zip; then unzip -q awscliv2.zip && sudo ./aws/install || true; else echo "::warning::awscli download failed"; fi
-            # gcloud
-            echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] http://packages.cloud.google.com/apt cloud-sdk main" | \
-              sudo tee /etc/apt/sources.list.d/google-cloud-sdk.list
+            dl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" awscliv2.zip && unzip -q awscliv2.zip && sudo ./aws/install || echo "::warning::awscli install failed"
+            echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] http://packages.cloud.google.com/apt cloud-sdk main" | sudo tee /etc/apt/sources.list.d/google-cloud-sdk.list
             curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | sudo gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg
             sudo apt-get update -y && sudo apt-get install -y google-cloud-sdk || echo "::warning::gcloud install failed"
-            # azure
             curl -fsSL https://aka.ms/InstallAzureCLIDeb | sudo bash || echo "::warning::azure cli install failed"
-            # kubectl
-            if dl https://storage.googleapis.com/kubernetes-release/release/stable.txt /tmp/kver; then
-              dl "https://storage.googleapis.com/kubernetes-release/release/$(cat /tmp/kver)/bin/linux/amd64/kubectl" /tmp/kubectl && sudo install -m 0755 /tmp/kubectl /usr/local/bin/kubectl || echo "::warning::kubectl install failed"
-            fi
-            # helm
+            dl https://storage.googleapis.com/kubernetes-release/release/stable.txt /tmp/kver && dl "https://storage.googleapis.com/kubernetes-release/release/$(cat /tmp/kver)/bin/linux/amd64/kubectl" /tmp/kubectl && sudo install -m 0755 /tmp/kubectl /usr/local/bin/kubectl || echo "::warning::kubectl install failed"
             continue_or_warn "curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash" "helm install failed"
-            # kustomize
             KUSVER="$(gh_api repos/kubernetes-sigs/kustomize/releases/latest | jq -r .tag_name)"
-            if dl "https://github.com/kubernetes-sigs/kustomize/releases/download/${KUSVER}/kustomize_${KUSVER#kustomize/}_linux_amd64.tar.gz" /tmp/kus.tgz; then
-              sudo tar -xzf /tmp/kus.tgz -C /usr/local/bin kustomize && sudo chmod +x /usr/local/bin/kustomize || echo "::warning::kustomize extract failed"
-            else
-              echo "::warning::kustomize install failed"
-            fi
-            # argocd
-            if dl https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64 /tmp/argocd; then sudo install -m 0755 /tmp/argocd /usr/local/bin/argocd; else echo "::warning::argocd install failed"; fi
-            # yq
+            dl "https://github.com/kubernetes-sigs/kustomize/releases/download/${KUSVER}/kustomize_${KUSVER#kustomize/}_linux_amd64.tar.gz" /tmp/kus.tgz && sudo tar -xzf /tmp/kus.tgz -C /usr/local/bin kustomize || echo "::warning::kustomize extract failed"
+            dl https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64 /tmp/argocd && sudo install -m 0755 /tmp/argocd /usr/local/bin/argocd || echo "::warning::argocd install failed"
             YQVER="$(gh_api repos/mikefarah/yq/releases/latest | jq -r .tag_name)"
-            if dl "https://github.com/mikefarah/yq/releases/download/${YQVER}/yq_linux_amd64" /tmp/yq; then sudo install -m 0755 /tmp/yq /usr/local/bin/yq; else echo "::warning::yq install failed"; fi
+            dl "https://github.com/mikefarah/yq/releases/download/${YQVER}/yq_linux_amd64" /tmp/yq && sudo install -m 0755 /tmp/yq /usr/local/bin/yq || echo "::warning::yq install failed"
           fi
 
           # ============ 3) Security & Lint ============
@@ -267,14 +247,10 @@ jobs:
             echo "[extras] Security & Lint"
             sudo apt-get install -y python3-pip shellcheck || true
             GLVER="$(gh_api repos/gitleaks/gitleaks/releases/latest | jq -r .tag_name)"
-            if dl "https://github.com/gitleaks/gitleaks/releases/download/${GLVER}/gitleaks_${GLVER#v}_linux_x64.tar.gz" /tmp/gitleaks.tgz; then
-              sudo tar -xzf /tmp/gitleaks.tgz -C /usr/local/bin gitleaks && sudo chmod +x /usr/local/bin/gitleaks || echo "::warning::gitleaks extract failed"
-            else
-              echo "::warning::gitleaks install failed"
-            fi
+            dl "https://github.com/gitleaks/gitleaks/releases/download/${GLVER}/gitleaks_${GLVER#v}_linux_x64.tar.gz" /tmp/gitleaks.tgz && sudo tar -xzf /tmp/gitleaks.tgz -C /usr/local/bin gitleaks || echo "::warning::gitleaks extract failed"
             pip3 install --upgrade pip semgrep bandit || echo "::warning::pip installs failed"
             HADVER="$(gh_api repos/hadolint/hadolint/releases/latest | jq -r .tag_name)"
-            if dl "https://github.com/hadolint/hadolint/releases/download/${HADVER}/hadolint-Linux-x86_64" /tmp/hadolint; then sudo install -m 0755 /tmp/hadolint /usr/local/bin/hadolint; else echo "::warning::hadolint install failed"; fi
+            dl "https://github.com/hadolint/hadolint/releases/download/${HADVER}/hadolint-Linux-x86_64" /tmp/hadolint && sudo install -m 0755 /tmp/hadolint /usr/local/bin/hadolint || echo "::warning::hadolint install failed"
           fi
 
           # ============ 4) Observability ============
@@ -282,15 +258,23 @@ jobs:
             echo "[extras] Observability"
             sudo apt-get install -y prometheus-node-exporter unzip || true
             PTVER="$(gh_api repos/grafana/loki/releases/latest | jq -r .tag_name)"
-            if dl "https://github.com/grafana/loki/releases/download/${PTVER}/promtail-linux-amd64.zip" /tmp/promtail.zip; then
-              unzip -o /tmp/promtail.zip -d /tmp && sudo mv /tmp/promtail-linux-amd64 /usr/local/bin/promtail && sudo chmod +x /usr/local/bin/promtail || echo "::warning::promtail install failed"
+            dl "https://github.com/grafana/loki/releases/download/${PTVER}/promtail-linux-amd64.zip" /tmp/promtail.zip && unzip -o /tmp/promtail.zip -d /tmp && sudo mv /tmp/promtail-linux-amd64 /usr/local/bin/promtail && sudo chmod +x /usr/local/bin/promtail || echo "::warning::promtail install failed"
+
+            # otelcol: API 자산 탐색 → 실패 시 컨테이너 래퍼
+            if ! gh_dl_asset open-telemetry opentelemetry-collector-releases "otelcol_.*linux_amd64.*\.tar\.gz" /tmp/otelcol.tgz; then
+              echo "::warning::otelcol binary fetch failed; using docker wrapper"
+              docker pull otel/opentelemetry-collector:latest || true
+              sudo tee /usr/local/bin/otelcol >/dev/null <<'SH'
+              #!/usr/bin/env bash
+              exec docker run --rm --net=host \
+                -v "$PWD:/work" -w /work \
+                -v /var/log:/var/log \
+                -v /etc:/etc \
+                otel/opentelemetry-collector:latest "$@"
+              SH
+              sudo chmod +x /usr/local/bin/otelcol
             else
-              echo "::warning::promtail download failed"
-            fi
-            if dl https://github.com/open-telemetry/opentelemetry-collector-releases/releases/latest/download/otelcol_linux_amd64.tar.gz /tmp/otel.tgz; then
-              sudo tar -xzf /tmp/otel.tgz -C /usr/local/bin otelcol && sudo chmod +x /usr/local/bin/otelcol || echo "::warning::otelcol extract failed"
-            else
-              echo "::warning::otelcol download failed"
+              sudo tar -xzf /tmp/otelcol.tgz -C /usr/local/bin otelcol || echo "::warning::otelcol extract failed"
             fi
           fi
 
@@ -311,20 +295,27 @@ jobs:
           if [ "$(get_flag db_clis)" = "true" ]; then
             echo "[extras] DB CLIs"
             sudo apt-get install -y postgresql-client mysql-client redis-tools unzip || true
-            if dl https://dl.min.io/client/mc/release/linux-amd64/mc /tmp/mc; then sudo install -m 0755 /tmp/mc /usr/local/bin/mc; fi
-            if dl https://releases.hashicorp.com/vault/1.16.3/vault_1.16.3_linux_amd64.zip /tmp/vault.zip; then unzip -o /tmp/vault.zip -d /usr/local/bin && sudo chmod +x /usr/local/bin/vault; fi
+            dl https://dl.min.io/client/mc/release/linux-amd64/mc /tmp/mc && sudo install -m 0755 /tmp/mc /usr/local/bin/mc || echo "::warning::mc install failed"
+            dl https://releases.hashicorp.com/vault/1.16.3/vault_1.16.3_linux_amd64.zip /tmp/vault.zip && unzip -o /tmp/vault.zip -d /usr/local/bin && sudo chmod +x /usr/local/bin/vault || echo "::warning::vault install failed"
             dl https://fastdl.mongodb.org/tools/db/mongodb-database-tools-ubuntu2204-x86_64-100.9.4.deb /tmp/mdb.deb && sudo dpkg -i /tmp/mdb.deb || echo "::warning::mongodb tools install failed"
           fi
 
-          # ============ 7) Build Runtimes ============
+          # ============ 7) Build Runtimes (SDKMAN set -u 대응) ============
           if [ "$(get_flag build_runtimes)" = "true" ]; then
             echo "[extras] Build runtimes"
             curl -s "https://get.sdkman.io" | bash || true
-            source "$HOME/.sdkman/bin/sdkman-init.sh" || true
+            export SDKMAN_DIR="$HOME/.sdkman"
+            export SDKMAN_CANDIDATES_API="${SDKMAN_CANDIDATES_API:-https://api.sdkman.io/2}"
+            set +u
+            [ -s "$SDKMAN_DIR/bin/sdkman-init.sh" ] && source "$SDKMAN_DIR/bin/sdkman-init.sh"
+            set -u
+            sdk help >/dev/null 2>&1 || echo "::warning::sdk help failed"
+
             sudo apt-get install -y python3-pip || true
             pip3 install --upgrade pip pipx poetry || true
             curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash || true
-            export NVM_DIR="$HOME/.nvm"; . "$NVM_DIR/nvm.sh" || true
+            export NVM_DIR="$HOME/.nvm"
+            [ -s "$NVM_DIR/nvm.sh" ] && set +u && . "$NVM_DIR/nvm.sh" && set -u || true
             nvm install --lts || true
             corepack enable || true
             npm i -g pnpm || true
@@ -342,6 +333,8 @@ jobs:
             sudo apt-get install -y pandoc graphviz default-jre wkhtmltopdf || true
             dl https://sourceforge.net/projects/plantuml/files/plantuml.jar/download /usr/local/bin/plantuml.jar || echo "::warning::plantuml download failed"
           fi
+
+          echo "[extras] completed ok"
 
   build_matrix:
     needs: setup_base
@@ -479,7 +472,6 @@ jobs:
           distribution: temurin
           java-version: ${{ matrix.java }}
           cache: maven
-        # cache-dependency-path 생략해도 pom 자동 탐지됨
 
       - name: 🏗️ Build Boot (Maven)
         working-directory: boot-app
@@ -657,7 +649,7 @@ jobs:
           done < <(find release_artifacts -type f -print0)
           echo "== release-bundle =="; (cd release-bundle && ls -al) || true
 
-      - name: 🚀 Create/Update Release with GH CLI (clobber, no git)
+      - name: 🚀 Create/Update Release with GH CLI (no .git)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -725,7 +717,7 @@ jobs:
                 - run: echo "This is a placeholder PROD workflow. It exists as a copy for ops traceability."
           YML
 
-      - name: 🔁 Open PR for PROD workflow copy
+      - name: 🔁 Open PR for PROD workflow copy (hardened)
         uses: peter-evans/create-pull-request@v6
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -737,3 +729,5 @@ jobs:
             - 아티팩트(prod-bundles) 포함
           branch: promote/prod-${{ github.run_id }}
           delete-branch: true
+          author: "github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>"
+          committer: "github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>"
