@@ -1,18 +1,14 @@
-name: Test-Server + Spring Boot + Docker (Ultra:Maven+Gradle, JDK17/21, Schedule, Release, Promote)
+name: Test-Server + Spring Boot + Docker (Ultra Integrated)
 
 on:
   schedule:
-    - cron: "*/10 * * * *" # 10분 주기
+    - cron: "*/10 * * * *"
   workflow_dispatch:
     inputs:
       freedisk_profile:
-        description: "FreeDisk 프로파일 (none|minimal/aggressive)"
+        description: "FreeDisk 프로파일 (none|minimal|aggressive)"
         required: true
         default: "minimal"
-      lowdisk_mode:
-        description: "저용량 디스크 시뮬 (off|tmpfs|loop)"
-        required: true
-        default: "tmpfs"
       fast_compress:
         description: "pigz 병렬 압축 사용 (true/false)"
         required: true
@@ -21,10 +17,6 @@ on:
         description: "OS 패키지 업그레이드 (true/false)"
         required: true
         default: "false"
-      java_version:
-        description: "수동 실행시 기본 JDK (17/21)"
-        required: false
-        default: "17"
       maven_version:
         description: "Maven 버전(예: 3.9.9) 비우면 apt 기본"
         required: false
@@ -45,10 +37,27 @@ on:
         description: "호스트 포트(기본 18080; JDK21는 +1)"
         required: false
         default: "18080"
+      release_prerelease:
+        description: "릴리스를 프리릴리스로 표시 (true/false)"
+        required: true
+        default: "true"
+      extras_json:
+        description: >-
+          설치 토글 JSON.
+          예) {"container_toolchain":true,"k8s_toolchain":true,"security_tools":true,
+               "obs_tools":true,"db_images":true,"db_clis":true,
+               "build_runtimes":true,"release_utils":true,"docs_tools":true}
+        required: false
+        default: '{"container_toolchain":true,"k8s_toolchain":true,"security_tools":true,"obs_tools":true,"db_images":true,"db_clis":true,"build_runtimes":true,"release_utils":true,"docs_tools":true}'
 
 permissions:
   contents: write
   pull-requests: write
+
+# ✅ 동시 실행 충돌/PR 브랜치 중복 방지
+concurrency:
+  group: test-server-ultra-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   BOOT_GROUP: com.example
@@ -66,20 +75,19 @@ jobs:
         uses: actions/checkout@v4
         continue-on-error: true
 
-      - name: 🔧 Config echo
+      - name: 🔧 Config
         id: cfg
         run: |
           echo "artifact=${{ inputs.boot_artifact || 'demo-app' }}" >> $GITHUB_OUTPUT
           echo "deps=${{ inputs.boot_dependencies || 'web,actuator' }}" >> $GITHUB_OUTPUT
           echo "base_port=${{ inputs.container_port_host || '18080' }}" >> $GITHUB_OUTPUT
 
-      - name: 🔎 Echo:runner/env/docker/resources
+      - name: 🔎 Runner Info
         run: |
           uname -a || true
           nproc || true
           free -h || true
           df -h || true
-          ip a || true
           docker version || true
           docker info || true
 
@@ -93,12 +101,13 @@ jobs:
 
       - name: 🛠️ numfmt shim (-4 옵션 무시, bash 호환)
         run: |
-          command -v numfmt >/dev/null 2>&1 || { sudo apt-get update -y || true; sudo apt-get install -y coreutils || true; }
+          set -Eeuo pipefail
+          sudo apt-get update -y || true
+          sudo apt-get install -y coreutils jq unzip curl git || true
           sudo mkdir -p /usr/local/bin
           sudo tee /usr/local/bin/numfmt >/dev/null <<'SH'
           #!/usr/bin/env bash
           set -euo pipefail
-          # 실제 numfmt 경로 찾기
           TARGET="$(type -aP numfmt | grep -v '^/usr/local/bin/numfmt$' | head -n1)"
           args=()
           for a in "$@"; do [ "$a" = "-4" ] && continue; args+=("$a"); done
@@ -135,6 +144,123 @@ jobs:
           sudo find /var/log -type f -name "*.gz" -delete || true
           sudo find /var/log -type f -name "*.1" -delete || true
           df -h || true
+
+      - name: 🧩 Install Extras by JSON toggles
+        env:
+          EXTRAS_JSON: ${{ inputs.extras_json }}
+        run: |
+          set -Eeuo pipefail
+          # 기본 도구(여기에서 gh 설치) ✅ 릴리스 잡에서 깃 의존 없이 gh 사용 가능
+          sudo apt-get update -y || true
+          sudo apt-get install -y jq unzip tar zstd pigz aria2 p7zip-full git-lfs gh || true
+          git lfs install --system || true
+
+          get_flag(){ jq -r ".$1 // false" <<< "${EXTRAS_JSON:-{}}"; }
+
+          if [ "$(get_flag container_toolchain)" = "true" ]; then
+            echo "[extras] Container toolchain"
+            sudo apt-get install -y skopeo || true
+            curl -fsSL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sudo bash -s -- -b /usr/local/bin
+            curl -fsSL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sudo bash -s -- -b /usr/local/bin
+            curl -fsSL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin
+            curl -fsSL https://raw.githubusercontent.com/wagoodman/dive/master/install.sh | sudo sh -s -- -b /usr/local/bin
+            # ✅ cosign/ORAS 안정 설치
+            COSIGN_VER=$(curl -fsSL https://api.github.com/repos/sigstore/cosign/releases/latest | jq -r .tag_name)
+            curl -fsSL -o /usr/local/bin/cosign https://github.com/sigstore/cosign/releases/download/${COSIGN_VER}/cosign-linux-amd64
+            chmod +x /usr/local/bin/cosign
+            ORAS_VER=$(curl -fsSL https://api.github.com/repos/oras-project/oras/releases/latest | jq -r .tag_name)
+            curl -fsSL -o /tmp/oras.tgz https://github.com/oras-project/oras/releases/download/${ORAS_VER}/oras_${ORAS_VER#v}_linux_amd64.tar.gz
+            sudo tar -xzf /tmp/oras.tgz -C /usr/local/bin oras && sudo chmod +x /usr/local/bin/oras
+            CRANE_VER=$(curl -fsSL https://api.github.com/repos/google/go-containerregistry/releases/latest | jq -r .tag_name)
+            curl -fsSL -o /usr/local/bin/crane https://github.com/google/go-containerregistry/releases/download/${CRANE_VER}/crane_linux_amd64 && chmod +x /usr/local/bin/crane
+          fi
+
+          if [ "$(get_flag k8s_toolchain)" = "true" ]; then
+            echo "[extras] Cloud & K8s CLI"
+            sudo apt-get install -y curl gnupg || true
+            curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o awscliv2.zip
+            unzip -q awscliv2.zip && sudo ./aws/install || true
+            echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] http://packages.cloud.google.com/apt cloud-sdk main" | \
+              sudo tee /etc/apt/sources.list.d/google-cloud-sdk.list
+            curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | \
+              sudo gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg
+            sudo apt-get update -y && sudo apt-get install -y google-cloud-sdk
+            curl -fsSL https://aka.ms/InstallAzureCLIDeb | sudo bash
+            curl -fsSL https://storage.googleapis.com/kubernetes-release/release/stable.txt -o /tmp/kver
+            curl -fsSL -o /usr/local/bin/kubectl https://storage.googleapis.com/kubernetes-release/release/$(cat /tmp/kver)/bin/linux/amd64/kubectl && sudo chmod +x /usr/local/bin/kubectl
+            curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+            KUS_VER=$(curl -fsSL https://api.github.com/repos/kubernetes-sigs/kustomize/releases/latest | jq -r '.tag_name')
+            curl -fsSL -o /tmp/kus.tgz https://github.com/kubernetes-sigs/kustomize/releases/download/${KUS_VER}/kustomize_${KUS_VER#kustomize/}_linux_amd64.tar.gz
+            sudo tar -xzf /tmp/kus.tgz -C /usr/local/bin kustomize && sudo chmod +x /usr/local/bin/kustomize
+            curl -fsSL -o /usr/local/bin/argocd https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64 && sudo chmod +x /usr/local/bin/argocd
+            YQ_VER=$(curl -fsSL https://api.github.com/repos/mikefarah/yq/releases/latest | jq -r .tag_name)
+            curl -fsSL -o /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/${YQ_VER}/yq_linux_amd64 && sudo chmod +x /usr/local/bin/yq
+          fi
+
+          if [ "$(get_flag security_tools)" = "true" ]; then
+            echo "[extras] Security & Lint"
+            sudo apt-get install -y python3-pip shellcheck || true
+            GL_VER=$(curl -fsSL https://api.github.com/repos/gitleaks/gitleaks/releases/latest | jq -r .tag_name)
+            curl -fsSL -o /tmp/gitleaks.tar.gz https://github.com/gitleaks/gitleaks/releases/download/${GL_VER}/gitleaks_${GL_VER#v}_linux_x64.tar.gz
+            sudo tar -xzf /tmp/gitleaks.tar.gz -C /usr/local/bin gitleaks && sudo chmod +x /usr/local/bin/gitleaks
+            pip3 install --upgrade pip semgrep bandit
+            HAD_VER=$(curl -fsSL https://api.github.com/repos/hadolint/hadolint/releases/latest | jq -r .tag_name)
+            curl -fsSL -o /usr/local/bin/hadolint https://github.com/hadolint/hadolint/releases/download/${HAD_VER}/hadolint-Linux-x86_64 && sudo chmod +x /usr/local/bin/hadolint
+          fi
+
+          if [ "$(get_flag obs_tools)" = "true" ]; then
+            echo "[extras] Observability"
+            sudo apt-get install -y prometheus-node-exporter unzip || true
+            PT_VER=$(curl -fsSL https://api.github.com/repos/grafana/loki/releases/latest | jq -r .tag_name)
+            curl -fsSL -o /tmp/promtail.zip https://github.com/grafana/loki/releases/download/${PT_VER}/promtail-linux-amd64.zip
+            unzip -o /tmp/promtail.zip -d /tmp && sudo mv /tmp/promtail-linux-amd64 /usr/local/bin/promtail && sudo chmod +x /usr/local/bin/promtail
+            curl -fsSL https://github.com/open-telemetry/opentelemetry-collector-releases/releases/latest/download/otelcol_linux_amd64.tar.gz -o /tmp/otel.tgz
+            sudo tar -xzf /tmp/otel.tgz -C /usr/local/bin otelcol && sudo chmod +x /usr/local/bin/otelcol
+          fi
+
+          if [ "$(get_flag db_images)" = "true" ]; then
+            echo "[extras] DB & Middleware images"
+            docker pull postgres:16 || true
+            docker pull mysql:8 || true
+            docker pull redis:7 || true
+            docker pull mongo:7 || true
+            docker pull bitnami/kafka:latest || docker pull redpandadata/redpanda:latest || true
+            docker pull minio/minio:latest || true
+            docker pull minio/mc:latest || true
+            docker pull hashicorp/vault:1.16 || true
+          fi
+
+          if [ "$(get_flag db_clis)" = "true" ]; then
+            echo "[extras] DB CLIs"
+            sudo apt-get install -y postgresql-client mysql-client redis-tools unzip || true
+            curl -fsSL -o /usr/local/bin/mc https://dl.min.io/client/mc/release/linux-amd64/mc && sudo chmod +x /usr/local/bin/mc
+            curl -fsSL -o /tmp/vault.zip https://releases.hashicorp.com/vault/1.16.3/vault_1.16.3_linux_amd64.zip
+            unzip -o /tmp/vault.zip -d /usr/local/bin && sudo chmod +x /usr/local/bin/vault
+            aria2c -x16 -s16 -o /tmp/mdb.deb https://fastdl.mongodb.org/tools/db/mongodb-database-tools-ubuntu2204-x86_64-100.9.4.deb || true
+            sudo dpkg -i /tmp/mdb.deb || true
+          fi
+
+          if [ "$(get_flag build_runtimes)" = "true" ]; then
+            echo "[extras] Build runtimes"
+            curl -s "https://get.sdkman.io" | bash || true
+            source "$HOME/.sdkman/bin/sdkman-init.sh" || true
+            sudo apt-get install -y python3-pip || true
+            pip3 install --upgrade pip pipx poetry
+            curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash
+            export NVM_DIR="$HOME/.nvm"; . "$NVM_DIR/nvm.sh"
+            nvm install --lts && corepack enable && npm i -g pnpm
+          fi
+
+          if [ "$(get_flag release_utils)" = "true" ]; then
+            echo "[extras] Release & Transfer tools"
+            sudo apt-get install -y rclone || true
+          fi
+
+          if [ "$(get_flag docs_tools)" = "true" ]; then
+            echo "[extras] Docs & Diagram tools"
+            sudo apt-get install -y pandoc graphviz default-jre wkhtmltopdf || true
+            curl -L -o /usr/local/bin/plantuml.jar https://sourceforge.net/projects/plantuml/files/plantuml.jar/download || true
+          fi
 
   build_matrix:
     needs: setup_base
@@ -266,7 +392,7 @@ jobs:
           { echo "server.port=8080"; echo "management.endpoints.web.exposure.include=*"; } >> boot-app/src/main/resources/application.properties
           sed -i 's#</dependencies>#  <dependency>\n    <groupId>org.junit.jupiter</groupId>\n    <artifactId>junit-jupiter</artifactId>\n    <version>5.10.2</version>\n    <scope>test</scope>\n  </dependency>\n  <dependency>\n    <groupId>org.testcontainers</groupId>\n    <artifactId>junit-jupiter</artifactId>\n    <version>1.19.7</version>\n    <scope>test</scope>\n  </dependency>\n  <dependency>\n    <groupId>org.testcontainers</groupId>\n    <artifactId>testcontainers</artifactId>\n    <version>1.19.7</version>\n    <scope>test</scope>\n  </dependency>\n</dependencies>#' boot-app/pom.xml || true
 
-      - name: ☕ Enable Maven cache (now projects exist)
+      - name: ☕ Enable Maven cache
         uses: actions/setup-java@v5
         with:
           distribution: temurin
@@ -322,7 +448,6 @@ jobs:
         uses: docker/setup-qemu-action@v3
         with:
           platforms: all
-
       - uses: docker/setup-buildx-action@v3
         with:
           install: true
@@ -412,6 +537,9 @@ jobs:
     runs-on: ubuntu-latest
     continue-on-error: false
     steps:
+      # ✅ .git 없이도 동작하게 gh에 --repo를 줄 것이므로 checkout 불필요하지만,
+      # 필요시 아래 주석 해제
+      # - uses: actions/checkout@v4
       - name: ⬇️ Download artifacts
         uses: actions/download-artifact@v4
         with:
@@ -421,7 +549,7 @@ jobs:
         run: |
           echo "== release_artifacts =="; find release_artifacts -type f | sed 's/^/- /' || true
 
-      - name: 🧰 Normalize & de-duplicate names → release-bundle/
+      - name: 🧰 Normalize & de-duplicate → release-bundle/
         run: |
           set -Eeuo pipefail
           mkdir -p release-bundle
@@ -430,8 +558,6 @@ jobs:
             base="$(basename "$f")"
             ext="${base##*.}"
             stem="${base%.*}"
-
-            # 힌트 추출(JDK/Gradle/Maven)
             sfx=""
             case "$f" in
               *bundles-j17/*) sfx="${sfx:+$sfx-}j17";;
@@ -441,15 +567,8 @@ jobs:
               */boot-app-gradle/*|*gradle/*) sfx="${sfx:+$sfx-}gradle";;
               */boot-app/*|*maven-sample/*)  sfx="${sfx:+$sfx-}maven";;
             esac
-
-            # 접미사 없으면 그대로, 있으면 붙이기
-            if [ -n "$sfx" ]; then
-              out="${stem}-${sfx}.${ext}"
-            else
-              out="${base}"
-            fi
-
-            # 중복 방지 카운터
+            out="${base}"
+            [ -n "$sfx" ] && out="${stem}-${sfx}.${ext}"
             key="$out"
             if [[ -n "${seen[$key]:-}" ]]; then
               cnt="${seen[$key]}"
@@ -458,26 +577,26 @@ jobs:
             else
               seen["$key"]=1
             fi
-
             cp -f "$f" "release-bundle/$out"
           done < <(find release_artifacts -type f -print0)
+          echo "== release-bundle =="; (cd release-bundle && ls -al) || true
 
-          echo "== release-bundle =="
-          (cd release-bundle && ls -al) || true
-
-      - name: 🚀 Create/Update Release with GH CLI (clobber)
+      - name: 🚀 Create/Update Release with GH CLI (clobber, no git)  # ✅ 핵심 수정
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -Eeuo pipefail
           TAG="auto-${{ github.run_number }}"
           TITLE="Auto Release #${{ github.run_number }}"
-          # 릴리스가 없으면 생성
-          if ! gh release view "$TAG" >/dev/null 2>&1; then
-            gh release create "$TAG" --title "$TITLE" --notes "" --prerelease
+          REPO="${{ github.repository }}"
+          if ! gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            if [ "${{ inputs.release_prerelease }}" = "true" ]; then
+              gh release create "$TAG" --title "$TITLE" --notes "" --prerelease --repo "$REPO"
+            else
+              gh release create "$TAG" --title "$TITLE" --notes "" --repo "$REPO"
+            fi
           fi
-          # 업로드(동명 파일 덮어쓰기)
-          gh release upload "$TAG" release-bundle/** --clobber
+          gh release upload "$TAG" release-bundle/** --clobber --repo "$REPO"
 
   promote_to_prod:
     needs: [setup_base, build_matrix]
@@ -510,8 +629,11 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
-      - name: 🛒 Checkout (for PR)
+      - name: 🛒 Checkout (for PR)  # ✅ 깊이/크리덴셜 보장
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
 
       - name: 📝 Create a PROD workflow copy (PR)
         run: |
@@ -527,14 +649,15 @@ jobs:
                 - run: echo "This is a placeholder PROD workflow. It exists as a copy for ops traceability."
           YML
 
-      - name: 🔁 Open PR for PROD workflow copy
+      - name: 🔁 Open PR for PROD workflow copy  # ✅ 브랜치 유일화
         uses: peter-evans/create-pull-request@v6
         with:
+          token: ${{ secrets.GITHUB_TOKEN }}
           commit-message: "chore(prod): add prod workflow copy & promote bundles"
           title: "chore(prod): add prod workflow copy & promote bundles"
           body: |
             자동 생성된 PROD 워크플로우 래퍼 및 프로모션 번들 업로드.
             - test1-prod.yml 추가(운영 추적용)
             - 아티팩트(prod-bundles) 포함
-          branch: promote/prod-${{ github.run_number }}
+          branch: promote/prod-${{ github.run_id }}
           delete-branch: true
