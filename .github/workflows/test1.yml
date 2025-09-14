@@ -1,4 +1,4 @@
-name: Test-Server + Spring Boot + Docker (Ultra Integrated)
+name: Test-Server + Spring Boot + Docker (Ultra Integrated - Hardened)
 
 on:
   schedule:
@@ -43,10 +43,10 @@ on:
         default: "true"
       extras_json:
         description: >-
-          설치 토글 JSON.
-          예) {"container_toolchain":true,"k8s_toolchain":true,"security_tools":true,
-               "obs_tools":true,"db_images":true,"db_clis":true,
-               "build_runtimes":true,"release_utils":true,"docs_tools":true}
+          설치 토글 JSON. 예)
+          {"container_toolchain":true,"k8s_toolchain":true,"security_tools":true,
+           "obs_tools":true,"db_images":true,"db_clis":true,
+           "build_runtimes":true,"release_utils":true,"docs_tools":true}
         required: false
         default: '{"container_toolchain":true,"k8s_toolchain":true,"security_tools":true,"obs_tools":true,"db_images":true,"db_clis":true,"build_runtimes":true,"release_utils":true,"docs_tools":true}'
 
@@ -54,7 +54,6 @@ permissions:
   contents: write
   pull-requests: write
 
-# ✅ 동시 실행 충돌/PR 브랜치 중복 방지
 concurrency:
   group: test-server-ultra-${{ github.ref }}
   cancel-in-progress: true
@@ -145,79 +144,157 @@ jobs:
           sudo find /var/log -type f -name "*.1" -delete || true
           df -h || true
 
-      - name: 🧩 Install Extras by JSON toggles
+      - name: 🧩 Install Extras by JSON toggles (hardened)
         env:
           EXTRAS_JSON: ${{ inputs.extras_json }}
         run: |
           set -Eeuo pipefail
-          # 기본 도구(여기에서 gh 설치) ✅ 릴리스 잡에서 깃 의존 없이 gh 사용 가능
+
+          # ---------- Common base tools ----------
           sudo apt-get update -y || true
-          sudo apt-get install -y jq unzip tar zstd pigz aria2 p7zip-full git-lfs gh || true
+          sudo apt-get install -y jq unzip tar zstd pigz aria2 p7zip-full git-lfs gh curl ca-certificates gnupg || true
           git lfs install --system || true
 
-          get_flag(){ jq -r ".$1 // false" <<< "${EXTRAS_JSON:-{}}"; }
+          # ---------- Helpers ----------
+          validate_json () { echo "${1:-}" | jq -e . >/dev/null 2>&1; }
+          if ! validate_json "${EXTRAS_JSON}"; then
+            echo "::warning::extras_json is invalid JSON. All extras disabled for safety."
+            EXTRAS_JSON="{}"
+          fi
+          get_flag(){ printf '%s' "${EXTRAS_JSON}" | jq -r ".\"$1\" // false" 2>/dev/null || echo false; }
 
+          dl() { # url out [retries]
+            url="$1"; out="$2"; retries="${3:-3}"
+            for i in $(seq 1 "$retries"); do
+              if curl -fL --retry 3 --retry-connrefused --retry-delay 2 -o "$out" "$url"; then
+                return 0
+              fi
+              echo "::warning::download failed ($i/$retries): $url"
+              sleep 2
+            done
+            return 1
+          }
+          continue_or_warn(){ cmd="$1"; msg="$2"; bash -c "$cmd" || echo "::warning::$msg (ignored)"; }
+          gh_api(){ curl -fsSL "https://api.github.com/$1"; }
+
+          # ============ 1) Container Toolchain ============
           if [ "$(get_flag container_toolchain)" = "true" ]; then
             echo "[extras] Container toolchain"
             sudo apt-get install -y skopeo || true
-            curl -fsSL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sudo bash -s -- -b /usr/local/bin
-            curl -fsSL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sudo bash -s -- -b /usr/local/bin
-            curl -fsSL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin
-            curl -fsSL https://raw.githubusercontent.com/wagoodman/dive/master/install.sh | sudo sh -s -- -b /usr/local/bin
-            # ✅ cosign/ORAS 안정 설치
-            COSIGN_VER=$(curl -fsSL https://api.github.com/repos/sigstore/cosign/releases/latest | jq -r .tag_name)
-            curl -fsSL -o /usr/local/bin/cosign https://github.com/sigstore/cosign/releases/download/${COSIGN_VER}/cosign-linux-amd64
-            chmod +x /usr/local/bin/cosign
-            ORAS_VER=$(curl -fsSL https://api.github.com/repos/oras-project/oras/releases/latest | jq -r .tag_name)
-            curl -fsSL -o /tmp/oras.tgz https://github.com/oras-project/oras/releases/download/${ORAS_VER}/oras_${ORAS_VER#v}_linux_amd64.tar.gz
-            sudo tar -xzf /tmp/oras.tgz -C /usr/local/bin oras && sudo chmod +x /usr/local/bin/oras
-            CRANE_VER=$(curl -fsSL https://api.github.com/repos/google/go-containerregistry/releases/latest | jq -r .tag_name)
-            curl -fsSL -o /usr/local/bin/crane https://github.com/google/go-containerregistry/releases/download/${CRANE_VER}/crane_linux_amd64 && chmod +x /usr/local/bin/crane
+
+            # syft
+            continue_or_warn "curl -fsSL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sudo bash -s -- -b /usr/local/bin" "syft install failed"
+
+            # grype
+            continue_or_warn "curl -fsSL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sudo bash -s -- -b /usr/local/bin" "grype install failed"
+
+            # trivy
+            continue_or_warn "curl -fsSL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin" 'trivy install failed'
+
+            # dive (script + fallback)
+            if ! curl -fsSL https://raw.githubusercontent.com/wagoodman/dive/master/install.sh | sudo sh -s -- -b /usr/local/bin; then
+              DVER="$(gh_api repos/wagoodman/dive/releases/latest | jq -r .tag_name)"
+              ASSET="dive_${DVER#v}_linux_amd64.tar.gz"
+              if dl "https://github.com/wagoodman/dive/releases/download/${DVER}/${ASSET}" /tmp/dive.tgz; then
+                sudo tar -xzf /tmp/dive.tgz -C /usr/local/bin dive || echo "::warning::dive tar extract failed"
+              else
+                echo "::warning::dive install failed (all methods)."
+              fi
+            fi
+
+            # cosign (asset name variants)
+            COSVER="$(gh_api repos/sigstore/cosign/releases/latest | jq -r .tag_name)"
+            if dl "https://github.com/sigstore/cosign/releases/download/${COSVER}/cosign-linux-amd64" /tmp/cosign; then
+              sudo install -m 0755 /tmp/cosign /usr/local/bin/cosign
+            elif dl "https://github.com/sigstore/cosign/releases/download/${COSVER}/cosign_${COSVER#v}_linux_amd64.tar.gz" /tmp/cosign.tgz; then
+              sudo tar -xzf /tmp/cosign.tgz -C /usr/local/bin cosign || echo "::warning::cosign extract failed"
+            else
+              echo "::warning::cosign install failed (404 on assets)."
+            fi
+
+            # crane
+            CRVER="$(gh_api repos/google/go-containerregistry/releases/latest | jq -r .tag_name)"
+            if dl "https://github.com/google/go-containerregistry/releases/download/${CRVER}/crane_linux_amd64" /tmp/crane; then
+              sudo install -m 0755 /tmp/crane /usr/local/bin/crane
+            else
+              echo "::warning::crane install failed."
+            fi
+
+            # oras
+            ORVER="$(gh_api repos/oras-project/oras/releases/latest | jq -r .tag_name)"
+            if dl "https://github.com/oras-project/oras/releases/download/${ORVER}/oras_${ORVER#v}_linux_amd64.tar.gz" /tmp/oras.tgz; then
+              sudo tar -xzf /tmp/oras.tgz -C /usr/local/bin oras && sudo chmod +x /usr/local/bin/oras || echo "::warning::oras extract failed"
+            else
+              echo "::warning::oras install failed."
+            fi
           fi
 
+          # ============ 2) Cloud & K8s ============
           if [ "$(get_flag k8s_toolchain)" = "true" ]; then
             echo "[extras] Cloud & K8s CLI"
             sudo apt-get install -y curl gnupg || true
-            curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o awscliv2.zip
-            unzip -q awscliv2.zip && sudo ./aws/install || true
+            # awscli v2
+            if dl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" awscliv2.zip; then unzip -q awscliv2.zip && sudo ./aws/install || true; else echo "::warning::awscli download failed"; fi
+            # gcloud
             echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] http://packages.cloud.google.com/apt cloud-sdk main" | \
               sudo tee /etc/apt/sources.list.d/google-cloud-sdk.list
-            curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | \
-              sudo gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg
-            sudo apt-get update -y && sudo apt-get install -y google-cloud-sdk
-            curl -fsSL https://aka.ms/InstallAzureCLIDeb | sudo bash
-            curl -fsSL https://storage.googleapis.com/kubernetes-release/release/stable.txt -o /tmp/kver
-            curl -fsSL -o /usr/local/bin/kubectl https://storage.googleapis.com/kubernetes-release/release/$(cat /tmp/kver)/bin/linux/amd64/kubectl && sudo chmod +x /usr/local/bin/kubectl
-            curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
-            KUS_VER=$(curl -fsSL https://api.github.com/repos/kubernetes-sigs/kustomize/releases/latest | jq -r '.tag_name')
-            curl -fsSL -o /tmp/kus.tgz https://github.com/kubernetes-sigs/kustomize/releases/download/${KUS_VER}/kustomize_${KUS_VER#kustomize/}_linux_amd64.tar.gz
-            sudo tar -xzf /tmp/kus.tgz -C /usr/local/bin kustomize && sudo chmod +x /usr/local/bin/kustomize
-            curl -fsSL -o /usr/local/bin/argocd https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64 && sudo chmod +x /usr/local/bin/argocd
-            YQ_VER=$(curl -fsSL https://api.github.com/repos/mikefarah/yq/releases/latest | jq -r .tag_name)
-            curl -fsSL -o /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/${YQ_VER}/yq_linux_amd64 && sudo chmod +x /usr/local/bin/yq
+            curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | sudo gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg
+            sudo apt-get update -y && sudo apt-get install -y google-cloud-sdk || echo "::warning::gcloud install failed"
+            # azure
+            curl -fsSL https://aka.ms/InstallAzureCLIDeb | sudo bash || echo "::warning::azure cli install failed"
+            # kubectl
+            if dl https://storage.googleapis.com/kubernetes-release/release/stable.txt /tmp/kver; then
+              dl "https://storage.googleapis.com/kubernetes-release/release/$(cat /tmp/kver)/bin/linux/amd64/kubectl" /tmp/kubectl && sudo install -m 0755 /tmp/kubectl /usr/local/bin/kubectl || echo "::warning::kubectl install failed"
+            fi
+            # helm
+            continue_or_warn "curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash" "helm install failed"
+            # kustomize
+            KUSVER="$(gh_api repos/kubernetes-sigs/kustomize/releases/latest | jq -r .tag_name)"
+            if dl "https://github.com/kubernetes-sigs/kustomize/releases/download/${KUSVER}/kustomize_${KUSVER#kustomize/}_linux_amd64.tar.gz" /tmp/kus.tgz; then
+              sudo tar -xzf /tmp/kus.tgz -C /usr/local/bin kustomize && sudo chmod +x /usr/local/bin/kustomize || echo "::warning::kustomize extract failed"
+            else
+              echo "::warning::kustomize install failed"
+            fi
+            # argocd
+            if dl https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64 /tmp/argocd; then sudo install -m 0755 /tmp/argocd /usr/local/bin/argocd; else echo "::warning::argocd install failed"; fi
+            # yq
+            YQVER="$(gh_api repos/mikefarah/yq/releases/latest | jq -r .tag_name)"
+            if dl "https://github.com/mikefarah/yq/releases/download/${YQVER}/yq_linux_amd64" /tmp/yq; then sudo install -m 0755 /tmp/yq /usr/local/bin/yq; else echo "::warning::yq install failed"; fi
           fi
 
+          # ============ 3) Security & Lint ============
           if [ "$(get_flag security_tools)" = "true" ]; then
             echo "[extras] Security & Lint"
             sudo apt-get install -y python3-pip shellcheck || true
-            GL_VER=$(curl -fsSL https://api.github.com/repos/gitleaks/gitleaks/releases/latest | jq -r .tag_name)
-            curl -fsSL -o /tmp/gitleaks.tar.gz https://github.com/gitleaks/gitleaks/releases/download/${GL_VER}/gitleaks_${GL_VER#v}_linux_x64.tar.gz
-            sudo tar -xzf /tmp/gitleaks.tar.gz -C /usr/local/bin gitleaks && sudo chmod +x /usr/local/bin/gitleaks
-            pip3 install --upgrade pip semgrep bandit
-            HAD_VER=$(curl -fsSL https://api.github.com/repos/hadolint/hadolint/releases/latest | jq -r .tag_name)
-            curl -fsSL -o /usr/local/bin/hadolint https://github.com/hadolint/hadolint/releases/download/${HAD_VER}/hadolint-Linux-x86_64 && sudo chmod +x /usr/local/bin/hadolint
+            GLVER="$(gh_api repos/gitleaks/gitleaks/releases/latest | jq -r .tag_name)"
+            if dl "https://github.com/gitleaks/gitleaks/releases/download/${GLVER}/gitleaks_${GLVER#v}_linux_x64.tar.gz" /tmp/gitleaks.tgz; then
+              sudo tar -xzf /tmp/gitleaks.tgz -C /usr/local/bin gitleaks && sudo chmod +x /usr/local/bin/gitleaks || echo "::warning::gitleaks extract failed"
+            else
+              echo "::warning::gitleaks install failed"
+            fi
+            pip3 install --upgrade pip semgrep bandit || echo "::warning::pip installs failed"
+            HADVER="$(gh_api repos/hadolint/hadolint/releases/latest | jq -r .tag_name)"
+            if dl "https://github.com/hadolint/hadolint/releases/download/${HADVER}/hadolint-Linux-x86_64" /tmp/hadolint; then sudo install -m 0755 /tmp/hadolint /usr/local/bin/hadolint; else echo "::warning::hadolint install failed"; fi
           fi
 
+          # ============ 4) Observability ============
           if [ "$(get_flag obs_tools)" = "true" ]; then
             echo "[extras] Observability"
             sudo apt-get install -y prometheus-node-exporter unzip || true
-            PT_VER=$(curl -fsSL https://api.github.com/repos/grafana/loki/releases/latest | jq -r .tag_name)
-            curl -fsSL -o /tmp/promtail.zip https://github.com/grafana/loki/releases/download/${PT_VER}/promtail-linux-amd64.zip
-            unzip -o /tmp/promtail.zip -d /tmp && sudo mv /tmp/promtail-linux-amd64 /usr/local/bin/promtail && sudo chmod +x /usr/local/bin/promtail
-            curl -fsSL https://github.com/open-telemetry/opentelemetry-collector-releases/releases/latest/download/otelcol_linux_amd64.tar.gz -o /tmp/otel.tgz
-            sudo tar -xzf /tmp/otel.tgz -C /usr/local/bin otelcol && sudo chmod +x /usr/local/bin/otelcol
+            PTVER="$(gh_api repos/grafana/loki/releases/latest | jq -r .tag_name)"
+            if dl "https://github.com/grafana/loki/releases/download/${PTVER}/promtail-linux-amd64.zip" /tmp/promtail.zip; then
+              unzip -o /tmp/promtail.zip -d /tmp && sudo mv /tmp/promtail-linux-amd64 /usr/local/bin/promtail && sudo chmod +x /usr/local/bin/promtail || echo "::warning::promtail install failed"
+            else
+              echo "::warning::promtail download failed"
+            fi
+            if dl https://github.com/open-telemetry/opentelemetry-collector-releases/releases/latest/download/otelcol_linux_amd64.tar.gz /tmp/otel.tgz; then
+              sudo tar -xzf /tmp/otel.tgz -C /usr/local/bin otelcol && sudo chmod +x /usr/local/bin/otelcol || echo "::warning::otelcol extract failed"
+            else
+              echo "::warning::otelcol download failed"
+            fi
           fi
 
+          # ============ 5) DB Images ============
           if [ "$(get_flag db_images)" = "true" ]; then
             echo "[extras] DB & Middleware images"
             docker pull postgres:16 || true
@@ -230,36 +307,40 @@ jobs:
             docker pull hashicorp/vault:1.16 || true
           fi
 
+          # ============ 6) DB CLIs ============
           if [ "$(get_flag db_clis)" = "true" ]; then
             echo "[extras] DB CLIs"
             sudo apt-get install -y postgresql-client mysql-client redis-tools unzip || true
-            curl -fsSL -o /usr/local/bin/mc https://dl.min.io/client/mc/release/linux-amd64/mc && sudo chmod +x /usr/local/bin/mc
-            curl -fsSL -o /tmp/vault.zip https://releases.hashicorp.com/vault/1.16.3/vault_1.16.3_linux_amd64.zip
-            unzip -o /tmp/vault.zip -d /usr/local/bin && sudo chmod +x /usr/local/bin/vault
-            aria2c -x16 -s16 -o /tmp/mdb.deb https://fastdl.mongodb.org/tools/db/mongodb-database-tools-ubuntu2204-x86_64-100.9.4.deb || true
-            sudo dpkg -i /tmp/mdb.deb || true
+            if dl https://dl.min.io/client/mc/release/linux-amd64/mc /tmp/mc; then sudo install -m 0755 /tmp/mc /usr/local/bin/mc; fi
+            if dl https://releases.hashicorp.com/vault/1.16.3/vault_1.16.3_linux_amd64.zip /tmp/vault.zip; then unzip -o /tmp/vault.zip -d /usr/local/bin && sudo chmod +x /usr/local/bin/vault; fi
+            dl https://fastdl.mongodb.org/tools/db/mongodb-database-tools-ubuntu2204-x86_64-100.9.4.deb /tmp/mdb.deb && sudo dpkg -i /tmp/mdb.deb || echo "::warning::mongodb tools install failed"
           fi
 
+          # ============ 7) Build Runtimes ============
           if [ "$(get_flag build_runtimes)" = "true" ]; then
             echo "[extras] Build runtimes"
             curl -s "https://get.sdkman.io" | bash || true
             source "$HOME/.sdkman/bin/sdkman-init.sh" || true
             sudo apt-get install -y python3-pip || true
-            pip3 install --upgrade pip pipx poetry
-            curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash
-            export NVM_DIR="$HOME/.nvm"; . "$NVM_DIR/nvm.sh"
-            nvm install --lts && corepack enable && npm i -g pnpm
+            pip3 install --upgrade pip pipx poetry || true
+            curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash || true
+            export NVM_DIR="$HOME/.nvm"; . "$NVM_DIR/nvm.sh" || true
+            nvm install --lts || true
+            corepack enable || true
+            npm i -g pnpm || true
           fi
 
+          # ============ 8) Release Utils ============
           if [ "$(get_flag release_utils)" = "true" ]; then
             echo "[extras] Release & Transfer tools"
             sudo apt-get install -y rclone || true
           fi
 
+          # ============ 9) Docs Tools ============
           if [ "$(get_flag docs_tools)" = "true" ]; then
             echo "[extras] Docs & Diagram tools"
             sudo apt-get install -y pandoc graphviz default-jre wkhtmltopdf || true
-            curl -L -o /usr/local/bin/plantuml.jar https://sourceforge.net/projects/plantuml/files/plantuml.jar/download || true
+            dl https://sourceforge.net/projects/plantuml/files/plantuml.jar/download /usr/local/bin/plantuml.jar || echo "::warning::plantuml download failed"
           fi
 
   build_matrix:
@@ -398,9 +479,7 @@ jobs:
           distribution: temurin
           java-version: ${{ matrix.java }}
           cache: maven
-          cache-dependency-path: |
-            maven-sample/pom.xml
-            boot-app/pom.xml
+        # cache-dependency-path 생략해도 pom 자동 탐지됨
 
       - name: 🏗️ Build Boot (Maven)
         working-directory: boot-app
@@ -537,9 +616,6 @@ jobs:
     runs-on: ubuntu-latest
     continue-on-error: false
     steps:
-      # ✅ .git 없이도 동작하게 gh에 --repo를 줄 것이므로 checkout 불필요하지만,
-      # 필요시 아래 주석 해제
-      # - uses: actions/checkout@v4
       - name: ⬇️ Download artifacts
         uses: actions/download-artifact@v4
         with:
@@ -581,7 +657,7 @@ jobs:
           done < <(find release_artifacts -type f -print0)
           echo "== release-bundle =="; (cd release-bundle && ls -al) || true
 
-      - name: 🚀 Create/Update Release with GH CLI (clobber, no git)  # ✅ 핵심 수정
+      - name: 🚀 Create/Update Release with GH CLI (clobber, no git)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -629,7 +705,7 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
-      - name: 🛒 Checkout (for PR)  # ✅ 깊이/크리덴셜 보장
+      - name: 🛒 Checkout (for PR)
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -649,7 +725,7 @@ jobs:
                 - run: echo "This is a placeholder PROD workflow. It exists as a copy for ops traceability."
           YML
 
-      - name: 🔁 Open PR for PROD workflow copy  # ✅ 브랜치 유일화
+      - name: 🔁 Open PR for PROD workflow copy
         uses: peter-evans/create-pull-request@v6
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
