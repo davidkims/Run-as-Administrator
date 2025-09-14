@@ -91,14 +91,17 @@ jobs:
           du -h .github/workflows/.reserve_space || true
           df -h || true
 
-      - name: 🛠️ numfmt shim (-4 옵션 무시)
+      - name: 🛠️ numfmt shim (-4 옵션 무시, bash 호환)
         run: |
           command -v numfmt >/dev/null 2>&1 || { sudo apt-get update -y || true; sudo apt-get install -y coreutils || true; }
           sudo mkdir -p /usr/local/bin
           sudo tee /usr/local/bin/numfmt >/dev/null <<'SH'
           #!/usr/bin/env bash
-          TARGET="$(command -v -a numfmt | grep -v '/usr/local/bin/numfmt' | head -n1)"
-          args=(); for a in "$@"; do [ "$a" = "-4" ] && continue; args+=("$a"); done
+          set -euo pipefail
+          # 실제 numfmt 경로 찾기
+          TARGET="$(type -aP numfmt | grep -v '^/usr/local/bin/numfmt$' | head -n1)"
+          args=()
+          for a in "$@"; do [ "$a" = "-4" ] && continue; args+=("$a"); done
           exec "$TARGET" "${args[@]}"
           SH
           sudo chmod +x /usr/local/bin/numfmt
@@ -151,7 +154,6 @@ jobs:
       - name: 🛒 Checkout
         uses: actions/checkout@v4
 
-      # 1) 첫 Java 설정(캐시 없이) → 캐시 미스/경로 오류 방지
       - name: ☕ Setup Java (no cache yet)
         uses: actions/setup-java@v5
         with:
@@ -174,7 +176,6 @@ jobs:
           fi
           mvn -v || true
 
-      # 2) Maven 샘플 생성/패치/빌드
       - name: 🧪 Generate Maven sample + patch (JDK=${{ matrix.java }})
         run: |
           mvn -q -T 1C archetype:generate \
@@ -222,7 +223,6 @@ jobs:
           (cd maven-sample && mvn -q -T 1C -DskipTests package) || true
           ls -al maven-sample/target || true
 
-      # 3) Spring Boot(Maven) 프로젝트 생성 + Hello + Testcontainers 스텁
       - name: 🌱 Generate Boot (Maven) + Hello + IT stub
         run: |
           G="${{ env.BOOT_GROUP }}"; A="${{ env.BOOT_ARTIFACT }}"; D="${{ env.BOOT_DEPS }}"; J="${{ matrix.java }}"
@@ -264,10 +264,8 @@ jobs:
           EOF
           mkdir -p boot-app/src/main/resources
           { echo "server.port=8080"; echo "management.endpoints.web.exposure.include=*"; } >> boot-app/src/main/resources/application.properties
-          # testcontainers deps 주입
           sed -i 's#</dependencies>#  <dependency>\n    <groupId>org.junit.jupiter</groupId>\n    <artifactId>junit-jupiter</artifactId>\n    <version>5.10.2</version>\n    <scope>test</scope>\n  </dependency>\n  <dependency>\n    <groupId>org.testcontainers</groupId>\n    <artifactId>junit-jupiter</artifactId>\n    <version>1.19.7</version>\n    <scope>test</scope>\n  </dependency>\n  <dependency>\n    <groupId>org.testcontainers</groupId>\n    <artifactId>testcontainers</artifactId>\n    <version>1.19.7</version>\n    <scope>test</scope>\n  </dependency>\n</dependencies>#' boot-app/pom.xml || true
 
-      # 4) (이 시점에) Maven 캐시 활성화 — 이제 pom.xml 존재
       - name: ☕ Enable Maven cache (now projects exist)
         uses: actions/setup-java@v5
         with:
@@ -286,7 +284,6 @@ jobs:
           fi
           ls -al target || true
 
-      # 5) Spring Boot (Gradle) 동시 생성/빌드(샘플 비교)
       - name: 🌱 Generate Boot (Gradle)
         run: |
           G="${{ env.BOOT_GROUP }}"; A="${{ env.BOOT_ARTIFACT }}-gradle"; D="${{ env.BOOT_DEPS }}"; J="${{ matrix.java }}"
@@ -321,7 +318,6 @@ jobs:
           ./gradlew -q -Dorg.gradle.jvmargs="-Xmx1g" -x test build || true
           ls -al build/libs || true
 
-      # 6) Docker 이미지(멀티스테이지) 빌드/기동
       - name: 🐳 Setup QEMU/Buildx
         uses: docker/setup-qemu-action@v3
         with:
@@ -414,7 +410,7 @@ jobs:
   release:
     needs: [setup_base, build_matrix]
     runs-on: ubuntu-latest
-    continue-on-error: true
+    continue-on-error: false
     steps:
       - name: ⬇️ Download artifacts
         uses: actions/download-artifact@v4
@@ -425,21 +421,65 @@ jobs:
         run: |
           echo "== release_artifacts =="; find release_artifacts -type f | sed 's/^/- /' || true
 
-      - name: 🚀 Create GitHub Release (only if files exist)
-        if: ${{ hashFiles('release_artifacts/**/*') != '' }}
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: auto-${{ github.run_number }}
-          name: "Auto Release #${{ github.run_number }}"
-          draft: false
-          prerelease: true
-          files: |
-            release_artifacts/**/* 
+      - name: 🧰 Normalize & de-duplicate names → release-bundle/
+        run: |
+          set -Eeuo pipefail
+          mkdir -p release-bundle
+          declare -A seen=()
+          while IFS= read -r -d '' f; do
+            base="$(basename "$f")"
+            ext="${base##*.}"
+            stem="${base%.*}"
+
+            # 힌트 추출(JDK/Gradle/Maven)
+            sfx=""
+            case "$f" in
+              *bundles-j17/*) sfx="${sfx:+$sfx-}j17";;
+              *bundles-j21/*) sfx="${sfx:+$sfx-}j21";;
+            esac
+            case "$f" in
+              */boot-app-gradle/*|*gradle/*) sfx="${sfx:+$sfx-}gradle";;
+              */boot-app/*|*maven-sample/*)  sfx="${sfx:+$sfx-}maven";;
+            esac
+
+            # 접미사 없으면 그대로, 있으면 붙이기
+            if [ -n "$sfx" ]; then
+              out="${stem}-${sfx}.${ext}"
+            else
+              out="${base}"
+            fi
+
+            # 중복 방지 카운터
+            key="$out"
+            if [[ -n "${seen[$key]:-}" ]]; then
+              cnt="${seen[$key]}"
+              seen["$key"]=$((cnt+1))
+              out="${stem}-${sfx:+$sfx-}dup$((cnt+1)).${ext}"
+            else
+              seen["$key"]=1
+            fi
+
+            cp -f "$f" "release-bundle/$out"
+          done < <(find release_artifacts -type f -print0)
+
+          echo "== release-bundle =="
+          (cd release-bundle && ls -al) || true
+
+      - name: 🚀 Create/Update Release with GH CLI (clobber)
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -Eeuo pipefail
+          TAG="auto-${{ github.run_number }}"
+          TITLE="Auto Release #${{ github.run_number }}"
+          # 릴리스가 없으면 생성
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --title "$TITLE" --notes "" --prerelease
+          fi
+          # 업로드(동명 파일 덮어쓰기)
+          gh release upload "$TAG" release-bundle/** --clobber
 
   promote_to_prod:
-    # 테스트 산출물을 운영 명명으로 복제/리태깅(tar) + 워크플로우 복제 PR 생성
     needs: [setup_base, build_matrix]
     runs-on: ubuntu-latest
     continue-on-error: true
@@ -457,7 +497,6 @@ jobs:
             prod="${base/local/prod}"
             cp -f "$f" "prod_artifacts/${prod}"
           done
-          # JAR도 prod 접미사로 복제
           find stage_artifacts -type f \( -name "*.jar" -o -name "*.tgz" \) -print0 | while IFS= read -r -d '' f; do
             cp -f "$f" "prod_artifacts/$(basename "$f")"
           done
