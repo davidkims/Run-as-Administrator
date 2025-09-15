@@ -1,4 +1,4 @@
-name: Test-Server + Spring Boot + Docker (Ultra Integrated - Hardened v2)
+name: Test-Server + Spring Boot + Docker (Ultra Integrated - Hardened v2-fixed)
 
 on:
   schedule:
@@ -60,6 +60,10 @@ concurrency:
 
 env:
   BOOT_GROUP: com.example
+  DEFAULT_EXTRAS_JSON: >-
+    {"container_toolchain":true,"k8s_toolchain":true,"security_tools":true,
+     "obs_tools":true,"db_images":true,"db_clis":true,
+     "build_runtimes":true,"release_utils":true,"docs_tools":true}
 
 jobs:
   setup_base:
@@ -77,9 +81,9 @@ jobs:
       - name: 🔧 Config
         id: cfg
         run: |
-          echo "artifact=${{ inputs.boot_artifact || 'demo-app' }}" >> $GITHUB_OUTPUT
-          echo "deps=${{ inputs.boot_dependencies || 'web,actuator' }}" >> $GITHUB_OUTPUT
-          echo "base_port=${{ inputs.container_port_host || '18080' }}" >> $GITHUB_OUTPUT
+          echo "artifact=${{ inputs.boot_artifact || 'demo-app' }}" >> "$GITHUB_OUTPUT"
+          echo "deps=${{ inputs.boot_dependencies || 'web,actuator' }}" >> "$GITHUB_OUTPUT"
+          echo "base_port=${{ inputs.container_port_host || '18080' }}" >> "$GITHUB_OUTPUT"
 
       - name: 🔎 Runner Info
         run: |
@@ -104,14 +108,17 @@ jobs:
           sudo apt-get update -y || true
           sudo apt-get install -y coreutils jq unzip curl git || true
           sudo mkdir -p /usr/local/bin
-          sudo tee /usr/local/bin/numfmt >/dev/null <<'SH'
+          sudo tee /usr/local/bin/numfmt >/dev/null <<'EOF'
           #!/usr/bin/env bash
           set -euo pipefail
-          TARGET="$(type -aP numfmt | grep -v '^/usr/local/bin/numfmt$' | head -n1)"
+          TARGET="$(command -v numfmt || true)"
+          if [ -z "${TARGET:-}" ]; then
+            echo "numfmt not found" >&2; exit 127
+          fi
           args=()
           for a in "$@"; do [ "$a" = "-4" ] && continue; args+=("$a"); done
           exec "$TARGET" "${args[@]}"
-          SH
+          EOF
           sudo chmod +x /usr/local/bin/numfmt
           /usr/local/bin/numfmt -4 --to=iec 1024 || true
 
@@ -146,40 +153,54 @@ jobs:
 
       - name: 🧩 Install Extras by JSON toggles (API/fallback 강화)
         env:
-          EXTRAS_JSON: ${{ inputs.extras_json }}
+          RAW_EXTRAS_JSON: ${{ inputs.extras_json }}
         run: |
           set -Eeuo pipefail
           sudo apt-get update -y || true
           sudo apt-get install -y jq unzip tar zstd pigz aria2 p7zip-full git-lfs gh curl ca-certificates gnupg || true
-          git lfs install --system || true
+          git lfs install || true
 
-          # ------------ helpers ------------
-          validate_json () { echo "${1:-}" | jq -e . >/dev/null 2>&1; }
-          if ! validate_json "${EXTRAS_JSON}"; then
-            echo "::warning::extras_json invalid. disabling extras."
-            EXTRAS_JSON="{}"
+          # -------- JSON 입력 보정(스케줄 시 inputs 없음 대비) --------
+          EXTRAS_JSON="${RAW_EXTRAS_JSON:-}"
+          if ! printf '%s' "${EXTRAS_JSON}" | jq -e . >/dev/null 2>&1; then
+            echo "::notice::extras_json empty/invalid → DEFAULT_EXTRAS_JSON 사용"
+            EXTRAS_JSON='${{ env.DEFAULT_EXTRAS_JSON }}'
           fi
-          get_flag(){ printf '%s' "${EXTRAS_JSON}" | jq -r ".\"$1\" // false" 2>/dev/null || echo false; }
-          gh_api(){ curl -fsSL "https://api.github.com/$1"; }
-          dl() { url="$1"; out="$2"; retries="${3:-3}"; for i in $(seq 1 "$retries"); do curl -fL --retry 3 --retry-connrefused --retry-delay 2 -o "$out" "$url" && exit 0 || echo "::warning::download failed ($i/$retries): $url"; sleep 2; done; return 1; }
-          continue_or_warn(){ bash -c "$1" || echo "::warning::$2"; }
 
-          # 파일명/자산 자동탐색 다운로드
+          validate_json () { echo "${1:-}" | jq -e . >/dev/null 2>&1; }
+          get_flag(){ printf '%s' "${EXTRAS_JSON}" | jq -r ".\"$1\" // false" 2>/dev/null || echo false; }
+
+          gh_api(){ curl -fsSL "https://api.github.com/$1"; }
+
+          # ↓↓↓ 치명적 버그 수정: exit 0 → return 0
+          dl() { 
+            url="$1"; out="$2"; retries="${3:-3}";
+            for i in $(seq 1 "$retries"); do
+              if curl -fL --retry 3 --retry-connrefused --retry-delay 2 -o "$out" "$url"; then
+                return 0
+              fi
+              echo "::warning::download failed ($i/$retries): $url"
+              sleep 2
+            done
+            return 1
+          }
+
+          continue_or_warn(){ bash -lc "$1" || echo "::warning::$2"; }
+
           gh_dl_asset() { # owner repo filter_substr out
             owner="$1"; repo="$2"; filt="$3"; out="$4"
             rel="$(gh_api repos/${owner}/${repo}/releases/latest | jq -r '.tag_name, (.assets // [])[]?.browser_download_url' 2>/dev/null || true)"
-            url="$(echo "$rel" | awk '/^https?:/ {print}' | grep -i "$filt" | head -n1 || true)"
+            url="$(echo "$rel" | awk '/^https?:/ {print}' | grep -iE "$filt" | head -n1 || true)"
             [ -z "$url" ] && return 1
             dl "$url" "$out"
           }
 
-          # 컨테이너 바이너리 래퍼 생성
-          make_wrapper() { # name image args...
-            name="$1"; shift; image="$1"; shift
-            sudo tee "/usr/local/bin/${name}" >/dev/null <<SH
+          make_wrapper() { # name image
+            name="$1"; image="$2"
+            sudo tee "/usr/local/bin/${name}" >/dev/null <<EOF
             #!/usr/bin/env bash
             exec docker run --rm -i --net=host -v "\$PWD:/work" -w /work ${image} ${name} "\$@"
-            SH
+            EOF
             sudo chmod +x "/usr/local/bin/${name}"
           }
 
@@ -200,14 +221,14 @@ jobs:
               fi
             fi
 
-            # cosign (두 가지 패턴 모두 시도)
+            # cosign
             if ! dl "https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-amd64" /tmp/cosign; then
               gh_dl_asset sigstore cosign "linux_amd64.*\.tar\.gz" /tmp/cosign.tgz && sudo tar -xzf /tmp/cosign.tgz -C /usr/local/bin cosign || echo "::warning::cosign extract failed"
             else
               sudo install -m 0755 /tmp/cosign /usr/local/bin/cosign || true
             fi
 
-            # crane (자산 API → 실패 시 컨테이너 래퍼)
+            # crane
             if ! gh_dl_asset google go-containerregistry "crane_linux_amd64$" /tmp/crane; then
               echo "::warning::crane binary fetch failed; falling back to container wrapper"
               docker pull gcr.io/go-containerregistry/crane:debug || true
@@ -217,10 +238,10 @@ jobs:
             fi
 
             # oras
-            if ! gh_dl_asset oras-project oras "linux_amd64.*\.tar\.gz" /tmp/oras.tgz; then
-              echo "::warning::oras download failed"
-            else
+            if gh_dl_asset oras-project oras "linux_amd64.*\.tar\.gz" /tmp/oras.tgz; then
               sudo tar -xzf /tmp/oras.tgz -C /usr/local/bin oras && sudo chmod +x /usr/local/bin/oras || echo "::warning::oras extract failed"
+            else
+              echo "::warning::oras download failed"
             fi
           fi
 
@@ -229,17 +250,29 @@ jobs:
             echo "[extras] Cloud & K8s CLI"
             sudo apt-get install -y curl gnupg || true
             dl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" awscliv2.zip && unzip -q awscliv2.zip && sudo ./aws/install || echo "::warning::awscli install failed"
-            echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] http://packages.cloud.google.com/apt cloud-sdk main" | sudo tee /etc/apt/sources.list.d/google-cloud-sdk.list
+
+            echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] http://packages.cloud.google.com/apt cloud-sdk main" | sudo tee /etc/apt/sources.list.d/google-cloud-sdk.list >/dev/null
             curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | sudo gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg
             sudo apt-get update -y && sudo apt-get install -y google-cloud-sdk || echo "::warning::gcloud install failed"
+
             curl -fsSL https://aka.ms/InstallAzureCLIDeb | sudo bash || echo "::warning::azure cli install failed"
-            dl https://storage.googleapis.com/kubernetes-release/release/stable.txt /tmp/kver && dl "https://storage.googleapis.com/kubernetes-release/release/$(cat /tmp/kver)/bin/linux/amd64/kubectl" /tmp/kubectl && sudo install -m 0755 /tmp/kubectl /usr/local/bin/kubectl || echo "::warning::kubectl install failed"
+
+            dl https://storage.googleapis.com/kubernetes-release/release/stable.txt /tmp/kver \
+              && dl "https://storage.googleapis.com/kubernetes-release/release/$(cat /tmp/kver)/bin/linux/amd64/kubectl" /tmp/kubectl \
+              && sudo install -m 0755 /tmp/kubectl /usr/local/bin/kubectl || echo "::warning::kubectl install failed"
+
             continue_or_warn "curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash" "helm install failed"
+
             KUSVER="$(gh_api repos/kubernetes-sigs/kustomize/releases/latest | jq -r .tag_name)"
-            dl "https://github.com/kubernetes-sigs/kustomize/releases/download/${KUSVER}/kustomize_${KUSVER#kustomize/}_linux_amd64.tar.gz" /tmp/kus.tgz && sudo tar -xzf /tmp/kus.tgz -C /usr/local/bin kustomize || echo "::warning::kustomize extract failed"
-            dl https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64 /tmp/argocd && sudo install -m 0755 /tmp/argocd /usr/local/bin/argocd || echo "::warning::argocd install failed"
+            dl "https://github.com/kubernetes-sigs/kustomize/releases/download/${KUSVER}/kustomize_${KUSVER#kustomize/}_linux_amd64.tar.gz" /tmp/kus.tgz \
+              && sudo tar -xzf /tmp/kus.tgz -C /usr/local/bin kustomize || echo "::warning::kustomize extract failed"
+
+            dl https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64 /tmp/argocd \
+              && sudo install -m 0755 /tmp/argocd /usr/local/bin/argocd || echo "::warning::argocd install failed"
+
             YQVER="$(gh_api repos/mikefarah/yq/releases/latest | jq -r .tag_name)"
-            dl "https://github.com/mikefarah/yq/releases/download/${YQVER}/yq_linux_amd64" /tmp/yq && sudo install -m 0755 /tmp/yq /usr/local/bin/yq || echo "::warning::yq install failed"
+            dl "https://github.com/mikefarah/yq/releases/download/${YQVER}/yq_linux_amd64" /tmp/yq \
+              && sudo install -m 0755 /tmp/yq /usr/local/bin/yq || echo "::warning::yq install failed"
           fi
 
           # ============ 3) Security & Lint ============
@@ -247,31 +280,37 @@ jobs:
             echo "[extras] Security & Lint"
             sudo apt-get install -y python3-pip shellcheck || true
             GLVER="$(gh_api repos/gitleaks/gitleaks/releases/latest | jq -r .tag_name)"
-            dl "https://github.com/gitleaks/gitleaks/releases/download/${GLVER}/gitleaks_${GLVER#v}_linux_x64.tar.gz" /tmp/gitleaks.tgz && sudo tar -xzf /tmp/gitleaks.tgz -C /usr/local/bin gitleaks || echo "::warning::gitleaks extract failed"
+            dl "https://github.com/gitleaks/gitleaks/releases/download/${GLVER}/gitleaks_${GLVER#v}_linux_x64.tar.gz" /tmp/gitleaks.tgz \
+              && sudo tar -xzf /tmp/gitleaks.tgz -C /usr/local/bin gitleaks || echo "::warning::gitleaks extract failed"
             pip3 install --upgrade pip semgrep bandit || echo "::warning::pip installs failed"
             HADVER="$(gh_api repos/hadolint/hadolint/releases/latest | jq -r .tag_name)"
-            dl "https://github.com/hadolint/hadolint/releases/download/${HADVER}/hadolint-Linux-x86_64" /tmp/hadolint && sudo install -m 0755 /tmp/hadolint /usr/local/bin/hadolint || echo "::warning::hadolint install failed"
+            dl "https://github.com/hadolint/hadolint/releases/download/${HADVER}/hadolint-Linux-x86_64" /tmp/hadolint \
+              && sudo install -m 0755 /tmp/hadolint /usr/local/bin/hadolint || echo "::warning::hadolint install failed"
           fi
 
           # ============ 4) Observability ============
           if [ "$(get_flag obs_tools)" = "true" ]; then
             echo "[extras] Observability"
             sudo apt-get install -y prometheus-node-exporter unzip || true
-            PTVER="$(gh_api repos/grafana/loki/releases/latest | jq -r .tag_name)"
-            dl "https://github.com/grafana/loki/releases/download/${PTVER}/promtail-linux-amd64.zip" /tmp/promtail.zip && unzip -o /tmp/promtail.zip -d /tmp && sudo mv /tmp/promtail-linux-amd64 /usr/local/bin/promtail && sudo chmod +x /usr/local/bin/promtail || echo "::warning::promtail install failed"
 
-            # otelcol: API 자산 탐색 → 실패 시 컨테이너 래퍼
+            PTVER="$(gh_api repos/grafana/loki/releases/latest | jq -r .tag_name)"
+            dl "https://github.com/grafana/loki/releases/download/${PTVER}/promtail-linux-amd64.zip" /tmp/promtail.zip \
+              && unzip -o /tmp/promtail.zip -d /tmp \
+              && sudo mv /tmp/promtail-linux-amd64 /usr/local/bin/promtail \
+              && sudo chmod +x /usr/local/bin/promtail || echo "::warning::promtail install failed"
+
+            # otelcol: 바이너리 실패 시 컨테이너 래퍼
             if ! gh_dl_asset open-telemetry opentelemetry-collector-releases "otelcol_.*linux_amd64.*\.tar\.gz" /tmp/otelcol.tgz; then
               echo "::warning::otelcol binary fetch failed; using docker wrapper"
               docker pull otel/opentelemetry-collector:latest || true
-              sudo tee /usr/local/bin/otelcol >/dev/null <<'SH'
+              sudo tee /usr/local/bin/otelcol >/dev/null <<'EOF'
               #!/usr/bin/env bash
               exec docker run --rm --net=host \
                 -v "$PWD:/work" -w /work \
                 -v /var/log:/var/log \
                 -v /etc:/etc \
                 otel/opentelemetry-collector:latest "$@"
-              SH
+              EOF
               sudo chmod +x /usr/local/bin/otelcol
             else
               sudo tar -xzf /tmp/otelcol.tgz -C /usr/local/bin otelcol || echo "::warning::otelcol extract failed"
@@ -300,7 +339,7 @@ jobs:
             dl https://fastdl.mongodb.org/tools/db/mongodb-database-tools-ubuntu2204-x86_64-100.9.4.deb /tmp/mdb.deb && sudo dpkg -i /tmp/mdb.deb || echo "::warning::mongodb tools install failed"
           fi
 
-          # ============ 7) Build Runtimes (SDKMAN set -u 대응) ============
+          # ============ 7) Build Runtimes ============
           if [ "$(get_flag build_runtimes)" = "true" ]; then
             echo "[extras] Build runtimes"
             curl -s "https://get.sdkman.io" | bash || true
@@ -310,7 +349,6 @@ jobs:
             [ -s "$SDKMAN_DIR/bin/sdkman-init.sh" ] && source "$SDKMAN_DIR/bin/sdkman-init.sh"
             set -u
             sdk help >/dev/null 2>&1 || echo "::warning::sdk help failed"
-
             sudo apt-get install -y python3-pip || true
             pip3 install --upgrade pip pipx poetry || true
             curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash || true
@@ -449,8 +487,8 @@ jobs:
           public class HelloController { @GetMapping("/hello") public String hello(){ return "hello"; } }
           EOF
           mkdir -p "boot-app/src/test/java/${PKG//.//}/it"
-          cat > "boot-app/src/test/java/${PKG//.//}/it/DemoIT.java" <<EOF
-          package ${PKG}.it;
+          cat > "boot-app/src/test/java/${PKG//.//}/it/DemoIT.java" <<'EOF'
+          package PACKAGE_PLACEHOLDER.it;
           import org.junit.jupiter.api.Disabled;
           import org.junit.jupiter.api.Test;
           import org.testcontainers.containers.GenericContainer;
@@ -462,6 +500,7 @@ jobs:
             }
           }
           EOF
+          sed -i "s/PACKAGE_PLACEHOLDER/${PKG//./\\.}/" "boot-app/src/test/java/${PKG//.//}/it/DemoIT.java" || true
           mkdir -p boot-app/src/main/resources
           { echo "server.port=8080"; echo "management.endpoints.web.exposure.include=*"; } >> boot-app/src/main/resources/application.properties
           sed -i 's#</dependencies>#  <dependency>\n    <groupId>org.junit.jupiter</groupId>\n    <artifactId>junit-jupiter</artifactId>\n    <version>5.10.2</version>\n    <scope>test</scope>\n  </dependency>\n  <dependency>\n    <groupId>org.testcontainers</groupId>\n    <artifactId>junit-jupiter</artifactId>\n    <version>1.19.7</version>\n    <scope>test</scope>\n  </dependency>\n  <dependency>\n    <groupId>org.testcontainers</groupId>\n    <artifactId>testcontainers</artifactId>\n    <version>1.19.7</version>\n    <scope>test</scope>\n  </dependency>\n</dependencies>#' boot-app/pom.xml || true
@@ -529,7 +568,7 @@ jobs:
           J="${{ matrix.java }}"
           BUILDER="maven:3.9.9-eclipse-temurin-${J}"
           RUNTIME="eclipse-temurin:${J}-jre"
-          cat > Dockerfile <<DOCKER
+          cat > Dockerfile <<EOF
           FROM ${BUILDER} AS builder
           WORKDIR /workspace
           COPY pom.xml .
@@ -541,7 +580,7 @@ jobs:
           EXPOSE 8080
           USER 1000
           ENTRYPOINT ["java","-jar","/app/app.jar"]
-          DOCKER
+          EOF
           printf "target/\n.git/\n.github/\n**/*.iml\n**/.DS_Store\n*.log\n" > .dockerignore
 
       - name: 🐳 Build image (cached) - tag by JDK
@@ -557,7 +596,7 @@ jobs:
             .
           rm -rf /tmp/.buildx-cache-${{ matrix.java }} || true
           mv /tmp/.buildx-cache-new-${{ matrix.java }} /tmp/.buildx-cache-${{ matrix.java }} || true
-          echo "image=${IMG}" >> $GITHUB_OUTPUT
+          echo "image=${IMG}" >> "$GITHUB_OUTPUT"
           docker images | head -n 20 || true
 
       - name: 🐳 Save image tar
@@ -566,7 +605,7 @@ jobs:
           IMG: ${{ steps.docker_build.outputs.image }}
         run: |
           mkdir -p artifacts || true
-          docker save "${IMG}" -o artifacts/${IMG/:/_}.tar 2>/dev/null || true
+          docker save "${IMG}" -o "artifacts/${IMG/:/_}.tar" 2>/dev/null || true
 
       - name: 🐳 Run container (No-Stop)
         id: docker_run
@@ -578,12 +617,11 @@ jobs:
           PORT=$BASE; [ "$J" = "21" ] && PORT=$((BASE+1))
           NAME="boot-app-${J}-${GITHUB_RUN_ID}"
           docker run -d --name "${NAME}" -p "${PORT}:8080" "${IMG}" 2>/dev/null || true
-          echo "container_name=${NAME}" >> $GITHUB_OUTPUT
-          echo "PORT=${PORT}" >> $GITHUB_OUTPUT
+          echo "container_name=${NAME}" >> "$GITHUB_OUTPUT"
+          echo "PORT=${PORT}" >> "$GITHUB_OUTPUT"
           for i in $(seq 1 30); do
             sleep 2
-            curl -fsS "http://localhost:${PORT}/actuator/health" && break || true
-            curl -fsS "http://localhost:${PORT}/hello" && break || true
+            (curl -fsS "http://localhost:${PORT}/actuator/health" || curl -fsS "http://localhost:${PORT}/hello") && break || true
             echo "[echo] waiting app(${J})... ($i)"
           done
           curl -fsS "http://localhost:${PORT}/hello" || true
@@ -649,7 +687,7 @@ jobs:
           done < <(find release_artifacts -type f -print0)
           echo "== release-bundle =="; (cd release-bundle && ls -al) || true
 
-      - name: 🚀 Create/Update Release with GH CLI (no .git)
+      - name: 🚀 Create/Update Release with GH CLI (skip 0B, per-file upload)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -657,6 +695,8 @@ jobs:
           TAG="auto-${{ github.run_number }}"
           TITLE="Auto Release #${{ github.run_number }}"
           REPO="${{ github.repository }}"
+
+          # 1) Release ensure
           if ! gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
             if [ "${{ inputs.release_prerelease }}" = "true" ]; then
               gh release create "$TAG" --title "$TITLE" --notes "" --prerelease --repo "$REPO"
@@ -664,7 +704,19 @@ jobs:
               gh release create "$TAG" --title "$TITLE" --notes "" --repo "$REPO"
             fi
           fi
-          gh release upload "$TAG" release-bundle/** --clobber --repo "$REPO"
+
+          # 2) Upload non-empty files only (fix 400 Bad Content-Length)
+          find release-bundle -type f -size +0c -print0 | while IFS= read -r -d '' f; do
+            for n in 1 2 3; do
+              if gh release upload "$TAG" "$f" --clobber --repo "$REPO"; then
+                echo "uploaded: $f"
+                break
+              else
+                echo "::warning::upload failed ($n/3) for $f; retrying..."
+                sleep 2
+              fi
+            done
+          done
 
   promote_to_prod:
     needs: [setup_base, build_matrix]
