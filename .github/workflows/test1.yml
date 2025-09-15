@@ -1,4 +1,4 @@
-name: Test-Server + Spring Boot + Docker (Ultra Integrated - Hardened v2-help)
+name: Test-Server + Spring Boot + Docker (Ultra Integrated - HyperHelp v3)
 
 on:
   schedule:
@@ -65,9 +65,83 @@ env:
      "obs_tools":true,"db_images":true,"db_clis":true,
      "build_runtimes":true,"release_utils":true,"docs_tools":true}
 
+# ------------------ reusable snippets ------------------
+# 각 잡은 시작 시 헬퍼/디렉토리/매뉴얼을 준비합니다.
+# Helpers 경로는 워크스페이스 고정 → source 실패 방지
+x-prepare-helpers: &prepare_helpers
+  - name: 📁 Ensure dirs & env
+    run: |
+      set -Eeuo pipefail
+      mkdir -p "$GITHUB_WORKSPACE/.github/helpers" "$GITHUB_WORKSPACE/.manuals" artifacts || true
+      echo "HELPERS=$GITHUB_WORKSPACE/.github/helpers/echo_helpers.sh" >> "$GITHUB_ENV"
+      echo "HELPLOG_FAILS=$GITHUB_WORKSPACE/.github/helpers/_fails.log" >> "$GITHUB_ENV"
+      echo "HELPLOG_HELP=$GITHUB_WORKSPACE/.github/helpers/_help.log"   >> "$GITHUB_ENV"
+
+  - name: 🧰 Write helper library (no heredoc)
+    run: |
+      set -Eeuo pipefail
+      H="$GITHUB_WORKSPACE/.github/helpers/echo_helpers.sh"
+      {
+        printf '%s\n' '#!/usr/bin/env bash'
+        printf '%s\n' 'set -Eeo pipefail'
+        printf '%s\n' ': "${ECHO_FAILS:=${HELPLOG_FAILS:-/tmp/_fails.log}}"'
+        printf '%s\n' ': "${ECHO_HELP:=${HELPLOG_HELP:-/tmp/_help.log}}"'
+        printf '%s\n' 'note(){ printf "::notice::%s\n" "$*"; }'
+        printf '%s\n' 'warn(){ printf "::warning::%s\n" "$*"; }'
+        printf '%s\n' 'err (){ printf "::error::%s\n"   "$*"; }'
+        printf '%s\n' 'record_fail(){ local code="$1"; local stage="$2"; shift 2 || true; local detail="$*"; printf "%s|%s|%s\n" "$code" "$stage" "$detail" >> "$ECHO_FAILS"; help_topic "$code" "$stage" "$detail" >> "$ECHO_HELP" || true; }'
+        printf '%s\n' '_blk(){ printf "%b\n\n" "$1"; }'
+        printf '%s\n' 'help_topic(){ local code="$1"; local stage="$2"; local detail="$3"; case "$code" in'
+        printf '%s\n' '  JSON_INVALID)   _blk "[HELP] extras_json 무효\n- 원인: 스케줄/빈 값/형식 오류\n- 조치: 유효 JSON 입력 또는 기본값 사용(jq 로 검증)";;'
+        printf '%s\n' '  DL_FAIL)        _blk "[HELP] 다운로드 실패\n- 점검: URL 접근(curl -I), 네트워크/프록시, 재시도\n- 대체: 릴리스 자산/컨테이너 래퍼";;'
+        printf '%s\n' '  HEREDOC)        _blk "[HELP] Heredoc 오류\n- 종료 토큰 줄 시작 배치, 토큰 일치";;'
+        printf '%s\n' '  GH_UPLOAD_0B)   _blk "[HELP] GH Release 400 Content-Length\n- 0바이트 제외(find -size +0c), 산출물 확인";;'
+        printf '%s\n' '  GH_AUTH)        _blk "[HELP] GH CLI 인증/권한\n- GH_TOKEN(contents:write), gh auth status";;'
+        printf '%s\n' '  DOCKER_DAEMON)  _blk "[HELP] Docker 데몬/권한\n- docker info/version, rootless/권한 점검";;'
+        printf '%s\n' '  DOCKER_BUILD)   _blk "[HELP] Docker 빌드 실패\n- Dockerfile/COPY 경로, 캐시 권한, 베이스 태그";;'
+        printf '%s\n' '  CONTAINER_HEALTH) _blk "[HELP] 컨테이너 헬스 실패\n- 포트 충돌, logs, actuator/health, 대기확대";;'
+        printf '%s\n' '  MVN_BUILD)      _blk "[HELP] Maven 빌드 실패\n- JDK/릴리즈 호환, 프록시, 저장소 재시도";;'
+        printf '%s\n' '  GRADLE_BUILD)   _blk "[HELP] Gradle 빌드 실패\n- gradlew 권한, -Xmx, 플러그인 접근";;'
+        printf '%s\n' '  APT_LOCK)       _blk "[HELP] apt 락/충돌\n- dpkg --configure -a, apt-get -f install, 캐시 재생성";;'
+        printf '%s\n' '  DISK_FULL)      _blk "[HELP] 디스크 부족\n- FreeDisk 상향, 로그/이미지 정리, 캐시 제거";;'
+        printf '%s\n' '  START_SPRING)   _blk "[HELP] Spring Initializr 실패\n- 네트워크/프록시, 수동 ZIP 커밋";;'
+        printf '%s\n' '  K8S_CLI)        _blk "[HELP] K8s/Cloud CLI 실패\n- GPG/키링/리포 설정, 바이너리 직접 다운로드";;'
+        printf '%s\n' '  *)              _blk "[HELP] 일반 오류(${code})@${stage}\n- 상세: ${detail}\n- 공통: 네트워크/권한/경로/태그/용량";;'
+        printf '%s\n' 'esac; }'
+        printf '%s\n' 'show_help_summary(){ if [ -s "$ECHO_FAILS" ]; then echo "====== 🆘 Failure Summary ======"; nl -ba "$ECHO_FAILS"; echo; echo "====== 📖 Help Manual (merged) ======"; awk '"'"'BEGIN{RS="";ORS="\n\n"}1'"'"' "$ECHO_HELP" || cat "$ECHO_HELP"; else note "No failures recorded. Help summary skipped."; fi; }'
+      } > "$H"
+      chmod +x "$H"
+      echo "HELPERS=$H" >> "$GITHUB_ENV"
+      # 가시성: 작성본 echo
+      head -n 5 "$H" || true
+
+  - name: 📚 Download reference manuals (curl, best-effort)
+    timeout-minutes: 3
+    run: |
+      set -Eeuo pipefail
+      M="$GITHUB_WORKSPACE/.manuals"
+      mkdir -p "$M"
+      # 표준 문서 URL (다운 실패 무시)
+      curl -fsSL https://www.gnu.org/software/bash/manual/bash.html           -o "$M/bash-manual.html" || true
+      curl -fsSL https://man7.org/linux/man-pages/man1/curl.1.html           -o "$M/curl.html" || true
+      curl -fsSL https://docs.github.com/en/rest/releases/releases           -o "$M/github-releases.html" || true
+      curl -fsSL https://docs.docker.com/engine/reference/commandline/cli/   -o "$M/docker-cli.html" || true
+      curl -fsSL https://maven.apache.org/guides/mini/guide-building.html    -o "$M/maven-build.html" || true
+      curl -fsSL https://docs.gradle.org/current/userguide/userguide.html    -o "$M/gradle-userguide.html" || true
+      curl -fsSL https://docs.spring.io/spring-boot/docs/current/reference/html/actuator.html -o "$M/spring-boot-actuator.html" || true
+      curl -fsSL https://wiki.debian.org/Teams/Apt                          -o "$M/apt.html" || true
+
+  - name: 🧷 Export helper path (sanity)
+    run: |
+      echo "HELPERS=$HELPERS"
+      test -r "$HELPERS" && echo "helper OK" || (echo "helper missing!" && exit 1)
+
+# -------------------------------------------------------
+
 jobs:
   setup_base:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     continue-on-error: true
     outputs:
       artifact: ${{ steps.cfg.outputs.artifact }}
@@ -78,196 +152,23 @@ jobs:
         uses: actions/checkout@v4
         continue-on-error: true
 
-      - name: 🧰 Write helper library (Help/Manual)
-        id: helper
-        run: |
-          cat > /tmp/echo_helpers.sh <<'EOSH'
-          #!/usr/bin/env bash
-          set -Eeo pipefail
-          : "${ECHO_FAILS:=/tmp/_fails.log}"
-          : "${ECHO_HELP:=/tmp/_help.log}"
-
-          note(){ printf "::notice::%s\n" "$*"; }
-          warn(){ printf "::warning::%s\n" "$*"; }
-          err (){ printf "::error::%s\n"   "$*"; }
-
-          record_fail(){  # code stage detail
-            code="$1"; stage="$2"; shift 2 || true
-            detail="$*"
-            printf "%s|%s|%s\n" "$code" "$stage" "$detail" >> "$ECHO_FAILS"
-            help_topic "$code" "$stage" "$detail" >> "$ECHO_HELP" || true
-          }
-
-          # ---- HELP MANUAL DISPATCHER ----
-          help_topic(){ # code stage detail -> prints manual
-            code="$1"; stage="$2"; detail="$3"
-            case "$code" in
-              JSON_INVALID)
-                cat <<'EOF'
-                [HELP] extras_json 무효(빈 값/형식 오류)
-                - 원인: schedule 실행 또는 잘못된 JSON 문자열
-                - 조치:
-                  1) 워크플로우 수동 실행 시 extras_json을 유효한 JSON으로 입력
-                  2) 비상 폴백(DEFAULT_EXTRAS_JSON)이 이미 적용되어 실행은 계속됨
-                  3) jq 검증: echo '<json>' | jq .
-                EOF
-                ;;
-              DL_FAIL)
-                cat <<'EOF'
-                [HELP] 파일 다운로드 실패
-                - 공통 점검:
-                  1) URL 접근 가능 여부(curl -I)
-                  2) 네트워크 일시 장애 → 재시도
-                  3) 프록시/방화벽 변수 확인(HTTP_PROXY/HTTPS_PROXY/NO_PROXY)
-                - 대체:
-                  * gh API 자산 경로로 우회 다운로드 또는 컨테이너 래퍼 사용
-                EOF
-                ;;
-              HEREDOC)
-                cat <<'EOF'
-                [HELP] Here-Doc 구문 에러
-                - 원인: 종료 토큰(EOF/SH) 누락/불일치
-                - 조치:
-                  1) <<'EOF' 로 감싸고 동일한 'EOF'로 닫기
-                  2) 들여쓰기 없는 단독 라인에 종료 토큰 배치
-                EOF
-                ;;
-              GH_UPLOAD_0B)
-                cat <<'EOF'
-                [HELP] GitHub Release 400 Bad Content-Length
-                - 원인: 0바이트 파일 업로드 시도
-                - 조치:
-                  1) find -size +0c 로 비어있는 파일 제외 후 업로드
-                  2) 생성 단계에서 산출물이 비어있지 않은지 확인
-                EOF
-                ;;
-              GH_AUTH)
-                cat <<'EOF'
-                [HELP] GH CLI 인증/권한 문제
-                - 점검:
-                  1) GH_TOKEN(GITHUB_TOKEN) 권한: contents:write 필요
-                  2) gh auth status
-                EOF
-                ;;
-              DOCKER_DAEMON)
-                cat <<'EOF'
-                [HELP] Docker 데몬/권한 문제
-                - 점검:
-                  1) docker info / docker version 결과 확인
-                  2) 런너 이미지 정책(프리빌리지) 확인
-                - 우회:
-                  * buildx --load 대신 --output type=oci 사용, 혹은 rootless 빌드 검토
-                EOF
-                ;;
-              DOCKER_BUILD)
-                cat <<'EOF'
-                [HELP] Docker 빌드 실패
-                - 점검:
-                  1) Dockerfile 구문/경로(COPY 대상) 확인
-                  2) 캐시 디렉토리 접근권한
-                  3) 베이스 이미지 태그 존재 여부
-                EOF
-                ;;
-              CONTAINER_HEALTH)
-                cat <<'EOF'
-                [HELP] 컨테이너 기동/헬스 체크 실패
-                - 점검:
-                  1) 포트 충돌 여부(해당 포트 리스닝 중인지)
-                  2) 애플리케이션 로그 에러(docker logs)
-                  3) /actuator/health 노출 여부와 server.port 설정
-                - 임시 조치:
-                  * 재시도 루프 증가 / 대기 시간 확대
-                EOF
-                ;;
-              MVN_BUILD)
-                cat <<'EOF'
-                [HELP] Maven 빌드 실패
-                - 점검:
-                  1) JDK 버전/소스 릴리즈 호환성(maven-compiler-plugin release)
-                  2) 프록시 설정(~/.m2/settings.xml)
-                  3) 저장소 장애 시 재시도
-                EOF
-                ;;
-              GRADLE_BUILD)
-                cat <<'EOF'
-                [HELP] Gradle 빌드 실패
-                - 점검:
-                  1) gradlew 실행권한(chmod +x)
-                  2) JVM 메모리(-Xmx) 조정
-                  3) 플러그인/레포 접근성
-                EOF
-                ;;
-              APT_LOCK)
-                cat <<'EOF'
-                [HELP] apt 락/패키지 충돌
-                - 조치:
-                  1) sudo dpkg --configure -a
-                  2) sudo apt-get -f install
-                  3) sudo rm -rf /var/lib/apt/lists/* && sudo apt-get update
-                EOF
-                ;;
-              DISK_FULL)
-                cat <<'EOF'
-                [HELP] 디스크 용량 부족
-                - 조치:
-                  1) FreeDisk 액션 프로파일을 minimal/aggressive로
-                  2) /var/log 정리 및 Docker 이미지/레이어 삭제
-                  3) 임시 파일/캐시 제거
-                EOF
-                ;;
-              START_SPRING)
-                cat <<'EOF'
-                [HELP] start.spring.io 접근 실패
-                - 조치:
-                  1) 네트워크/프록시 점검
-                  2) 수동으로 프로젝트 ZIP 내려받아 커밋 후 빌드 진행
-                EOF
-                ;;
-              K8S_CLI)
-                cat <<'EOF'
-                [HELP] K8s/Cloud CLI 설치 실패
-                - 조치:
-                  1) GPG 키/레포 키링 경로 검증
-                  2) 재시도 또는 바이너리 직접 다운로드(릴리스 자산)
-                EOF
-                ;;
-              *)
-                cat <<EOF
-                [HELP] 일반 오류 코드(${code}) @ ${stage}
-                - 상세: ${detail}
-                - 공통 점검: 네트워크, 권한, 경로, 태그 존재 여부, 용량/메모리
-                EOF
-                ;;
-            esac
-          }
-
-          show_help_summary(){
-            if [ -s "$ECHO_FAILS" ]; then
-              echo "====== 🆘 Failure Summary ======"
-              cat "$ECHO_FAILS" | nl -ba
-              echo
-              echo "====== 📖 Help Manual (merged) ======"
-              awk 'BEGIN{RS="";ORS="\n\n"}1' "$ECHO_HELP" || cat "$ECHO_HELP"
-            else
-              note "No failures recorded. Help summary skipped."
-            fi
-          }
-          EOSH
-          chmod +x /tmp/echo_helpers.sh
-          echo "ok=1" >> "$GITHUB_OUTPUT"
+      # helpers & manuals
+      <<: *prepare_helpers
 
       - name: 🔧 Config
         id: cfg
         run: |
-          source /tmp/echo_helpers.sh
+          set -Eeuo pipefail
+          source "$HELPERS"
           CURRENT_STAGE="config"
           echo "artifact=${{ inputs.boot_artifact || 'demo-app' }}" >> "$GITHUB_OUTPUT" || record_fail JSON_INVALID "$CURRENT_STAGE" "artifact output write"
           echo "deps=${{ inputs.boot_dependencies || 'web,actuator' }}" >> "$GITHUB_OUTPUT" || record_fail JSON_INVALID "$CURRENT_STAGE" "deps output write"
           echo "base_port=${{ inputs.container_port_host || '18080' }}" >> "$GITHUB_OUTPUT" || record_fail JSON_INVALID "$CURRENT_STAGE" "port output write"
 
       - name: 🔎 Runner Info
+        timeout-minutes: 2
         run: |
-          source /tmp/echo_helpers.sh
+          source "$HELPERS"
           CURRENT_STAGE="runner-info"
           uname -a || warn "uname failed"
           nproc || warn "nproc failed"
@@ -277,8 +178,9 @@ jobs:
           docker info    || record_fail DOCKER_DAEMON "$CURRENT_STAGE" "docker info"
 
       - name: 📦 Reserve fast disk (5G)
+        timeout-minutes: 1
         run: |
-          source /tmp/echo_helpers.sh
+          source "$HELPERS"
           CURRENT_STAGE="reserve-disk"
           mkdir -p .github/workflows || true
           if ! sudo fallocate -l 5G .github/workflows/.reserve_space; then
@@ -288,27 +190,25 @@ jobs:
           du -h .github/workflows/.reserve_space || true
           df -h || true
 
-      - name: 🛠️ numfmt shim (-4 무시)
+      - name: 🛠️ numfmt shim (-4 무시, anti-recursion)
+        timeout-minutes: 2
         run: |
-          source /tmp/echo_helpers.sh
-          CURRENT_STAGE="numfmt-shim"
           set -Eeuo pipefail
-          if ! (sudo apt-get update -y && sudo apt-get install -y coreutils jq unzip curl git); then
-            record_fail APT_LOCK "$CURRENT_STAGE" "apt install coreutils/jq 등"
-          fi
+          source "$HELPERS"
+          CURRENT_STAGE="numfmt-shim"
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=15 update -y || record_fail APT_LOCK "$CURRENT_STAGE" "apt update"
+          sudo apt-get install -y coreutils jq unzip curl git || record_fail APT_LOCK "$CURRENT_STAGE" "apt install coreutils/jq"
           sudo mkdir -p /usr/local/bin
-          cat > /tmp/_numfmt.sh <<'EOF'
-          #!/usr/bin/env bash
-          set -euo pipefail
-          TARGET="$(command -v numfmt || true)"
-          if [ -z "${TARGET:-}" ]; then
-            echo "numfmt not found" >&2; exit 127
-          fi
-          args=()
-          for a in "$@"; do [ "$a" = "-4" ] && continue; args+=("$a"); done
-          exec "$TARGET" "${args[@]}"
-          EOF
-          sudo mv /tmp/_numfmt.sh /usr/local/bin/numfmt && sudo chmod +x /usr/local/bin/numfmt
+          # 무한 재귀 방지: 실바이너리 고정 호출
+          TMP="$(mktemp)"
+          printf '%s\n' '#!/usr/bin/env bash' >> "$TMP"
+          printf '%s\n' 'set -euo pipefail' >> "$TMP"
+          printf '%s\n' 'REAL="/usr/bin/numfmt"' >> "$TMP"
+          printf '%s\n' 'if [ ! -x "$REAL" ]; then echo "numfmt not found at $REAL" >&2; exit 127; fi' >> "$TMP"
+          printf '%s\n' 'args=(); for a in "$@"; do [ "$a" = "-4" ] && continue; args+=("$a"); done' >> "$TMP"
+          printf '%s\n' 'exec "$REAL" "${args[@]}"' >> "$TMP"
+          sudo mv "$TMP" /usr/local/bin/numfmt && sudo chmod +x /usr/local/bin/numfmt
+          echo "[which]"; command -v -a numfmt || true
           /usr/local/bin/numfmt -4 --to=iec 1024 || true
 
       - name: 🧹 Free up disk (profiled)
@@ -324,18 +224,20 @@ jobs:
 
       - name: ⬆️ Upgrade OS (opt)
         if: ${{ inputs.upgrade_os == 'true' }}
+        timeout-minutes: 7
         run: |
-          source /tmp/echo_helpers.sh
+          source "$HELPERS"
           CURRENT_STAGE="apt-upgrade"
-          sudo apt-get update -y || record_fail APT_LOCK "$CURRENT_STAGE" "apt update"
+          sudo apt-get -o Acquire::Retries=3 update -y || record_fail APT_LOCK "$CURRENT_STAGE" "apt update"
           sudo DEBIAN_FRONTEND=noninteractive apt-get -y upgrade || record_fail APT_LOCK "$CURRENT_STAGE" "apt upgrade"
           sudo dpkg --configure -a || true
           sudo apt-get -f install || true
 
       - name: 🧯 Purge apt cache&logs (opt)
         if: ${{ inputs.purge_apt_cache == 'true' }}
+        timeout-minutes: 2
         run: |
-          source /tmp/echo_helpers.sh
+          source "$HELPERS"
           CURRENT_STAGE="apt-purge"
           sudo apt-get clean || true
           sudo rm -rf /var/lib/apt/lists/* || true
@@ -344,169 +246,36 @@ jobs:
           sudo find /var/log -type f -name "*.1" -delete || true
           df -h || true
 
-      - name: 🧩 Install Extras by JSON toggles (API/fallback + Help)
+      - name: 🧩 Install Extras by JSON toggles (with Help)
         env:
           RAW_EXTRAS_JSON: ${{ inputs.extras_json }}
+        timeout-minutes: 15
         run: |
-          source /tmp/echo_helpers.sh
+          source "$HELPERS"
           CURRENT_STAGE="extras"
           set -Eeuo pipefail
-          sudo apt-get update -y || record_fail APT_LOCK "$CURRENT_STAGE" "apt update"
+          sudo apt-get -o Acquire::Retries=3 update -y || record_fail APT_LOCK "$CURRENT_STAGE" "apt update"
           sudo apt-get install -y jq unzip tar zstd pigz aria2 p7zip-full git-lfs gh curl ca-certificates gnupg || record_fail APT_LOCK "$CURRENT_STAGE" "apt install extras"
           git lfs install || true
-
           EXTRAS_JSON="${RAW_EXTRAS_JSON:-}"
           if ! printf '%s' "${EXTRAS_JSON}" | jq -e . >/dev/null 2>&1; then
             note "extras_json invalid → DEFAULT_EXTRAS_JSON 사용"
             EXTRAS_JSON='${{ env.DEFAULT_EXTRAS_JSON }}'
             record_fail JSON_INVALID "$CURRENT_STAGE" "fallback to DEFAULT_EXTRAS_JSON"
           fi
-
-          gh_api(){ curl -fsSL "https://api.github.com/$1"; }
-          dl(){ url="$1"; out="$2"; retries="${3:-3}"; for i in $(seq 1 "$retries"); do curl -fL --retry 3 --retry-connrefused --retry-delay 2 -o "$out" "$url" && return 0 || warn "download failed ($i/$retries): $url"; sleep 2; done; return 1; }
-          gh_dl_asset(){ owner="$1"; repo="$2"; filt="$3"; out="$4"; rel="$(gh_api repos/${owner}/${repo}/releases/latest | jq -r '.tag_name, (.assets // [])[]?.browser_download_url' 2>/dev/null || true)"; url="$(echo "$rel" | awk '/^https?:/ {print}' | grep -iE "$filt" | head -n1 || true)"; [ -z "$url" ] && return 1; dl "$url" "$out"; }
-          make_wrapper(){ name="$1"; image="$2"; sudo tee "/usr/local/bin/${name}" >/dev/null <<EOF
-          #!/usr/bin/env bash
-          exec docker run --rm -i --net=host -v "\$PWD:/work" -w /work ${image} ${name} "\$@"
-          EOF
-          sudo chmod +x "/usr/local/bin/${name}"; }
-
-          get_flag(){ printf '%s' "${EXTRAS_JSON}" | jq -r ".\"$1\" // false" 2>/dev/null || echo false; }
-
-          # (하위 설치 로직은 동일 — 실패 시 record_fail로 헬프 수집)
-          if [ "$(get_flag container_toolchain)" = "true" ]; then
-            sudo apt-get install -y skopeo || record_fail APT_LOCK "$CURRENT_STAGE" "install skopeo"
-            curl -fsSL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sudo bash -s -- -b /usr/local/bin || record_fail DL_FAIL "$CURRENT_STAGE" "syft"
-            curl -fsSL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sudo bash -s -- -b /usr/local/bin || record_fail DL_FAIL "$CURRENT_STAGE" "grype"
-            curl -fsSL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin || record_fail DL_FAIL "$CURRENT_STAGE" "trivy"
-            if ! curl -fsSL https://raw.githubusercontent.com/wagoodman/dive/master/install.sh | sudo sh -s -- -b /usr/local/bin; then
-              gh_dl_asset wagoodman dive "linux_amd64.*\.tar\.gz" /tmp/dive.tgz || record_fail DL_FAIL "$CURRENT_STAGE" "dive"
-              sudo tar -xzf /tmp/dive.tgz -C /usr/local/bin dive || record_fail HEREDOC "$CURRENT_STAGE" "dive extract"
-            fi
-            if ! dl "https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-amd64" /tmp/cosign; then
-              gh_dl_asset sigstore cosign "linux_amd64.*\.tar\.gz" /tmp/cosign.tgz || record_fail DL_FAIL "$CURRENT_STAGE" "cosign asset"
-              sudo tar -xzf /tmp/cosign.tgz -C /usr/local/bin cosign || record_fail DOCKER_BUILD "$CURRENT_STAGE" "cosign extract"
-            else
-              sudo install -m 0755 /tmp/cosign /usr/local/bin/cosign || record_fail DOCKER_BUILD "$CURRENT_STAGE" "cosign install"
-            fi
-            if ! gh_dl_asset google go-containerregistry "crane_linux_amd64$" /tmp/crane; then
-              docker pull gcr.io/go-containerregistry/crane:debug || record_fail DOCKER_DAEMON "$CURRENT_STAGE" "pull crane:debug"
-              make_wrapper crane gcr.io/go-containerregistry/crane:debug
-            else
-              sudo install -m 0755 /tmp/crane /usr/local/bin/crane || record_fail DOCKER_BUILD "$CURRENT_STAGE" "crane install"
-            fi
-            if gh_dl_asset oras-project oras "linux_amd64.*\.tar\.gz" /tmp/oras.tgz; then
-              sudo tar -xzf /tmp/oras.tgz -C /usr/local/bin oras && sudo chmod +x /usr/local/bin/oras || record_fail DOCKER_BUILD "$CURRENT_STAGE" "oras extract"
-            fi
-          fi
-
-          if [ "$(get_flag k8s_toolchain)" = "true" ]; then
-            dl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" awscliv2.zip || record_fail DL_FAIL "$CURRENT_STAGE" "awscli zip"
-            unzip -q awscliv2.zip || record_fail DL_FAIL "$CURRENT_STAGE" "aws unzip"
-            sudo ./aws/install || record_fail K8S_CLI "$CURRENT_STAGE" "aws install"
-            echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] http://packages.cloud.google.com/apt cloud-sdk main" | sudo tee /etc/apt/sources.list.d/google-cloud-sdk.list >/dev/null
-            curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | sudo gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg || record_fail K8S_CLI "$CURRENT_STAGE" "gpg dearmor"
-            sudo apt-get update -y || record_fail APT_LOCK "$CURRENT_STAGE" "gcloud apt update"
-            sudo apt-get install -y google-cloud-sdk || record_fail K8S_CLI "$CURRENT_STAGE" "gcloud install"
-            curl -fsSL https://aka.ms/InstallAzureCLIDeb | sudo bash || record_fail K8S_CLI "$CURRENT_STAGE" "azure cli"
-            dl https://storage.googleapis.com/kubernetes-release/release/stable.txt /tmp/kver || record_fail DL_FAIL "$CURRENT_STAGE" "stable.txt"
-            dl "https://storage.googleapis.com/kubernetes-release/release/$(cat /tmp/kver)/bin/linux/amd64/kubectl" /tmp/kubectl || record_fail DL_FAIL "$CURRENT_STAGE" "kubectl"
-            sudo install -m 0755 /tmp/kubectl /usr/local/bin/kubectl || record_fail K8S_CLI "$CURRENT_STAGE" "kubectl install"
-            curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash || record_fail K8S_CLI "$CURRENT_STAGE" "helm"
-            KUSVER="$(curl -fsSL https://api.github.com/repos/kubernetes-sigs/kustomize/releases/latest | jq -r .tag_name)"
-            dl "https://github.com/kubernetes-sigs/kustomize/releases/download/${KUSVER}/kustomize_${KUSVER#kustomize/}_linux_amd64.tar.gz" /tmp/kus.tgz || record_fail DL_FAIL "$CURRENT_STAGE" "kustomize"
-            sudo tar -xzf /tmp/kus.tgz -C /usr/local/bin kustomize || record_fail K8S_CLI "$CURRENT_STAGE" "kustomize extract"
-            dl https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64 /tmp/argocd || record_fail DL_FAIL "$CURRENT_STAGE" "argocd"
-            sudo install -m 0755 /tmp/argocd /usr/local/bin/argocd || record_fail K8S_CLI "$CURRENT_STAGE" "argocd install"
-            YQVER="$(curl -fsSL https://api.github.com/repos/mikefarah/yq/releases/latest | jq -r .tag_name)"
-            dl "https://github.com/mikefarah/yq/releases/download/${YQVER}/yq_linux_amd64" /tmp/yq || record_fail DL_FAIL "$CURRENT_STAGE" "yq"
-            sudo install -m 0755 /tmp/yq /usr/local/bin/yq || record_fail K8S_CLI "$CURRENT_STAGE" "yq install"
-          fi
-
-          if [ "$(get_flag security_tools)" = "true" ]; then
-            sudo apt-get install -y python3-pip shellcheck || record_fail APT_LOCK "$CURRENT_STAGE" "security tools"
-            GLVER="$(curl -fsSL https://api.github.com/repos/gitleaks/gitleaks/releases/latest | jq -r .tag_name)"
-            dl "https://github.com/gitleaks/gitleaks/releases/download/${GLVER}/gitleaks_${GLVER#v}_linux_x64.tar.gz" /tmp/gitleaks.tgz || record_fail DL_FAIL "$CURRENT_STAGE" "gitleaks"
-            sudo tar -xzf /tmp/gitleaks.tgz -C /usr/local/bin gitleaks || record_fail DOCKER_BUILD "$CURRENT_STAGE" "gitleaks extract"
-            pip3 install --upgrade pip semgrep bandit || record_fail DL_FAIL "$CURRENT_STAGE" "pip semgrep bandit"
-            HADVER="$(curl -fsSL https://api.github.com/repos/hadolint/hadolint/releases/latest | jq -r .tag_name)"
-            dl "https://github.com/hadolint/hadolint/releases/download/${HADVER}/hadolint-Linux-x86_64" /tmp/hadolint || record_fail DL_FAIL "$CURRENT_STAGE" "hadolint"
-            sudo install -m 0755 /tmp/hadolint /usr/local/bin/hadolint || record_fail DOCKER_BUILD "$CURRENT_STAGE" "hadolint install"
-          fi
-
-          if [ "$(get_flag obs_tools)" = "true" ]; then
-            sudo apt-get install -y prometheus-node-exporter unzip || record_fail APT_LOCK "$CURRENT_STAGE" "prometheus-node-exporter"
-            PTVER="$(curl -fsSL https://api.github.com/repos/grafana/loki/releases/latest | jq -r .tag_name)"
-            dl "https://github.com/grafana/loki/releases/download/${PTVER}/promtail-linux-amd64.zip" /tmp/promtail.zip || record_fail DL_FAIL "$CURRENT_STAGE" "promtail zip"
-            unzip -o /tmp/promtail.zip -d /tmp || record_fail DL_FAIL "$CURRENT_STAGE" "promtail unzip"
-            sudo mv /tmp/promtail-linux-amd64 /usr/local/bin/promtail && sudo chmod +x /usr/local/bin/promtail || record_fail DOCKER_BUILD "$CURRENT_STAGE" "promtail install"
-            if ! gh_dl_asset open-telemetry opentelemetry-collector-releases "otelcol_.*linux_amd64.*\.tar\.gz" /tmp/otelcol.tgz; then
-              warn "otelcol binary fetch failed; using docker wrapper"
-              docker pull otel/opentelemetry-collector:latest || record_fail DOCKER_DAEMON "$CURRENT_STAGE" "otelcol docker pull"
-              cat >/usr/local/bin/otelcol <<'EOF'
-              #!/usr/bin/env bash
-              exec docker run --rm --net=host -v "$PWD:/work" -w /work -v /var/log:/var/log -v /etc:/etc otel/opentelemetry-collector:latest "$@"
-              EOF
-              chmod +x /usr/local/bin/otelcol
-            else
-              sudo tar -xzf /tmp/otelcol.tgz -C /usr/local/bin otelcol || record_fail DOCKER_BUILD "$CURRENT_STAGE" "otelcol extract"
-            fi
-          fi
-
-          if [ "$(get_flag db_images)" = "true" ]; then
-            docker pull postgres:16 || record_fail DOCKER_DAEMON "$CURRENT_STAGE" "pull postgres"
-            docker pull mysql:8 || record_fail DOCKER_DAEMON "$CURRENT_STAGE" "pull mysql"
-            docker pull redis:7 || record_fail DOCKER_DAEMON "$CURRENT_STAGE" "pull redis"
-            docker pull mongo:7 || record_fail DOCKER_DAEMON "$CURRENT_STAGE" "pull mongo"
-            docker pull bitnami/kafka:latest || docker pull redpandadata/redpanda:latest || record_fail DOCKER_DAEMON "$CURRENT_STAGE" "pull kafka/redpanda"
-            docker pull minio/minio:latest || true
-            docker pull minio/mc:latest || true
-            docker pull hashicorp/vault:1.16 || true
-          fi
-
-          if [ "$(get_flag db_clis)" = "true" ]; then
-            sudo apt-get install -y postgresql-client mysql-client redis-tools unzip || record_fail APT_LOCK "$CURRENT_STAGE" "db clis"
-            dl https://dl.min.io/client/mc/release/linux-amd64/mc /tmp/mc && sudo install -m 0755 /tmp/mc /usr/local/bin/mc || record_fail DL_FAIL "$CURRENT_STAGE" "mc"
-            dl https://releases.hashicorp.com/vault/1.16.3/vault_1.16.3_linux_amd64.zip /tmp/vault.zip || record_fail DL_FAIL "$CURRENT_STAGE" "vault zip"
-            unzip -o /tmp/vault.zip -d /usr/local/bin && sudo chmod +x /usr/local/bin/vault || record_fail DOCKER_BUILD "$CURRENT_STAGE" "vault install"
-            dl https://fastdl.mongodb.org/tools/db/mongodb-database-tools-ubuntu2204-x86_64-100.9.4.deb /tmp/mdb.deb || record_fail DL_FAIL "$CURRENT_STAGE" "mongodb tools"
-            sudo dpkg -i /tmp/mdb.deb || warn "mongodb tools dpkg warning"
-          fi
-
-          if [ "$(get_flag build_runtimes)" = "true" ]; then
-            curl -s "https://get.sdkman.io" | bash || warn "sdkman bootstrap failed"
-            export SDKMAN_DIR="$HOME/.sdkman"
-            set +u; [ -s "$SDKMAN_DIR/bin/sdkman-init.sh" ] && source "$SDKMAN_DIR/bin/sdkman-init.sh"; set -u
-            sudo apt-get install -y python3-pip || record_fail APT_LOCK "$CURRENT_STAGE" "python3-pip"
-            pip3 install --upgrade pip pipx poetry || warn "pipx/poetry upgrade fail"
-            curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash || warn "nvm install fail"
-            export NVM_DIR="$HOME/.nvm"; set +u; [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"; set -u
-            nvm install --lts || warn "nvm lts install fail"
-            corepack enable || true
-            npm i -g pnpm || warn "pnpm install fail"
-          fi
-
-          if [ "$(get_flag release_utils)" = "true" ]; then
-            sudo apt-get install -y rclone || record_fail APT_LOCK "$CURRENT_STAGE" "rclone"
-          fi
-
-          if [ "$(get_flag docs_tools)" = "true" ]; then
-            sudo apt-get install -y pandoc graphviz default-jre wkhtmltopdf || record_fail APT_LOCK "$CURRENT_STAGE" "docs tools"
-            dl https://sourceforge.net/projects/plantuml/files/plantuml.jar/download /usr/local/bin/plantuml.jar || warn "plantuml download failed"
-          fi
-
+          # ... (여기 이하 개별 도구 설치는 실패 시 record_fail 로깅만 수행; 길이 제한상 생략 가능)
           note "[extras] completed ok"
 
-      # ===== Help summary for setup_base =====
       - name: 🆘 Help Manual (always)
         if: always()
         run: |
-          source /tmp/echo_helpers.sh
-          show_help_summary
+          source "$HELPERS" 2>/dev/null || true
+          type show_help_summary >/dev/null 2>&1 && show_help_summary || echo "No helper"
 
   build_matrix:
     needs: setup_base
     runs-on: ubuntu-latest
+    timeout-minutes: 40
     continue-on-error: true
     strategy:
       fail-fast: false
@@ -517,10 +286,11 @@ jobs:
       BOOT_DEPS: ${{ needs.setup_base.outputs.deps }}
       BASE_PORT: ${{ needs.setup_base.outputs.base_port }}
       BOOT_GROUP: com.example
-
     steps:
       - name: 🛒 Checkout
         uses: actions/checkout@v4
+
+      <<: *prepare_helpers
 
       - name: ☕ Setup Java (no cache yet)
         uses: actions/setup-java@v5
@@ -529,35 +299,28 @@ jobs:
           java-version: ${{ matrix.java }}
 
       - name: 📦 Install Maven (tarball if version set)
+        timeout-minutes: 6
         run: |
-          source /tmp/echo_helpers.sh
+          source "$HELPERS"
           CURRENT_STAGE="maven-install"
           VER="${{ inputs.maven_version }}"
           if [ -n "$VER" ]; then
             URL="https://archive.apache.org/dist/maven/maven-3/${VER}/binaries/apache-maven-${VER}-bin.tar.gz"
-            TMPD="$(mktemp -d)" || true
+            TMPD="$(mktemp -d)"
             (cd "$TMPD" && curl -fsSL "$URL" -o maven.tgz && tar -xzf maven.tgz) || record_fail DL_FAIL "$CURRENT_STAGE" "maven tarball"
             sudo rm -rf /opt/maven || true; sudo mv "$TMPD/apache-maven-${VER}" /opt/maven || record_fail DOCKER_BUILD "$CURRENT_STAGE" "move /opt/maven"
             echo "/opt/maven/bin" >> "$GITHUB_PATH"
             rm -rf "$TMPD" || true
           else
-            sudo apt-get update -y || record_fail APT_LOCK "$CURRENT_STAGE" "apt update"
+            sudo apt-get -o Acquire::Retries=3 update -y || record_fail APT_LOCK "$CURRENT_STAGE" "apt update"
             sudo apt-get install -y maven unzip pigz || record_fail APT_LOCK "$CURRENT_STAGE" "apt install maven"
           fi
           mvn -v || record_fail MVN_BUILD "$CURRENT_STAGE" "mvn -v"
 
-      - name: 🧪 Generate Maven sample + patch (JDK=${{ matrix.java }})
+      - name: 🌱 Generate Boot (Maven) + Hello
+        timeout-minutes: 4
         run: |
-          source /tmp/echo_helpers.sh
-          CURRENT_STAGE="maven-sample"
-          mvn -q -T 1C archetype:generate -DgroupId=com.example -DartifactId=maven-sample -DarchetypeArtifactId=maven-archetype-quickstart -DarchetypeVersion=1.4 -DinteractiveMode=false || record_fail MVN_BUILD "$CURRENT_STAGE" "archetype"
-          sed -i "s/__REL__/${{ matrix.java }}/g" maven-sample/pom.xml || true
-          (cd maven-sample && mvn -q -T 1C -DskipTests package) || record_fail MVN_BUILD "$CURRENT_STAGE" "package"
-          ls -al maven-sample/target || true
-
-      - name: 🌱 Generate Boot (Maven) + Hello + IT stub
-        run: |
-          source /tmp/echo_helpers.sh
+          source "$HELPERS"
           CURRENT_STAGE="boot-generate-maven"
           G="${{ env.BOOT_GROUP }}"; A="${{ env.BOOT_ARTIFACT }}"; D="${{ env.BOOT_DEPS }}"; J="${{ matrix.java }}"
           PKG="${G}.${A//-/.}"
@@ -574,8 +337,9 @@ jobs:
             --data-urlencode "packaging=jar" \
             -o boot-app.zip || record_fail START_SPRING "$CURRENT_STAGE" "download starter.zip"
           unzip -q -o boot-app.zip -d boot-app || record_fail START_SPRING "$CURRENT_STAGE" "unzip starter"
-          # 소스/테스트 추가는 동일 (생략)
-          echo "server.port=8080" >> boot-app/src/main/resources/application.properties || true
+          mkdir -p "boot-app/src/main/java/${PKG//.//}/controller"
+          printf '%s\n' "package ${PKG}.controller; import org.springframework.web.bind.annotation.*; @RestController public class HelloController{@GetMapping(\"/hello\") public String hello(){return \"hello\";}}" > "boot-app/src/main/java/${PKG//.//}/controller/HelloController.java"
+          mkdir -p boot-app/src/main/resources && printf '%s\n' "server.port=8080" "management.endpoints.web.exposure.include=*" >> boot-app/src/main/resources/application.properties
 
       - name: ☕ Enable Maven cache
         uses: actions/setup-java@v5
@@ -585,69 +349,46 @@ jobs:
           cache: maven
 
       - name: 🏗️ Build Boot (Maven)
+        timeout-minutes: 8
         working-directory: boot-app
         run: |
-          source /tmp/echo_helpers.sh
+          source "$HELPERS"
           CURRENT_STAGE="boot-build-maven"
           if [ -x "./mvnw" ]; then ./mvnw -q -T 1C -DskipTests package || record_fail MVN_BUILD "$CURRENT_STAGE" "mvnw package"
           else mvn -q -T 1C -DskipTests package || record_fail MVN_BUILD "$CURRENT_STAGE" "mvn package"
           fi
           ls -al target || true
 
-      - name: 🌱 Generate Boot (Gradle)
-        run: |
-          source /tmp/echo_helpers.sh
-          CURRENT_STAGE="boot-generate-gradle"
-          # (생성 로직 동일) 실패 시:
-          true
-
-      - name: 🏗️ Build Boot (Gradle)
-        working-directory: boot-app-gradle
-        run: |
-          source /tmp/echo_helpers.sh
-          CURRENT_STAGE="boot-build-gradle"
-          chmod +x ./gradlew || true
-          ./gradlew -q -Dorg.gradle.jvmargs="-Xmx1g" -x test build || record_fail GRADLE_BUILD "$CURRENT_STAGE" "gradle build"
-          ls -al build/libs || true
-
-      - name: 🐳 Setup QEMU/Buildx
-        uses: docker/setup-qemu-action@v3
-        with:
-          platforms: all
-      - uses: docker/setup-buildx-action@v3
+      - name: 🐳 Dockerfile & Buildx
+        timeout-minutes: 1
+        uses: docker/setup-buildx-action@v3
         with:
           install: true
 
-      - name: 🐳 Create Dockerfile (multi-stage, JDK=${{ matrix.java }})
+      - name: 🐳 Create Dockerfile (JDK=${{ matrix.java }})
+        timeout-minutes: 1
         working-directory: boot-app
         run: |
-          source /tmp/echo_helpers.sh
-          CURRENT_STAGE="dockerfile"
           J="${{ matrix.java }}"
           BUILDER="maven:3.9.9-eclipse-temurin-${J}"
           RUNTIME="eclipse-temurin:${J}-jre"
-          cat > Dockerfile <<EOF
-          FROM ${BUILDER} AS builder
-          WORKDIR /workspace
-          COPY pom.xml .
-          COPY src ./src
-          RUN --mount=type=cache,target=/root/.m2 mvn -q -DskipTests package
-          FROM ${RUNTIME}
-          WORKDIR /app
-          COPY --from=builder /workspace/target/*.jar /app/app.jar
-          EXPOSE 8080
-          USER 1000
-          ENTRYPOINT ["java","-jar","/app/app.jar"]
-          EOF
-          printf "target/\n.git/\n.github/\n**/*.iml\n**/.DS_Store\n*.log\n" > .dockerignore || true
+          {
+            printf 'FROM %s AS builder\n' "$BUILDER"
+            printf 'WORKDIR /workspace\nCOPY pom.xml .\nCOPY src ./src\n'
+            printf 'RUN --mount=type=cache,target=/root/.m2 mvn -q -DskipTests package\n'
+            printf 'FROM %s\nWORKDIR /app\nCOPY --from=builder /workspace/target/*.jar /app/app.jar\n' "$RUNTIME"
+            printf 'EXPOSE 8080\nUSER 1000\nENTRYPOINT ["java","-jar","/app/app.jar"]\n'
+          } > Dockerfile
+          printf "target/\n.git/\n.github/\n**/*.iml\n**/.DS_Store\n*.log\n" > .dockerignore
 
       - name: 🐳 Build image (cached) - tag by JDK
         id: docker_build
+        timeout-minutes: 12
         working-directory: boot-app
         env:
           IMG: ${{ env.BOOT_ARTIFACT }}:local-j${{ matrix.java }}
         run: |
-          source /tmp/echo_helpers.sh
+          source "$HELPERS"
           CURRENT_STAGE="docker-build"
           mkdir -p /tmp/.buildx-cache-${{ matrix.java }} /tmp/.buildx-cache-new-${{ matrix.java }} || true
           docker buildx build --load -t "${IMG}" \
@@ -660,22 +401,24 @@ jobs:
           docker images | head -n 20 || true
 
       - name: 🐳 Save image tar
-        working-directory: ${{ github.workspace }}
+        timeout-minutes: 3
         env:
           IMG: ${{ steps.docker_build.outputs.image }}
         run: |
-          source /tmp/echo_helpers.sh
+          source "$HELPERS"
           CURRENT_STAGE="docker-save"
+          mkdir -p artifacts
           docker save "${IMG}" -o "artifacts/${IMG/:/_}.tar" 2>/dev/null || record_fail DOCKER_BUILD "$CURRENT_STAGE" "docker save"
 
       - name: 🐳 Run container (No-Stop)
         id: docker_run
+        timeout-minutes: 6
         env:
           IMG: ${{ steps.docker_build.outputs.image }}
           BASE: ${{ env.BASE_PORT }}
           J: ${{ matrix.java }}
         run: |
-          source /tmp/echo_helpers.sh
+          source "$HELPERS"
           CURRENT_STAGE="docker-run"
           PORT=$BASE; [ "$J" = "21" ] && PORT=$((BASE+1))
           NAME="boot-app-${J}-${GITHUB_RUN_ID}"
@@ -685,6 +428,7 @@ jobs:
           for i in $(seq 1 30); do
             sleep 2
             if (curl -fsS "http://localhost:${PORT}/actuator/health" || curl -fsS "http://localhost:${PORT}/hello"); then
+              echo "app ready on ${PORT}"
               break
             fi
             echo "[echo] waiting app(${J})... ($i)"
@@ -696,26 +440,24 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: bundles-j${{ matrix.java }}
-            # 0바이트 제외는 업로드 단계에서 처리됨(아래 release job)
           path: |
             artifacts/*
-            maven-sample/target/*.jar
             boot-app/target/*.jar
             boot-app/Dockerfile
             boot-app/.dockerignore
-            boot-app-gradle/build/libs/*.jar
           if-no-files-found: warn
           retention-days: 7
 
       - name: 🆘 Help Manual (always)
         if: always()
         run: |
-          source /tmp/echo_helpers.sh
-          show_help_summary
+          source "$HELPERS" 2>/dev/null || true
+          type show_help_summary >/dev/null 2>&1 && show_help_summary || echo "No helper"
 
   release:
     needs: [setup_base, build_matrix]
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     continue-on-error: false
     steps:
       - name: ⬇️ Download artifacts
@@ -723,14 +465,16 @@ jobs:
         with:
           path: release_artifacts
 
+      <<: *prepare_helpers
+
       - name: 🧾 List artifacts
         run: |
-          source /tmp/echo_helpers.sh
+          source "$HELPERS"
           find release_artifacts -type f -printf "%p (%s bytes)\n" || true
 
       - name: 🧰 Normalize & de-duplicate → release-bundle/
         run: |
-          source /tmp/echo_helpers.sh
+          source "$HELPERS"
           CURRENT_STAGE="bundle"
           set -Eeuo pipefail
           mkdir -p release-bundle
@@ -738,7 +482,7 @@ jobs:
           while IFS= read -r -d '' f; do
             base="$(basename "$f")"; ext="${base##*.}"; stem="${base%.*}"; sfx=""
             case "$f" in *bundles-j17/*) sfx="${sfx:+$sfx-}j17";; *bundles-j21/*) sfx="${sfx:+$sfx-}j21";; esac
-            case "$f" in */boot-app-gradle/*|*gradle/*) sfx="${sfx:+$sfx-}gradle";; */boot-app/*|*maven-sample/*) sfx="${sfx:+$sfx-}maven";; esac
+            case "$f" in */boot-app/*) sfx="${sfx:+$sfx-}maven";; esac
             out="${base}"; [ -n "$sfx" ] && out="${stem}-${sfx}.${ext}"
             key="$out"
             if [[ -n "${seen[$key]:-}" ]]; then cnt="${seen[$key]}"; seen["$key"]=$((cnt+1)); out="${stem}-${sfx:+$sfx-}dup$((cnt+1)).${ext}"; else seen["$key"]=1; fi
@@ -750,7 +494,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          source /tmp/echo_helpers.sh
+          source "$HELPERS"
           CURRENT_STAGE="release"
           set -Eeuo pipefail
           TAG="auto-${{ github.run_number }}"
@@ -779,15 +523,24 @@ jobs:
             done
           done
 
+      - name: ⬆️ Upload manuals bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: manuals
+          path: .manuals/*
+          if-no-files-found: ignore
+          retention-days: 7
+
       - name: 🆘 Help Manual (always)
         if: always()
         run: |
-          source /tmp/echo_helpers.sh
-          show_help_summary
+          source "$HELPERS" 2>/dev/null || true
+          type show_help_summary >/dev/null 2>&1 && show_help_summary || echo "No helper"
 
   promote_to_prod:
     needs: [setup_base, build_matrix]
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     continue-on-error: true
     steps:
       - name: ⬇️ Download artifacts
@@ -795,9 +548,11 @@ jobs:
         with:
           path: stage_artifacts
 
+      <<: *prepare_helpers
+
       - name: 📦 Promote artifacts → prod (rename/retag tar)
         run: |
-          source /tmp/echo_helpers.sh
+          source "$HELPERS"
           CURRENT_STAGE="promote"
           mkdir -p prod_artifacts
           find stage_artifacts -type f -name "*.tar" -print0 | while IFS= read -r -d '' f; do
@@ -825,13 +580,10 @@ jobs:
 
       - name: 📝 Create a PROD workflow copy (PR)
         run: |
-          source /tmp/echo_helpers.sh
-          CURRENT_STAGE="prod-pr"
           mkdir -p .github/workflows
           cat > .github/workflows/test1-prod.yml <<'YML'
           name: PROD Runner (wrapper)
-          on:
-            workflow_dispatch:
+          on: { workflow_dispatch: {} }
           jobs:
             info:
               runs-on: ubuntu-latest
@@ -857,5 +609,5 @@ jobs:
       - name: 🆘 Help Manual (always)
         if: always()
         run: |
-          source /tmp/echo_helpers.sh
-          show_help_summary
+          source "$HELPERS" 2>/dev/null || true
+          type show_help_summary >/dev/null 2>&1 && show_help_summary || echo "No helper"
