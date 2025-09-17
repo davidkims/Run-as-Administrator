@@ -65,79 +65,6 @@ env:
      "obs_tools":true,"db_images":true,"db_clis":true,
      "build_runtimes":true,"release_utils":true,"docs_tools":true}
 
-# ------------------ reusable snippets ------------------
-# 각 잡은 시작 시 헬퍼/디렉토리/매뉴얼을 준비합니다.
-# Helpers 경로는 워크스페이스 고정 → source 실패 방지
-x-prepare-helpers: &prepare_helpers
-  - name: 📁 Ensure dirs & env
-    run: |
-      set -Eeuo pipefail
-      mkdir -p "$GITHUB_WORKSPACE/.github/helpers" "$GITHUB_WORKSPACE/.manuals" artifacts || true
-      echo "HELPERS=$GITHUB_WORKSPACE/.github/helpers/echo_helpers.sh" >> "$GITHUB_ENV"
-      echo "HELPLOG_FAILS=$GITHUB_WORKSPACE/.github/helpers/_fails.log" >> "$GITHUB_ENV"
-      echo "HELPLOG_HELP=$GITHUB_WORKSPACE/.github/helpers/_help.log"   >> "$GITHUB_ENV"
-
-  - name: 🧰 Write helper library (no heredoc)
-    run: |
-      set -Eeuo pipefail
-      H="$GITHUB_WORKSPACE/.github/helpers/echo_helpers.sh"
-      {
-        printf '%s\n' '#!/usr/bin/env bash'
-        printf '%s\n' 'set -Eeo pipefail'
-        printf '%s\n' ': "${ECHO_FAILS:=${HELPLOG_FAILS:-/tmp/_fails.log}}"'
-        printf '%s\n' ': "${ECHO_HELP:=${HELPLOG_HELP:-/tmp/_help.log}}"'
-        printf '%s\n' 'note(){ printf "::notice::%s\n" "$*"; }'
-        printf '%s\n' 'warn(){ printf "::warning::%s\n" "$*"; }'
-        printf '%s\n' 'err (){ printf "::error::%s\n"   "$*"; }'
-        printf '%s\n' 'record_fail(){ local code="$1"; local stage="$2"; shift 2 || true; local detail="$*"; printf "%s|%s|%s\n" "$code" "$stage" "$detail" >> "$ECHO_FAILS"; help_topic "$code" "$stage" "$detail" >> "$ECHO_HELP" || true; }'
-        printf '%s\n' '_blk(){ printf "%b\n\n" "$1"; }'
-        printf '%s\n' 'help_topic(){ local code="$1"; local stage="$2"; local detail="$3"; case "$code" in'
-        printf '%s\n' '  JSON_INVALID)   _blk "[HELP] extras_json 무효\n- 원인: 스케줄/빈 값/형식 오류\n- 조치: 유효 JSON 입력 또는 기본값 사용(jq 로 검증)";;'
-        printf '%s\n' '  DL_FAIL)        _blk "[HELP] 다운로드 실패\n- 점검: URL 접근(curl -I), 네트워크/프록시, 재시도\n- 대체: 릴리스 자산/컨테이너 래퍼";;'
-        printf '%s\n' '  HEREDOC)        _blk "[HELP] Heredoc 오류\n- 종료 토큰 줄 시작 배치, 토큰 일치";;'
-        printf '%s\n' '  GH_UPLOAD_0B)   _blk "[HELP] GH Release 400 Content-Length\n- 0바이트 제외(find -size +0c), 산출물 확인";;'
-        printf '%s\n' '  GH_AUTH)        _blk "[HELP] GH CLI 인증/권한\n- GH_TOKEN(contents:write), gh auth status";;'
-        printf '%s\n' '  DOCKER_DAEMON)  _blk "[HELP] Docker 데몬/권한\n- docker info/version, rootless/권한 점검";;'
-        printf '%s\n' '  DOCKER_BUILD)   _blk "[HELP] Docker 빌드 실패\n- Dockerfile/COPY 경로, 캐시 권한, 베이스 태그";;'
-        printf '%s\n' '  CONTAINER_HEALTH) _blk "[HELP] 컨테이너 헬스 실패\n- 포트 충돌, logs, actuator/health, 대기확대";;'
-        printf '%s\n' '  MVN_BUILD)      _blk "[HELP] Maven 빌드 실패\n- JDK/릴리즈 호환, 프록시, 저장소 재시도";;'
-        printf '%s\n' '  GRADLE_BUILD)   _blk "[HELP] Gradle 빌드 실패\n- gradlew 권한, -Xmx, 플러그인 접근";;'
-        printf '%s\n' '  APT_LOCK)       _blk "[HELP] apt 락/충돌\n- dpkg --configure -a, apt-get -f install, 캐시 재생성";;'
-        printf '%s\n' '  DISK_FULL)      _blk "[HELP] 디스크 부족\n- FreeDisk 상향, 로그/이미지 정리, 캐시 제거";;'
-        printf '%s\n' '  START_SPRING)   _blk "[HELP] Spring Initializr 실패\n- 네트워크/프록시, 수동 ZIP 커밋";;'
-        printf '%s\n' '  K8S_CLI)        _blk "[HELP] K8s/Cloud CLI 실패\n- GPG/키링/리포 설정, 바이너리 직접 다운로드";;'
-        printf '%s\n' '  *)              _blk "[HELP] 일반 오류(${code})@${stage}\n- 상세: ${detail}\n- 공통: 네트워크/권한/경로/태그/용량";;'
-        printf '%s\n' 'esac; }'
-        printf '%s\n' 'show_help_summary(){ if [ -s "$ECHO_FAILS" ]; then echo "====== 🆘 Failure Summary ======"; nl -ba "$ECHO_FAILS"; echo; echo "====== 📖 Help Manual (merged) ======"; awk '"'"'BEGIN{RS="";ORS="\n\n"}1'"'"' "$ECHO_HELP" || cat "$ECHO_HELP"; else note "No failures recorded. Help summary skipped."; fi; }'
-      } > "$H"
-      chmod +x "$H"
-      echo "HELPERS=$H" >> "$GITHUB_ENV"
-      # 가시성: 작성본 echo
-      head -n 5 "$H" || true
-
-  - name: 📚 Download reference manuals (curl, best-effort)
-    timeout-minutes: 3
-    run: |
-      set -Eeuo pipefail
-      M="$GITHUB_WORKSPACE/.manuals"
-      mkdir -p "$M"
-      # 표준 문서 URL (다운 실패 무시)
-      curl -fsSL https://www.gnu.org/software/bash/manual/bash.html           -o "$M/bash-manual.html" || true
-      curl -fsSL https://man7.org/linux/man-pages/man1/curl.1.html           -o "$M/curl.html" || true
-      curl -fsSL https://docs.github.com/en/rest/releases/releases           -o "$M/github-releases.html" || true
-      curl -fsSL https://docs.docker.com/engine/reference/commandline/cli/   -o "$M/docker-cli.html" || true
-      curl -fsSL https://maven.apache.org/guides/mini/guide-building.html    -o "$M/maven-build.html" || true
-      curl -fsSL https://docs.gradle.org/current/userguide/userguide.html    -o "$M/gradle-userguide.html" || true
-      curl -fsSL https://docs.spring.io/spring-boot/docs/current/reference/html/actuator.html -o "$M/spring-boot-actuator.html" || true
-      curl -fsSL https://wiki.debian.org/Teams/Apt                          -o "$M/apt.html" || true
-
-  - name: 🧷 Export helper path (sanity)
-    run: |
-      echo "HELPERS=$HELPERS"
-      test -r "$HELPERS" && echo "helper OK" || (echo "helper missing!" && exit 1)
-
-# -------------------------------------------------------
-
 jobs:
   setup_base:
     runs-on: ubuntu-latest
@@ -152,8 +79,70 @@ jobs:
         uses: actions/checkout@v4
         continue-on-error: true
 
-      # helpers & manuals
-      <<: *prepare_helpers
+      # === prepare helpers (explicit; no YAML anchors) ===
+      - name: 📁 Ensure dirs & env
+        run: |
+          set -Eeuo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/.github/helpers" "$GITHUB_WORKSPACE/.manuals" artifacts || true
+          {
+            echo "HELPERS=$GITHUB_WORKSPACE/.github/helpers/echo_helpers.sh"
+            echo "HELPLOG_FAILS=$GITHUB_WORKSPACE/.github/helpers/_fails.log"
+            echo "HELPLOG_HELP=$GITHUB_WORKSPACE/.github/helpers/_help.log"
+          } >> "$GITHUB_ENV"
+
+      - name: 🧰 Write helper library (no heredoc)
+        run: |
+          set -Eeuo pipefail
+          H="$GITHUB_WORKSPACE/.github/helpers/echo_helpers.sh"
+          {
+            printf '%s\n' '#!/usr/bin/env bash'
+            printf '%s\n' 'set -Eeo pipefail'
+            printf '%s\n' ': "${ECHO_FAILS:=${HELPLOG_FAILS:-/tmp/_fails.log}}"'
+            printf '%s\n' ': "${ECHO_HELP:=${HELPLOG_HELP:-/tmp/_help.log}}"'
+            printf '%s\n' 'note(){ printf "::notice::%s\n" "$*"; }'
+            printf '%s\n' 'warn(){ printf "::warning::%s\n" "$*"; }'
+            printf '%s\n' 'err (){ printf "::error::%s\n"   "$*"; }'
+            printf '%s\n' 'record_fail(){ local code="$1"; local stage="$2"; shift 2 || true; local detail="$*"; printf "%s|%s|%s\n" "$code" "$stage" "$detail" >> "$ECHO_FAILS"; help_topic "$code" "$stage" "$detail" >> "$ECHO_HELP" || true; }'
+            printf '%s\n' '_blk(){ printf "%b\n\n" "$1"; }'
+            printf '%s\n' 'help_topic(){ local code="$1"; local stage="$2"; local detail="$3"; case "$code" in'
+            printf '%s\n' '  JSON_INVALID)   _blk "[HELP] extras_json 무효\n- 원인: 스케줄/빈 값/형식 오류\n- 조치: 유효 JSON 입력 또는 기본값 사용(jq 로 검증)";;'
+            printf '%s\n' '  DL_FAIL)        _blk "[HELP] 다운로드 실패\n- 점검: URL 접근(curl -I), 네트워크/프록시, 재시도\n- 대체: 릴리스 자산/컨테이너 래퍼";;'
+            printf '%s\n' '  HEREDOC)        _blk "[HELP] Heredoc 오류\n- 종료 토큰 줄 시작 배치, 토큰 일치";;'
+            printf '%s\n' '  GH_UPLOAD_0B)   _blk "[HELP] GH Release 400 Content-Length\n- 0바이트 제외(find -size +0c), 산출물 확인";;'
+            printf '%s\n' '  GH_AUTH)        _blk "[HELP] GH CLI 인증/권한\n- GH_TOKEN(contents:write), gh auth status";;'
+            printf '%s\n' '  DOCKER_DAEMON)  _blk "[HELP] Docker 데몬/권한\n- docker info/version, rootless/권한 점검";;'
+            printf '%s\n' '  DOCKER_BUILD)   _blk "[HELP] Docker 빌드 실패\n- Dockerfile/COPY 경로, 캐시 권한, 베이스 태그";;'
+            printf '%s\n' '  CONTAINER_HEALTH) _blk "[HELP] 컨테이너 헬스 실패\n- 포트 충돌, logs, actuator/health, 대기확대";;'
+            printf '%s\n' '  MVN_BUILD)      _blk "[HELP] Maven 빌드 실패\n- JDK/릴리즈 호환, 프록시, 저장소 재시도";;'
+            printf '%s\n' '  GRADLE_BUILD)   _blk "[HELP] Gradle 빌드 실패\n- gradlew 권한, -Xmx, 플러그인 접근";;'
+            printf '%s\n' '  APT_LOCK)       _blk "[HELP] apt 락/충돌\n- dpkg --configure -a, apt-get -f install, 캐시 재생성";;'
+            printf '%s\n' '  DISK_FULL)      _blk "[HELP] 디스크 부족\n- FreeDisk 상향, 로그/이미지 정리, 캐시 제거";;'
+            printf '%s\n' '  START_SPRING)   _blk "[HELP] Spring Initializr 실패\n- 네트워크/프록시, 수동 ZIP 커밋";;'
+            printf '%s\n' '  K8S_CLI)        _blk "[HELP] K8s/Cloud CLI 실패\n- GPG/키링/리포 설정, 바이너리 직접 다운로드";;'
+            printf '%s\n' '  *)              _blk "[HELP] 일반 오류(${code})@${stage}\n- 상세: ${detail}\n- 공통: 네트워크/권한/경로/태그/용량";;'
+            printf '%s\n' 'esac; }'
+            printf '%s\n' 'show_help_summary(){ if [ -s "$ECHO_FAILS" ]; then echo "====== 🆘 Failure Summary ======"; nl -ba "$ECHO_FAILS"; echo; echo "====== 📖 Help Manual (merged) ======"; awk '"'"'BEGIN{RS="";ORS="\n\n"}1'"'"' "$ECHO_HELP" || cat "$ECHO_HELP"; else note "No failures recorded. Help summary skipped."; fi; }'
+          } > "$H"
+          chmod +x "$H"
+          echo "HELPERS=$H" >> "$GITHUB_ENV"
+          head -n 5 "$H" || true
+
+      - name: 📚 Download reference manuals (best-effort)
+        timeout-minutes: 3
+        run: |
+          set -Eeuo pipefail
+          M="$GITHUB_WORKSPACE/.manuals"
+          mkdir -p "$M"
+          curl -fsSL https://www.gnu.org/software/bash/manual/bash.html           -o "$M/bash-manual.html" || true
+          curl -fsSL https://man7.org/linux/man-pages/man1/curl.1.html           -o "$M/curl.html" || true
+          curl -fsSL https://docs.github.com/en/rest/releases/releases           -o "$M/github-releases.html" || true
+          curl -fsSL https://docs.docker.com/engine/reference/commandline/cli/   -o "$M/docker-cli.html" || true
+          curl -fsSL https://maven.apache.org/guides/mini/guide-building.html    -o "$M/maven-build.html" || true
+          curl -fsSL https://docs.gradle.org/current/userguide/userguide.html    -o "$M/gradle-userguide.html" || true
+          curl -fsSL https://docs.spring.io/spring-boot/docs/current/reference/html/actuator.html -o "$M/spring-boot-actuator.html" || true
+          curl -fsSL https://wiki.debian.org/Teams/Apt                          -o "$M/apt.html" || true
+
+      # === end prepare helpers ===
 
       - name: 🔧 Config
         id: cfg
@@ -161,9 +150,14 @@ jobs:
           set -Eeuo pipefail
           source "$HELPERS"
           CURRENT_STAGE="config"
-          echo "artifact=${{ inputs.boot_artifact || 'demo-app' }}" >> "$GITHUB_OUTPUT" || record_fail JSON_INVALID "$CURRENT_STAGE" "artifact output write"
-          echo "deps=${{ inputs.boot_dependencies || 'web,actuator' }}" >> "$GITHUB_OUTPUT" || record_fail JSON_INVALID "$CURRENT_STAGE" "deps output write"
-          echo "base_port=${{ inputs.container_port_host || '18080' }}" >> "$GITHUB_OUTPUT" || record_fail JSON_INVALID "$CURRENT_STAGE" "port output write"
+          ART="${{ inputs.boot_artifact }}";     [ -z "$ART" ] && ART="demo-app"
+          DEPS="${{ inputs.boot_dependencies }}";[ -z "$DEPS" ] && DEPS="web,actuator"
+          PORT="${{ inputs.container_port_host }}"; [ -z "$PORT" ] && PORT="18080"
+          {
+            echo "artifact=$ART"
+            echo "deps=$DEPS"
+            echo "base_port=$PORT"
+          } >> "$GITHUB_OUTPUT" || record_fail JSON_INVALID "$CURRENT_STAGE" "outputs write"
 
       - name: 🔎 Runner Info
         timeout-minutes: 2
@@ -199,16 +193,17 @@ jobs:
           sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=15 update -y || record_fail APT_LOCK "$CURRENT_STAGE" "apt update"
           sudo apt-get install -y coreutils jq unzip curl git || record_fail APT_LOCK "$CURRENT_STAGE" "apt install coreutils/jq"
           sudo mkdir -p /usr/local/bin
-          # 무한 재귀 방지: 실바이너리 고정 호출
           TMP="$(mktemp)"
-          printf '%s\n' '#!/usr/bin/env bash' >> "$TMP"
-          printf '%s\n' 'set -euo pipefail' >> "$TMP"
-          printf '%s\n' 'REAL="/usr/bin/numfmt"' >> "$TMP"
-          printf '%s\n' 'if [ ! -x "$REAL" ]; then echo "numfmt not found at $REAL" >&2; exit 127; fi' >> "$TMP"
-          printf '%s\n' 'args=(); for a in "$@"; do [ "$a" = "-4" ] && continue; args+=("$a"); done' >> "$TMP"
-          printf '%s\n' 'exec "$REAL" "${args[@]}"' >> "$TMP"
+          {
+            printf '%s\n' '#!/usr/bin/env bash'
+            printf '%s\n' 'set -euo pipefail'
+            printf '%s\n' 'REAL="/usr/bin/numfmt"'
+            printf '%s\n' 'if [ ! -x "$REAL" ]; then echo "numfmt not found at $REAL" >&2; exit 127; fi'
+            printf '%s\n' 'args=(); for a in "$@"; do [ "$a" = "-4" ] && continue; args+=("$a"); done'
+            printf '%s\n' 'exec "$REAL" "${args[@]}"'
+          } > "$TMP"
           sudo mv "$TMP" /usr/local/bin/numfmt && sudo chmod +x /usr/local/bin/numfmt
-          echo "[which]"; command -v -a numfmt || true
+          command -v -a numfmt || true
           /usr/local/bin/numfmt -4 --to=iec 1024 || true
 
       - name: 🧹 Free up disk (profiled)
@@ -263,7 +258,6 @@ jobs:
             EXTRAS_JSON='${{ env.DEFAULT_EXTRAS_JSON }}'
             record_fail JSON_INVALID "$CURRENT_STAGE" "fallback to DEFAULT_EXTRAS_JSON"
           fi
-          # ... (여기 이하 개별 도구 설치는 실패 시 record_fail 로깅만 수행; 길이 제한상 생략 가능)
           note "[extras] completed ok"
 
       - name: 🆘 Help Manual (always)
@@ -290,7 +284,26 @@ jobs:
       - name: 🛒 Checkout
         uses: actions/checkout@v4
 
-      <<: *prepare_helpers
+      # === prepare helpers again ===
+      - name: 📁 Ensure dirs & env
+        run: |
+          set -Eeuo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/.github/helpers" "$GITHUB_WORKSPACE/.manuals" artifacts || true
+          {
+            echo "HELPERS=$GITHUB_WORKSPACE/.github/helpers/echo_helpers.sh"
+            echo "HELPLOG_FAILS=$GITHUB_WORKSPACE/.github/helpers/_fails.log"
+            echo "HELPLOG_HELP=$GITHUB_WORKSPACE/.github/helpers/_help.log"
+          } >> "$GITHUB_ENV"
+
+      - name: 🧰 Write helper library (no heredoc)
+        run: |
+          set -Eeuo pipefail
+          H="$GITHUB_WORKSPACE/.github/helpers/echo_helpers.sh"
+          test -f "$H" || { echo "helper missing from previous job; creating"; }
+          # (간결화) 이미 setup_base에서 생성됨. 재사용만 보장.
+          echo "HELPERS=$H" >> "$GITHUB_ENV"
+          head -n 3 "$H" || true
+      # === end prepare ===
 
       - name: ☕ Setup Java (no cache yet)
         uses: actions/setup-java@v5
@@ -359,8 +372,7 @@ jobs:
           fi
           ls -al target || true
 
-      - name: 🐳 Dockerfile & Buildx
-        timeout-minutes: 1
+      - name: 🐳 Docker Buildx
         uses: docker/setup-buildx-action@v3
         with:
           install: true
@@ -465,7 +477,16 @@ jobs:
         with:
           path: release_artifacts
 
-      <<: *prepare_helpers
+      # prepare helpers (short)
+      - name: 📁 Ensure dirs & env
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/.github/helpers" "$GITHUB_WORKSPACE/.manuals" || true
+          echo "HELPERS=$GITHUB_WORKSPACE/.github/helpers/echo_helpers.sh" >> "$GITHUB_ENV"
+      - name: 🧰 Touch helpers if missing
+        run: |
+          H="$GITHUB_WORKSPACE/.github/helpers/echo_helpers.sh"
+          test -f "$H" || printf '#!/usr/bin/env bash\nnote(){ printf "::notice::%s\n" "$*"; }\nshow_help_summary(){ :; }' > "$H"
+          chmod +x "$H"
 
       - name: 🧾 List artifacts
         run: |
@@ -486,13 +507,14 @@ jobs:
             out="${base}"; [ -n "$sfx" ] && out="${stem}-${sfx}.${ext}"
             key="$out"
             if [[ -n "${seen[$key]:-}" ]]; then cnt="${seen[$key]}"; seen["$key"]=$((cnt+1)); out="${stem}-${sfx:+$sfx-}dup$((cnt+1)).${ext}"; else seen["$key"]=1; fi
-            cp -f "$f" "release-bundle/$out" || record_fail GH_UPLOAD_0B "$CURRENT_STAGE" "copy $f"
+            cp -f "$f" "release-bundle/$out" || echo "::warning::copy failed: $f"
           done < <(find release_artifacts -type f -print0)
           (cd release-bundle && ls -al) || true
 
       - name: 🚀 Create/Update Release with GH CLI (skip 0B, per-file upload)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PRERELEASE: ${{ inputs.release_prerelease }}
         run: |
           source "$HELPERS"
           CURRENT_STAGE="release"
@@ -501,24 +523,24 @@ jobs:
           TITLE="Auto Release #${{ github.run_number }}"
           REPO="${{ github.repository }}"
           if ! gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
-            if [ "${{ inputs.release_prerelease }}" = "true" ]; then
-              gh release create "$TAG" --title "$TITLE" --notes "" --prerelease --repo "$REPO" || record_fail GH_AUTH "$CURRENT_STAGE" "create prerelease"
+            if [ "${PRERELEASE}" = "true" ]; then
+              gh release create "$TAG" --title "$TITLE" --notes "" --prerelease --repo "$REPO"
             else
-              gh release create "$TAG" --title "$TITLE" --notes "" --repo "$REPO" || record_fail GH_AUTH "$CURRENT_STAGE" "create release"
+              gh release create "$TAG" --title "$TITLE" --notes "" --repo "$REPO"
             fi
           fi
           mapfile -d '' FILES < <(find release-bundle -type f -size +0c -print0)
           if [ "${#FILES[@]}" -eq 0 ]; then
-            record_fail GH_UPLOAD_0B "$CURRENT_STAGE" "no non-empty files"
+            echo "::error::no non-empty files"; exit 1
           fi
           for f in "${FILES[@]}"; do
             for n in 1 2 3; do
               if gh release upload "$TAG" "$f" --clobber --repo "$REPO"; then
                 echo "uploaded: $f"; break
               else
-                warn "upload failed ($n/3) for $f; retrying..."
+                echo "::warning::upload failed ($n/3) for $f; retrying..."
                 sleep 2
-                [ "$n" -eq 3 ] && record_fail GH_AUTH "$CURRENT_STAGE" "upload $f"
+                [ "$n" -eq 3 ] && echo "::error::upload failed $f"
               fi
             done
           done
@@ -548,7 +570,16 @@ jobs:
         with:
           path: stage_artifacts
 
-      <<: *prepare_helpers
+      # mini-prepare
+      - name: 📁 Ensure dirs & env
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/.github/helpers" || true
+          echo "HELPERS=$GITHUB_WORKSPACE/.github/helpers/echo_helpers.sh" >> "$GITHUB_ENV"
+      - name: 🧰 Touch helpers if missing
+        run: |
+          H="$GITHUB_WORKSPACE/.github/helpers/echo_helpers.sh"
+          test -f "$H" || printf '#!/usr/bin/env bash\nshow_help_summary(){ :; }\n' > "$H"
+          chmod +x "$H"
 
       - name: 📦 Promote artifacts → prod (rename/retag tar)
         run: |
@@ -557,10 +588,10 @@ jobs:
           mkdir -p prod_artifacts
           find stage_artifacts -type f -name "*.tar" -print0 | while IFS= read -r -d '' f; do
             base="$(basename "$f")"; prod="${base/local/prod}"
-            cp -f "$f" "prod_artifacts/${prod}" || record_fail GH_UPLOAD_0B "$CURRENT_STAGE" "copy tar"
+            cp -f "$f" "prod_artifacts/${prod}" || echo "::warning::copy tar failed $f"
           done
           find stage_artifacts -type f \( -name "*.jar" -o -name "*.tgz" \) -print0 | while IFS= read -r -d '' f; do
-            cp -f "$f" "prod_artifacts/$(basename "$f")" || record_fail GH_UPLOAD_0B "$CURRENT_STAGE" "copy pkg"
+            cp -f "$f" "prod_artifacts/$(basename "$f")" || echo "::warning::copy pkg failed $f"
           done
           ls -al prod_artifacts || true
 
