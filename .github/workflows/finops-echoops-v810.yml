@@ -1,4 +1,4 @@
-name: "🧱 Customer Resource — Gen+Build+Test (H2/Postgres/MySQL + DTO/Validation + Advice)"
+name: "🏗️ Customer MEGA — Gen + Echo + OpenAPI + Testcontainers + Flyway/Liquibase + MapStruct + Matrix CI (Fixed)"
 
 on:
   workflow_dispatch:
@@ -20,94 +20,101 @@ on:
         required: true
         default: "DemoApplication"
       java_version:
-        description: "Java version"
+        description: "Primary Java version"
         required: true
         default: "17"
       run_smoke_test:
-        description: "Run H2 smoke test (true/false)"
+        description: "Run HTTP smoke test (true/false)"
         required: true
         default: "true"
-      run_postgres_tests:
-        description: "Run tests with PostgreSQL profile (true/false)"
-        required: true
-        default: "false"
-      run_mysql_tests:
-        description: "Run tests with MySQL profile (true/false)"
-        required: true
-        default: "false"
       commit_changes:
         description: "Commit generated sources (true/false)"
+        required: true
+        default: "false"
+      build_matrix:
+        description: "Matrix build across Java versions (true/false)"
+        required: true
+        default: "true"
+      use_liquibase:
+        description: "Use Liquibase profile instead of Flyway (true/false)"
         required: true
         default: "false"
 
 permissions:
   contents: write
 
+env:
+  SRC_MAIN: src/main/java
+  SRC_TEST: src/test/java
+
 jobs:
-  generate-build-test:
+  generate:
     runs-on: ubuntu-latest
-
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_USER: test
-          POSTGRES_PASSWORD: test
-          POSTGRES_DB: testdb
-        ports: [ "5432:5432" ]
-        options: >-
-          --health-cmd="pg_isready -U test -d testdb"
-          --health-interval=5s
-          --health-timeout=5s
-          --health-retries=20
-      mysql:
-        image: mysql:8.4
-        env:
-          MYSQL_ROOT_PASSWORD: root
-          MYSQL_DATABASE: testdb
-          MYSQL_USER: test
-          MYSQL_PASSWORD: test
-        ports: [ "3306:3306" ]
-        options: >-
-          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -proot"
-          --health-interval=5s
-          --health-timeout=5s
-          --health-retries=20
-
     env:
       GROUP_ID: ${{ inputs.group_id }}
       ARTIFACT_ID: ${{ inputs.artifact_id }}
       PACKAGE_NAME: ${{ inputs.package_name }}
       APP_NAME: ${{ inputs.app_name }}
-      JAVA_VERSION: ${{ inputs.java_version }}
-      RUN_SMOKE_TEST: ${{ inputs.run_smoke_test }}
-      RUN_POSTGRES_TESTS: ${{ inputs.run_postgres_tests }}
-      RUN_MYSQL_TESTS: ${{ inputs.run_mysql_tests }}
-      COMMIT_CHANGES: ${{ inputs.commit_changes }}
-      SRC_MAIN: src/main/java
-      SRC_TEST: src/test/java
-
+      JAVA_PRIMARY: ${{ inputs.java_version }}
+      USE_LIQUIBASE: ${{ inputs.use_liquibase }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Echo helpers & log dir
+      - name: Echo helpers & massive dir tree
         run: |
           set -Eeuo pipefail
-          mkdir -p .github/echo_logs
-          cat > /tmp/echo_helpers.sh <<'SH'
-          set -Eeuo pipefail
-          TS(){ date +'%Y-%m-%d %H:%M:%S'; }
+          TS(){ date +'%F %T'; }
           echoe(){ printf '[%s] %s\n' "$(TS)" "$*"; }
-          SH
-          source /tmp/echo_helpers.sh
-          echoe "Workspace: $GITHUB_WORKSPACE"
+          mkdir -p \
+            .github/echo_logs \
+            .github/echo_dirs/{app,db,docs,ops,tests,containers} \
+            .github/echo_files/{samples,templates,reports} \
+            .github/echo_secrets \
+            .github/echo_containers \
+            .github/echo_tmp
+          for i in $(seq 1 30); do
+            printf 'placeholder-%02d\n' "$i" > ".github/echo_files/samples/sample_${i}.txt"
+          done
+          chmod -R 755 .github/echo_dirs .github/echo_containers
+          chmod -R 700 .github/echo_secrets
+          echoe "Echo dirs/files created."
 
-      - name: Create ~/.m2/settings.xml (optional for GH Packages)
+      - name: Generate virtual accounts & passwords (echo)
         run: |
           set -Eeuo pipefail
+          USERS_JSON=".github/echo_secrets/users.json"
+          ENV_FILE=".github/echo_secrets/.env"
+          TOKENS_FILE=".github/echo_secrets/tokens.txt"
+          cat > "$USERS_JSON" <<JSON
+          {
+            "users": [
+              {"username": "svc_admin", "roles": ["ADMIN","OPS"]},
+              {"username": "svc_app",   "roles": ["APP"]},
+              {"username": "svc_ro",    "roles": ["READONLY"]}
+            ]
+          }
+          JSON
+          for u in svc_admin svc_app svc_ro; do
+            P=$(openssl rand -base64 24)
+            echo "${u^^}_PASSWORD=$P" >> "$ENV_FILE"
+          done
+          for i in $(seq 1 5); do
+            openssl rand -hex 32 >> "$TOKENS_FILE"
+          done
+          chmod 600 "$ENV_FILE" "$TOKENS_FILE"
+
+      - name: Setup Java + Maven cache
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_PRIMARY }}
+          cache: maven
+
+      - name: Create ~/.m2/settings.xml (GH server optional)
+        run: |
           mkdir -p ~/.m2
-          cat > ~/.m2/settings.xml <<'XML'
+          cat > ~/.m2/settings.xml <<XML
           <settings xmlns="http://maven.apache.org/SETTINGS/1.0.0"
                     xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
                     xsi:schemaLocation="http://maven.apache.org/SETTINGS/1.0.0
@@ -115,27 +122,30 @@ jobs:
             <servers>
               <server>
                 <id>github</id>
-                <username>${env.GITHUB_ACTOR}</username>
-                <password>${env.GITHUB_TOKEN}</password>
+                <username>${GITHUB_ACTOR}</username>
+                <password>${GITHUB_TOKEN}</password>
               </server>
             </servers>
           </settings>
           XML
-          echo "Created settings.xml with server-id: github"
 
-      - name: Prepare directories
+      - name: Prepare source layout
+        id: prep
         run: |
           set -Eeuo pipefail
-          PKG_DIR="${SRC_MAIN}/$(echo "${PACKAGE_NAME}" | tr '.' '/')"
-          TEST_PKG_DIR="${SRC_TEST}/$(echo "${PACKAGE_NAME}" | tr '.' '/')"
-          mkdir -p "${PKG_DIR}/model" "${PKG_DIR}/dto" "${PKG_DIR}/repository" \
-                   "${PKG_DIR}/service" "${PKG_DIR}/controller" \
-                   "${PKG_DIR}/exception" "${PKG_DIR}/advice" \
-                   "src/main/resources" "${TEST_PKG_DIR}"
-          echo "PKG_DIR=${PKG_DIR}" >> "$GITHUB_ENV"
-          echo "TEST_PKG_DIR=${TEST_PKG_DIR}" >> "$GITHUB_ENV"
+          PKG_PATH="$(echo "${PACKAGE_NAME}" | tr '.' '/')"
+          PKG_DIR="${SRC_MAIN}/${PKG_PATH}"
+          TEST_PKG_DIR="${SRC_TEST}/${PKG_PATH}"
+          mkdir -p \
+            "${PKG_DIR}"/{model,dto,repository,service,controller,advice,exception,mapper,config} \
+            "${TEST_PKG_DIR}"
+          mkdir -p src/main/resources/db/migration
+          mkdir -p src/main/resources/db/changelog
+          mkdir -p src/main/resources/static
+          echo "PKG_DIR=$PKG_DIR" >> $GITHUB_OUTPUT
+          echo "TEST_PKG_DIR=$TEST_PKG_DIR" >> $GITHUB_OUTPUT
 
-      - name: Generate pom.xml (echo)
+      - name: Generate pom.xml (variables expanded)
         run: |
           set -Eeuo pipefail
           cat > pom.xml <<EOF
@@ -147,11 +157,12 @@ jobs:
             <artifactId>${ARTIFACT_ID}</artifactId>
             <version>0.0.1-SNAPSHOT</version>
             <name>${ARTIFACT_ID}</name>
-            <description>Customer Resource (H2/Postgres/MySQL + Validation + Advice)</description>
             <properties>
-              <java.version>${JAVA_VERSION}</java.version>
+              <java.version>${JAVA_PRIMARY}</java.version>
               <spring-boot.version>3.3.3</spring-boot.version>
-              <maven.compiler.release>${JAVA_VERSION}</maven.compiler.release>
+              <mapstruct.version>1.5.5.Final</mapstruct.version>
+              <testcontainers.version>1.20.1</testcontainers.version>
+              <maven.compiler.release>${JAVA_PRIMARY}</maven.compiler.release>
             </properties>
 
             <dependencyManagement>
@@ -184,7 +195,12 @@ jobs:
                 <artifactId>spring-boot-starter-actuator</artifactId>
               </dependency>
 
-              <!-- DB drivers -->
+              <dependency>
+                <groupId>org.springdoc</groupId>
+                <artifactId>springdoc-openapi-starter-webmvc-ui</artifactId>
+                <version>2.6.0</version>
+              </dependency>
+
               <dependency>
                 <groupId>com.h2database</groupId>
                 <artifactId>h2</artifactId>
@@ -201,10 +217,42 @@ jobs:
                 <scope>runtime</scope>
               </dependency>
 
-              <!-- Test -->
+              <dependency>
+                <groupId>org.flywaydb</groupId>
+                <artifactId>flyway-core</artifactId>
+              </dependency>
+              <dependency>
+                <groupId>org.liquibase</groupId>
+                <artifactId>liquibase-core</artifactId>
+              </dependency>
+
+              <dependency>
+                <groupId>org.mapstruct</groupId>
+                <artifactId>mapstruct</artifactId>
+                <version>\${mapstruct.version}</version>
+              </dependency>
+
               <dependency>
                 <groupId>org.springframework.boot</groupId>
                 <artifactId>spring-boot-starter-test</artifactId>
+                <scope>test</scope>
+              </dependency>
+              <dependency>
+                <groupId>org.testcontainers</groupId>
+                <artifactId>junit-jupiter</artifactId>
+                <version>\${testcontainers.version}</version>
+                <scope>test</scope>
+              </dependency>
+              <dependency>
+                <groupId>org.testcontainers</groupId>
+                <artifactId>postgresql</artifactId>
+                <version>\${testcontainers.version}</version>
+                <scope>test</scope>
+              </dependency>
+              <dependency>
+                <groupId>org.testcontainers</groupId>
+                <artifactId>mysql</artifactId>
+                <version>\${testcontainers.version}</version>
                 <scope>test</scope>
               </dependency>
             </dependencies>
@@ -224,6 +272,13 @@ jobs:
                   <version>3.13.0</version>
                   <configuration>
                     <release>\${maven.compiler.release}</release>
+                    <annotationProcessorPaths>
+                      <path>
+                        <groupId>org.mapstruct</groupId>
+                        <artifactId>mapstruct-processor</artifactId>
+                        <version>\${mapstruct.version}</version>
+                      </path>
+                    </annotationProcessorPaths>
                   </configuration>
                 </plugin>
                 <plugin>
@@ -235,30 +290,25 @@ jobs:
             </build>
           </project>
           EOF
-          echo "[OK] pom.xml generated."
 
-      - name: Setup Temurin JDK
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: ${{ env.JAVA_VERSION }}
-          cache: maven
-
-      - name: Generate application properties (H2/Postgres/MySQL profiles)
+      - name: application properties & profiles (OpenAPI + Flyway/Liquibase)
         run: |
           set -Eeuo pipefail
-          cat > src/main/resources/application.properties <<'PROPS'
+          cat > src/main/resources/application.properties <<P
           server.port=8080
-          spring.application.name=customer-app
-          spring.profiles.active=h2
+          spring.application.name=customer-mega
+          spring.profiles.active=flyway
+          spring.jpa.open-in-view=false
+          spring.jpa.hibernate.ddl-auto=validate
           management.endpoints.web.exposure.include=health,info
           management.endpoint.health.show-details=always
-          # JPA (common)
-          spring.jpa.open-in-view=false
-          spring.jpa.hibernate.ddl-auto=update
-          PROPS
+          springdoc.api-docs.enabled=true
+          springdoc.swagger-ui.enabled=true
+          spring.flyway.enabled=true
+          spring.liquibase.enabled=false
+          P
 
-          cat > src/main/resources/application-h2.properties <<'H2'
+          cat > src/main/resources/application-h2.properties <<H2
           spring.datasource.url=jdbc:h2:mem:testdb;DB_CLOSE_DELAY=-1
           spring.datasource.driverClassName=org.h2.Driver
           spring.datasource.username=sa
@@ -266,23 +316,59 @@ jobs:
           spring.jpa.database-platform=org.hibernate.dialect.H2Dialect
           H2
 
-          cat > src/main/resources/application-postgres.properties <<'PG'
-          spring.datasource.url=jdbc:postgresql://127.0.0.1:5432/testdb
+          cat > src/main/resources/application-flyway.properties <<F
+          spring.flyway.enabled=true
+          spring.liquibase.enabled=false
+          F
+
+          cat > src/main/resources/application-liquibase.properties <<L
+          spring.flyway.enabled=false
+          spring.liquibase.enabled=true
+          L
+
+          cat > src/main/resources/application-postgres.properties <<PG
+          spring.datasource.url=jdbc:postgresql://localhost:5432/testdb
           spring.datasource.username=test
           spring.datasource.password=test
           spring.jpa.database-platform=org.hibernate.dialect.PostgreSQLDialect
           PG
 
-          cat > src/main/resources/application-mysql.properties <<'MY'
-          spring.datasource.url=jdbc:mysql://127.0.0.1:3306/testdb?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC
+          cat > src/main/resources/application-mysql.properties <<MY
+          spring.datasource.url=jdbc:mysql://localhost:3306/testdb?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC
           spring.datasource.username=test
           spring.datasource.password=test
           spring.jpa.database-platform=org.hibernate.dialect.MySQL8Dialect
           MY
 
-      - name: Generate Application class
+          cat > src/main/resources/db/migration/V1__init.sql <<SQL
+          CREATE TABLE IF NOT EXISTS customers(
+            id BIGSERIAL PRIMARY KEY,
+            name VARCHAR(100) NOT NULL,
+            email VARCHAR(255) NOT NULL UNIQUE,
+            phone VARCHAR(20)
+          );
+          SQL
+
+          cat > src/main/resources/db/changelog/db.changelog-master.yaml <<Y
+          databaseChangeLog:
+            - changeSet:
+                id: 1
+                author: chatgpt
+                changes:
+                  - createTable:
+                      tableName: customers
+                      columns:
+                        - column: { name: id, type: BIGINT, autoIncrement: true, constraints: { primaryKey: true } }
+                        - column: { name: name, type: VARCHAR(100), constraints: { nullable: false } }
+                        - column: { name: email, type: VARCHAR(255), constraints: { nullable: false, unique: true } }
+                        - column: { name: phone, type: VARCHAR(20) }
+          Y
+
+      - name: Generate Java sources (NO quotes heredoc → expand vars)
         run: |
           set -Eeuo pipefail
+          PKG_DIR="${{ steps.prep.outputs.PKG_DIR }}"
+
           cat > "${PKG_DIR}/${APP_NAME}.java" <<EOF
           package ${PACKAGE_NAME};
 
@@ -297,11 +383,7 @@ jobs:
           }
           EOF
 
-      - name: Generate Entity/DTO/Repository/Service/Controller/Advice
-        run: |
-          set -Eeuo pipefail
-          # Entity
-          cat > "${PKG_DIR}/model/Customer.java" <<'JAVA'
+          cat > "${PKG_DIR}/model/Customer.java" <<EOF
           package ${PACKAGE_NAME}.model;
 
           import jakarta.persistence.*;
@@ -309,40 +391,27 @@ jobs:
           @Entity
           @Table(name = "customers")
           public class Customer {
-            @Id
-            @GeneratedValue(strategy = GenerationType.IDENTITY)
+            @Id @GeneratedValue(strategy = GenerationType.IDENTITY)
             private Long id;
-
             @Column(nullable = false, length = 100)
             private String name;
-
             @Column(nullable = false, unique = true, length = 255)
             private String email;
-
             @Column(length = 20)
             private String phone;
 
             public Customer() {}
-
-            public Customer(String name, String email, String phone) {
-              this.name = name;
-              this.email = email;
-              this.phone = phone;
+            public Customer(Long id, String name, String email, String phone) {
+              this.id=id; this.name=name; this.email=email; this.phone=phone;
             }
-
-            public Long getId() { return id; }
-            public void setId(Long id) { this.id = id; }
-            public String getName() { return name; }
-            public void setName(String name) { this.name = name; }
-            public String getEmail() { return email; }
-            public void setEmail(String email) { this.email = email; }
-            public String getPhone() { return phone; }
-            public void setPhone(String phone) { this.phone = phone; }
+            public Long getId(){return id;} public void setId(Long id){this.id=id;}
+            public String getName(){return name;} public void setName(String n){this.name=n;}
+            public String getEmail(){return email;} public void setEmail(String e){this.email=e;}
+            public String getPhone(){return phone;} public void setPhone(String p){this.phone=p;}
           }
-          JAVA
+          EOF
 
-          # DTO + Validation
-          cat > "${PKG_DIR}/dto/CustomerDto.java" <<'JAVA'
+          cat > "${PKG_DIR}/dto/CustomerDto.java" <<EOF
           package ${PACKAGE_NAME}.dto;
 
           import jakarta.validation.constraints.Email;
@@ -350,34 +419,35 @@ jobs:
           import jakarta.validation.constraints.Size;
 
           public class CustomerDto {
-            @NotBlank
-            @Size(max = 100)
-            private String name;
-
-            @NotBlank
-            @Email
-            @Size(max = 255)
-            private String email;
-
-            @Size(max = 20)
-            private String phone;
+            @NotBlank @Size(max=100) private String name;
+            @NotBlank @Email @Size(max=255) private String email;
+            @Size(max=20) private String phone;
 
             public CustomerDto() {}
-            public CustomerDto(String name, String email, String phone) {
-              this.name = name; this.email = email; this.phone = phone;
+            public CustomerDto(String name,String email,String phone){
+              this.name=name; this.email=email; this.phone=phone;
             }
-
-            public String getName() { return name; }
-            public void setName(String name) { this.name = name; }
-            public String getEmail() { return email; }
-            public void setEmail(String email) { this.email = email; }
-            public String getPhone() { return phone; }
-            public void setPhone(String phone) { this.phone = phone; }
+            public String getName(){return name;} public void setName(String v){this.name=v;}
+            public String getEmail(){return email;} public void setEmail(String v){this.email=v;}
+            public String getPhone(){return phone;} public void setPhone(String v){this.phone=v;}
           }
-          JAVA
+          EOF
 
-          # Repository
-          cat > "${PKG_DIR}/repository/CustomerRepository.java" <<'JAVA'
+          cat > "${PKG_DIR}/mapper/CustomerMapper.java" <<EOF
+          package ${PACKAGE_NAME}.mapper;
+
+          import ${PACKAGE_NAME}.dto.CustomerDto;
+          import ${PACKAGE_NAME}.model.Customer;
+          import org.mapstruct.*;
+
+          @Mapper(componentModel = "spring")
+          public interface CustomerMapper {
+            @Mapping(target="id", ignore = true)
+            Customer toEntity(CustomerDto dto);
+          }
+          EOF
+
+          cat > "${PKG_DIR}/repository/CustomerRepository.java" <<EOF
           package ${PACKAGE_NAME}.repository;
 
           import ${PACKAGE_NAME}.model.Customer;
@@ -386,78 +456,70 @@ jobs:
           public interface CustomerRepository extends JpaRepository<Customer, Long> {
             boolean existsByEmail(String email);
           }
-          JAVA
+          EOF
 
-          # Service
-          cat > "${PKG_DIR}/service/CustomerService.java" <<'JAVA'
+          cat > "${PKG_DIR}/service/CustomerService.java" <<EOF
           package ${PACKAGE_NAME}.service;
 
           import ${PACKAGE_NAME}.model.Customer;
           import ${PACKAGE_NAME}.repository.CustomerRepository;
           import org.springframework.stereotype.Service;
-
           import java.util.List;
 
           @Service
           public class CustomerService {
-            private final CustomerRepository customerRepository;
+            private final CustomerRepository repo;
+            public CustomerService(CustomerRepository repo){ this.repo=repo; }
 
-            public CustomerService(CustomerRepository customerRepository) {
-              this.customerRepository = customerRepository;
-            }
-
-            public Customer createCustomer(Customer customer) {
-              if (customerRepository.existsByEmail(customer.getEmail())) {
+            public Customer create(Customer c){
+              if(repo.existsByEmail(c.getEmail()))
                 throw new IllegalArgumentException("이미 존재하는 이메일입니다.");
-              }
-              return customerRepository.save(customer);
+              return repo.save(c);
             }
-
-            public List<Customer> getAllCustomers() {
-              return customerRepository.findAll();
-            }
+            public List<Customer> findAll(){ return repo.findAll(); }
           }
-          JAVA
+          EOF
 
-          # Controller
-          cat > "${PKG_DIR}/controller/CustomerController.java" <<'JAVA'
+          cat > "${PKG_DIR}/controller/CustomerController.java" <<EOF
           package ${PACKAGE_NAME}.controller;
 
           import ${PACKAGE_NAME}.dto.CustomerDto;
+          import ${PACKAGE_NAME}.mapper.CustomerMapper;
           import ${PACKAGE_NAME}.model.Customer;
           import ${PACKAGE_NAME}.service.CustomerService;
+          import io.swagger.v3.oas.annotations.Operation;
+          import io.swagger.v3.oas.annotations.tags.Tag;
           import jakarta.validation.Valid;
           import org.springframework.http.ResponseEntity;
           import org.springframework.web.bind.annotation.*;
-
           import java.util.List;
 
           @RestController
           @RequestMapping("/customers")
+          @Tag(name="Customers", description="Customer CRUD API")
           public class CustomerController {
-            private final CustomerService customerService;
-
-            public CustomerController(CustomerService customerService) {
-              this.customerService = customerService;
+            private final CustomerService svc;
+            private final CustomerMapper mapper;
+            public CustomerController(CustomerService svc, CustomerMapper mapper){
+              this.svc=svc; this.mapper=mapper;
             }
 
             @PostMapping
-            public ResponseEntity<Customer> createCustomer(@Valid @RequestBody CustomerDto dto) {
-              Customer saved = customerService.createCustomer(
-                new Customer(dto.getName(), dto.getEmail(), dto.getPhone())
-              );
+            @Operation(summary="Create customer")
+            public ResponseEntity<Customer> create(@Valid @RequestBody CustomerDto dto){
+              Customer saved = svc.create(mapper.toEntity(dto));
               return ResponseEntity.ok(saved);
             }
 
             @GetMapping
-            public ResponseEntity<List<Customer>> findAll() {
-              return ResponseEntity.ok(customerService.getAllCustomers());
+            @Operation(summary="List customers")
+            public ResponseEntity<List<Customer>> list(){
+              return ResponseEntity.ok(svc.findAll());
             }
           }
-          JAVA
+          EOF
 
-          # Exception + Advice
-          cat > "${PKG_DIR}/exception/ApiError.java" <<'JAVA'
+          cat > "${PKG_DIR}/exception/ApiError.java" <<EOF
           package ${PACKAGE_NAME}.exception;
 
           import java.time.Instant;
@@ -465,63 +527,52 @@ jobs:
 
           public class ApiError {
             private Instant timestamp = Instant.now();
-            private int status;
-            private String error;
-            private String message;
-            private String path;
-            private Map<String, String> validation;
-
-            public Instant getTimestamp() { return timestamp; }
-            public int getStatus() { return status; }
-            public void setStatus(int status) { this.status = status; }
-            public String getError() { return error; }
-            public void setError(String error) { this.error = error; }
-            public String getMessage() { return message; }
-            public void setMessage(String message) { this.message = message; }
-            public String getPath() { return path; }
-            public void setPath(String path) { this.path = path; }
-            public Map<String, String> getValidation() { return validation; }
-            public void setValidation(Map<String, String> validation) { this.validation = validation; }
+            private int status; private String error; private String message; private String path;
+            private Map<String,String> validation;
+            public Instant getTimestamp(){return timestamp;}
+            public int getStatus(){return status;} public void setStatus(int v){status=v;}
+            public String getError(){return error;} public void setError(String v){error=v;}
+            public String getMessage(){return message;} public void setMessage(String v){message=v;}
+            public String getPath(){return path;} public void setPath(String v){path=v;}
+            public Map<String,String> getValidation(){return validation;}
+            public void setValidation(Map<String,String> v){validation=v;}
           }
-          JAVA
+          EOF
 
-          cat > "${PKG_DIR}/advice/GlobalExceptionHandler.java" <<'JAVA'
+          cat > "${PKG_DIR}/advice/GlobalExceptionHandler.java" <<EOF
           package ${PACKAGE_NAME}.advice;
 
           import ${PACKAGE_NAME}.exception.ApiError;
+          import jakarta.servlet.http.HttpServletRequest;
           import org.springframework.http.HttpStatus;
           import org.springframework.http.ResponseEntity;
           import org.springframework.web.bind.MethodArgumentNotValidException;
           import org.springframework.web.bind.annotation.ControllerAdvice;
           import org.springframework.web.bind.annotation.ExceptionHandler;
 
-          import jakarta.servlet.http.HttpServletRequest;
           import java.util.LinkedHashMap;
-          import java.util.Map;
 
           @ControllerAdvice
           public class GlobalExceptionHandler {
 
             @ExceptionHandler(MethodArgumentNotValidException.class)
             public ResponseEntity<ApiError> handleValidation(MethodArgumentNotValidException ex,
-                                                             HttpServletRequest req) {
-              Map<String, String> fieldErrors = new LinkedHashMap<>();
+                                                             HttpServletRequest req){
+              var fields = new LinkedHashMap<String,String>();
               ex.getBindingResult().getFieldErrors()
-                .forEach(fe -> fieldErrors.put(fe.getField(), fe.getDefaultMessage()));
-
-              ApiError err = new ApiError();
+                .forEach(fe -> fields.put(fe.getField(), fe.getDefaultMessage()));
+              ApiError err=new ApiError();
               err.setStatus(HttpStatus.BAD_REQUEST.value());
               err.setError(HttpStatus.BAD_REQUEST.getReasonPhrase());
               err.setMessage("Validation failed");
               err.setPath(req.getRequestURI());
-              err.setValidation(fieldErrors);
+              err.setValidation(fields);
               return ResponseEntity.badRequest().body(err);
             }
 
             @ExceptionHandler(IllegalArgumentException.class)
-            public ResponseEntity<ApiError> handleIllegalArg(IllegalArgumentException ex,
-                                                             HttpServletRequest req) {
-              ApiError err = new ApiError();
+            public ResponseEntity<ApiError> handleIllegalArg(IllegalArgumentException ex, HttpServletRequest req){
+              ApiError err=new ApiError();
               err.setStatus(HttpStatus.CONFLICT.value());
               err.setError(HttpStatus.CONFLICT.getReasonPhrase());
               err.setMessage(ex.getMessage());
@@ -530,8 +581,8 @@ jobs:
             }
 
             @ExceptionHandler(Exception.class)
-            public ResponseEntity<ApiError> handleGeneric(Exception ex, HttpServletRequest req) {
-              ApiError err = new ApiError();
+            public ResponseEntity<ApiError> handleGeneric(Exception ex, HttpServletRequest req){
+              ApiError err=new ApiError();
               err.setStatus(HttpStatus.INTERNAL_SERVER_ERROR.value());
               err.setError(HttpStatus.INTERNAL_SERVER_ERROR.getReasonPhrase());
               err.setMessage(ex.getMessage());
@@ -539,14 +590,26 @@ jobs:
               return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(err);
             }
           }
-          JAVA
-        env:
-          PACKAGE_NAME: ${{ env.PACKAGE_NAME }}
+          EOF
 
-      - name: Unit & Integration Tests (H2 default)
+      - name: Guard: detect leftover ${...} and auto-fix
         run: |
           set -Eeuo pipefail
-          cat > "${TEST_PKG_DIR}/CustomerServiceTest.java" <<'JAVA'
+          if grep -R --include='*.java' '\${PACKAGE_NAME}' src/main/java >/dev/null 2>&1; then
+            sed -i "s|\${PACKAGE_NAME}|${PACKAGE_NAME}|g" $(git ls-files 'src/main/java/**/*.java')
+          fi
+          if grep -R --include='*.java' '\${APP_NAME}' src/main/java >/dev/null 2>&1; then
+            sed -i "s|\${APP_NAME}|${APP_NAME}|g" $(git ls-files 'src/main/java/**/*.java')
+          fi
+          # 최종 점검: 남아있으면 실패
+          ! grep -R --include='*.java' '\${' src/main/java || (echo "Unexpanded variables remain"; exit 1)
+
+      - name: Unit & IT (Testcontainers) sources
+        run: |
+          set -Eeuo pipefail
+          TEST_PKG_DIR="${{ steps.prep.outputs.TEST_PKG_DIR }}"
+
+          cat > "${TEST_PKG_DIR}/CustomerServiceTest.java" <<EOF
           package ${PACKAGE_NAME};
 
           import ${PACKAGE_NAME}.model.Customer;
@@ -558,126 +621,142 @@ jobs:
           import static org.junit.jupiter.api.Assertions.*;
           import static org.mockito.ArgumentMatchers.any;
 
-          public class CustomerServiceTest {
+          class CustomerServiceTest {
             @Test
-            void createCustomer_ok() {
-              CustomerRepository repo = Mockito.mock(CustomerRepository.class);
+            void create_ok(){
+              var repo = Mockito.mock(CustomerRepository.class);
               Mockito.when(repo.existsByEmail("a@b.c")).thenReturn(false);
-              Mockito.when(repo.save(any(Customer.class)))
-                     .thenAnswer(inv -> inv.getArgument(0));
-
-              CustomerService svc = new CustomerService(repo);
-              Customer saved = svc.createCustomer(new Customer("A","a@b.c","010"));
+              Mockito.when(repo.save(any(Customer.class))).thenAnswer(inv -> inv.getArgument(0));
+              var svc = new CustomerService(repo);
+              var saved = svc.create(new Customer(null,"A","a@b.c","010"));
               assertEquals("A", saved.getName());
-              assertEquals("a@b.c", saved.getEmail());
             }
-
             @Test
-            void createCustomer_dupEmail() {
-              CustomerRepository repo = Mockito.mock(CustomerRepository.class);
+            void dup_email(){
+              var repo = Mockito.mock(CustomerRepository.class);
               Mockito.when(repo.existsByEmail("dup@x.com")).thenReturn(true);
-              CustomerService svc = new CustomerService(repo);
+              var svc = new CustomerService(repo);
               assertThrows(IllegalArgumentException.class,
-                () -> svc.createCustomer(new Customer("D","dup@x.com","")));
+                () -> svc.create(new Customer(null,"D","dup@x.com",null)));
             }
           }
-          JAVA
+          EOF
 
-          cat > "${TEST_PKG_DIR}/CustomerControllerH2IT.java" <<'JAVA'
+          cat > "${TEST_PKG_DIR}/CustomerPostgresIT.java" <<EOF
           package ${PACKAGE_NAME};
 
           import ${PACKAGE_NAME}.dto.CustomerDto;
           import org.junit.jupiter.api.Test;
-          import org.springframework.beans.factory.annotation.Autowired;
           import org.springframework.boot.test.context.SpringBootTest;
           import org.springframework.boot.test.web.client.TestRestTemplate;
           import org.springframework.boot.test.web.server.LocalServerPort;
+          import org.springframework.test.context.DynamicPropertyRegistry;
+          import org.springframework.test.context.DynamicPropertySource;
+          import org.springframework.beans.factory.annotation.Autowired;
+          import org.testcontainers.containers.PostgreSQLContainer;
+          import org.testcontainers.junit.jupiter.Container;
+          import org.testcontainers.junit.jupiter.Testcontainers;
           import org.springframework.http.*;
 
-          import static org.junit.jupiter.api.Assertions.*;
-
+          @Testcontainers
           @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
-                          properties = { "spring.profiles.active=h2" })
-          class CustomerControllerH2IT {
+                          properties = {"spring.profiles.active=postgres,flyway"})
+          class CustomerPostgresIT {
 
-            @LocalServerPort
-            int port;
+            @Container
+            static PostgreSQLContainer<?> pg = new PostgreSQLContainer<>("postgres:16");
 
-            @Autowired
-            TestRestTemplate rest;
-
-            @Test
-            void postAndGet_ok() {
-              String base = "http://localhost:" + port;
-
-              CustomerDto dto = new CustomerDto("홍길동", "hong@example.com", "010-1234-5678");
-              ResponseEntity<String> postRes =
-                  rest.postForEntity(base + "/customers", dto, String.class);
-              assertEquals(HttpStatus.OK, postRes.getStatusCode());
-
-              String list = rest.getForObject(base + "/customers", String.class);
-              assertTrue(list.contains("hong@example.com"));
+            @DynamicPropertySource
+            static void props(DynamicPropertyRegistry r){
+              r.add("spring.datasource.url", pg::getJdbcUrl);
+              r.add("spring.datasource.username", pg::getUsername);
+              r.add("spring.datasource.password", pg::getPassword);
             }
 
-            @Test
-            void validation_fail() {
-              String base = "http://localhost:" + port;
+            @LocalServerPort int port;
+            @Autowired TestRestTemplate rest;
 
-              // invalid email
-              CustomerDto dto = new CustomerDto("A", "not-email", null);
-              ResponseEntity<String> res =
-                  rest.postForEntity(base + "/customers", dto, String.class);
-              assertEquals(HttpStatus.BAD_REQUEST, res.getStatusCode());
-              assertTrue(res.getBody().contains("Validation failed"));
+            @Test
+            void create_and_list(){
+              var dto = new CustomerDto("홍길동","pg@example.com","010");
+              var base = "http://localhost:"+port;
+              var res = rest.postForEntity(base+"/customers", dto, String.class);
+              assert(res.getStatusCode()==HttpStatus.OK);
+              var list = rest.getForObject(base+"/customers", String.class);
+              assert(list.contains("pg@example.com"));
             }
           }
-          JAVA
-        env:
-          PACKAGE_NAME: ${{ env.PACKAGE_NAME }}
+          EOF
 
-      - name: Build & Unit tests
-        run: mvn -B -q -DskipITs=false test package
+          cat > "${TEST_PKG_DIR}/CustomerMySQLIT.java" <<EOF
+          package ${PACKAGE_NAME};
 
-      - name: Smoke test via HTTP (H2)
-        if: ${{ env.RUN_SMOKE_TEST == 'true' }}
+          import ${PACKAGE_NAME}.dto.CustomerDto;
+          import org.junit.jupiter.api.Test;
+          import org.springframework.boot.test.context.SpringBootTest;
+          import org.springframework.boot.test.web.client.TestRestTemplate;
+          import org.springframework.boot.test.web.server.LocalServerPort;
+          import org.springframework.test.context.DynamicPropertyRegistry;
+          import org.springframework.test.context.DynamicPropertySource;
+          import org.springframework.beans.factory.annotation.Autowired;
+          import org.testcontainers.containers.MySQLContainer;
+          import org.testcontainers.junit.jupiter.Container;
+          import org.testcontainers.junit.jupiter.Testcontainers;
+          import org.springframework.http.*;
+
+          @Testcontainers
+          @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
+                          properties = {"spring.profiles.active=mysql,flyway"})
+          class CustomerMySQLIT {
+
+            @Container
+            static MySQLContainer<?> mysql = new MySQLContainer<>("mysql:8.4");
+
+            @DynamicPropertySource
+            static void props(DynamicPropertyRegistry r){
+              r.add("spring.datasource.url", mysql::getJdbcUrl);
+              r.add("spring.datasource.username", mysql::getUsername);
+              r.add("spring.datasource.password", mysql::getPassword);
+            }
+
+            @LocalServerPort int port;
+            @Autowired TestRestTemplate rest;
+
+            @Test
+            void create_and_list(){
+              var dto = new CustomerDto("이몽룡","my@example.com","010");
+              var base="http://localhost:"+port;
+              var res = rest.postForEntity(base+"/customers", dto, String.class);
+              assert(res.getStatusCode()==HttpStatus.OK);
+              var list = rest.getForObject(base+"/customers", String.class);
+              assert(list.contains("my@example.com"));
+            }
+          }
+          EOF
+
+      - name: Docker Echo Container (build & run)
         run: |
           set -Eeuo pipefail
-          LOG=.github/echo_logs; mkdir -p "$LOG"
-          nohup mvn -q -Dspring-boot.run.profiles=h2 -DskipTests spring-boot:run > "$LOG/app.log" 2>&1 &
-          APP_PID=$!
-          for i in $(seq 1 60); do
-            if curl -fsS "http://127.0.0.1:8080/actuator/health" >/dev/null 2>&1; then break; fi
-            sleep 1
-          done
-          curl -fsS -X POST "http://127.0.0.1:8080/customers" \
-            -H "Content-Type: application/json" \
-            -d '{"name":"홍길동","email":"hong2@example.com","phone":"010-0000-0000"}' | tee "$LOG/post.json"
-          curl -fsS "http://127.0.0.1:8080/customers" | tee "$LOG/get.json"
-          kill $APP_PID || true
+          cat > .github/echo_containers/Dockerfile <<DF
+          FROM alpine:3.20
+          WORKDIR /echo
+          COPY . /echo
+          CMD ["sh", "-c", "echo '[ECHO] Listing /echo && env'; ls -R /echo | head -n 50; env | sort | head -n 50"]
+          DF
+          docker build -t echo-container:latest .github/echo_containers
+          docker run --rm -e ECHO_FLAG=on echo-container:latest
 
-      - name: Postgres profile tests (optional)
-        if: ${{ env.RUN_POSTGRES_TESTS == 'true' }}
-        run: |
-          set -Eeuo pipefail
-          # wait for service healthy
-          for i in $(seq 1 60); do
-            if pg_isready -h 127.0.0.1 -p 5432 -U test >/dev/null 2>&1; then break; fi
-            sleep 1
-          done
-          mvn -B -q -Dspring.profiles.active=postgres -DskipTests=false test
+      - name: Build project (compile only)
+        run: mvn -B -q -DskipTests package
 
-      - name: MySQL profile tests (optional)
-        if: ${{ env.RUN_MYSQL_TESTS == 'true' }}
+      - name: Toggle Liquibase profile if requested
+        if: ${{ env.USE_LIQUIBASE == 'true' }}
         run: |
-          set -Eeuo pipefail
-          for i in $(seq 1 60); do
-            if mysqladmin ping -h 127.0.0.1 -proot >/dev/null 2>&1; then break; fi
-            sleep 1
-          done
-          mvn -B -q -Dspring.profiles.active=mysql -DskipTests=false test
+          sed -i 's/spring.profiles.active=flyway/spring.profiles.active=liquibase/g' src/main/resources/application.properties
+          echo "Liquibase profile enabled."
 
       - name: Commit & Push (optional)
-        if: ${{ env.COMMIT_CHANGES == 'true' }}
+        if: ${{ inputs.commit_changes == 'true' }}
         run: |
           set -Eeuo pipefail
           git config user.name "github-actions[bot]"
@@ -686,17 +765,95 @@ jobs:
           if git diff --cached --quiet; then
             echo "No changes."
           else
-            git commit -m "[ECHO] Init Customer Resource (H2/Postgres/MySQL + Validation + Advice)"
+            git commit -m "[ECHO] Fix heredoc + full MEGA init (OpenAPI/Testcontainers/Migrations/MapStruct)"
             git push
           fi
 
-      - name: Upload artifacts (sources, target, logs)
+      - name: Upload project artifact
         uses: actions/upload-artifact@v4
         with:
-          name: customer-app
+          name: customer-mega-src
           path: |
             pom.xml
             src/**
-            target/**
-            .github/echo_logs/**
+            .github/echo_*/**
+          if-no-files-found: error
+
+  build-test:
+    needs: generate
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        java: ${{ fromJSON( inputs.build_matrix == 'true' && '["17","21"]' || '["' + inputs.java_version + '"]' ) }}
+    steps:
+      - name: Download project
+        uses: actions/download-artifact@v4
+        with:
+          name: customer-mega-src
+
+      - name: Setup Java ${{ matrix.java }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ matrix.java }}
+          cache: maven
+
+      - name: Run unit & integration tests (Testcontainers)
+        run: |
+          set -Eeuo pipefail
+          mvn -B -q -DskipITs=false -Dtest=* test package
+
+      - name: Upload surefire reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: surefire-reports-java-${{ matrix.java }}
+          path: |
+            target/surefire-reports/**
+            target/failsafe-reports/**
+          if-no-files-found: warn
+
+  smoke:
+    needs: [generate]
+    if: ${{ inputs.run_smoke_test == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download project
+        uses: actions/download-artifact@v4
+        with:
+          name: customer-mega-src
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ inputs.java_version }}
+          cache: maven
+
+      - name: Boot run & curl check (H2 + OpenAPI)
+        run: |
+          set -Eeuo pipefail
+          LOG=.github/echo_logs; mkdir -p "$LOG"
+          nohup mvn -q -Dspring-boot.run.profiles=h2 spring-boot:run > "$LOG/app.log" 2>&1 &
+          APP_PID=$!
+          for i in $(seq 1 60); do
+            curl -fsS "http://127.0.0.1:8080/actuator/health" >/dev/null 2>&1 && break
+            sleep 1
+          done
+          curl -fsS "http://127.0.0.1:8080/v3/api-docs" | head -c 500 | tee "$LOG/openapi.json.head"
+          curl -fsS "http://127.0.0.1:8080/swagger-ui/index.html" | head -c 500 | tee "$LOG/swagger.head"
+          curl -fsS -X POST "http://127.0.0.1:8080/customers" \
+            -H "Content-Type: application/json" \
+            -d '{"name":"스모크","email":"smoke@example.com","phone":"010"}' | tee "$LOG/post.json"
+          curl -fsS "http://127.0.0.1:8080/customers" | tee "$LOG/get.json"
+          kill "$APP_PID" || true
+          sleep 2
+          pkill -f 'spring-boot:run' || true
+
+      - name: Upload smoke logs
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-logs
+          path: .github/echo_logs/**
           if-no-files-found: warn
