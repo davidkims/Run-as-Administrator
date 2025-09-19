@@ -50,14 +50,13 @@ permissions:
 env:
   SRC_MAIN: src/main/java
   SRC_TEST: src/test/java
-  # 아래 두 값으로 curl 기반 대량 다운로드를 토글할 수 있습니다(옵션).
-  # 리포지토리 Variables/Secrets에 설정해두면 자동 동작.
-  # DOWNLOAD_JDK: "true"  # Temurin JDK curl 설치
-  # DOWNLOAD_MAVEN: "true"  # Apache Maven curl 설치
-  # JDK_VERSION: ""   # 미설정 시 inputs.java_version 사용
+  # (옵션) curl 대량 다운로드 토글 — 리포지토리 Variables/Secrets에 설정 시 자동 동작
+  # DOWNLOAD_JDK: "true"
+  # DOWNLOAD_MAVEN: "true"
+  # JDK_VERSION: ""
   # JDK_ARCH: "x64"
   # MAVEN_VERSION: "3.9.9"
-  # MAVEN_SHA256: ""  # 제공 시 무결성 검증
+  # MAVEN_SHA256: ""
 
 jobs:
   generate:
@@ -113,7 +112,7 @@ jobs:
           done
           chmod 600 "$ENV_FILE" "$TOKENS_FILE"
 
-      # ⚠️ setup-java(cache:maven)는 pom.xml 생성 후로 이동 (캐시 키 생성을 위해)
+      # setup-java(cache:maven)는 pom.xml 생성 후에 실행
       - name: Prepare source layout
         id: prep
         run: |
@@ -131,7 +130,7 @@ jobs:
       - name: Generate pom.xml (Flyway 10.12.0 override)
         run: |
           set -Eeuo pipefail
-          cat > pom.xml <<'EOF'
+          cat > pom.xml <<EOF
           <project xmlns="http://maven.apache.org/POM/4.0.0"
                    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
                    xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
@@ -146,7 +145,7 @@ jobs:
               <mapstruct.version>1.5.5.Final</mapstruct.version>
               <testcontainers.version>1.20.1</testcontainers.version>
               <maven.compiler.release>${JAVA_PRIMARY}</maven.compiler.release>
-              <!-- ✅ Flyway 10.12.0로 상향: MySQL 8.4 / PostgreSQL 16.x 지원 -->
+              <!-- Flyway 10.12.0: MySQL 8.4 / PostgreSQL 16.x 지원 -->
               <flyway.version>10.12.0</flyway.version>
             </properties>
             <dependencyManagement>
@@ -154,7 +153,7 @@ jobs:
                 <dependency>
                   <groupId>org.springframework.boot</groupId>
                   <artifactId>spring-boot-dependencies</artifactId>
-                  <version>${spring-boot.version}</version>
+                  <version>\${spring-boot.version}</version>
                   <type>pom</type>
                   <scope>import</scope>
                 </dependency>
@@ -169,31 +168,45 @@ jobs:
               <dependency><groupId>com.h2database</groupId><artifactId>h2</artifactId><scope>runtime</scope></dependency>
               <dependency><groupId>org.postgresql</groupId><artifactId>postgresql</artifactId><scope>runtime</scope></dependency>
               <dependency><groupId>com.mysql</groupId><artifactId>mysql-connector-j</artifactId><scope>runtime</scope></dependency>
-              <!-- ✅ 버전은 Boot BOM + flyway.version으로 관리 -->
+              <!-- Boot BOM + flyway.version -->
               <dependency><groupId>org.flywaydb</groupId><artifactId>flyway-core</artifactId></dependency>
               <dependency><groupId>org.liquibase</groupId><artifactId>liquibase-core</artifactId></dependency>
-              <dependency><groupId>org.mapstruct</groupId><artifactId>mapstruct</artifactId><version>${mapstruct.version}</version></dependency>
+              <dependency><groupId>org.mapstruct</groupId><artifactId>mapstruct</artifactId><version>\${mapstruct.version}</version></dependency>
               <dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-test</artifactId><scope>test</scope></dependency>
-              <dependency><groupId>org.testcontainers</groupId><artifactId>junit-jupiter</artifactId><version>${testcontainers.version}</version><scope>test</scope></dependency>
-              <dependency><groupId>org.testcontainers</groupId><artifactId>postgresql</artifactId><version>${testcontainers.version}</version><scope>test</scope></dependency>
-              <dependency><groupId>org.testcontainers</groupId><artifactId>mysql</artifactId><version>${testcontainers.version}</version><scope>test</scope></dependency>
+              <dependency><groupId>org.testcontainers</groupId><artifactId>junit-jupiter</artifactId><version>\${testcontainers.version}</version><scope>test</scope></dependency>
+              <dependency><groupId>org.testcontainers</groupId><artifactId>postgresql</artifactId><version>\${testcontainers.version}</version><scope>test</scope></dependency>
+              <dependency><groupId>org.testcontainers</groupId><artifactId>mysql</artifactId><version>\${testcontainers.version}</version><scope>test</scope></dependency>
             </dependencies>
             <build>
               <plugins>
                 <plugin>
-                  <groupId>org.springframework.boot</groupId><artifactId>spring-boot-maven-plugin</artifactId>
-                  <configuration><mainClass>${PACKAGE_NAME}.${APP_NAME}</mainClass></configuration>
+                  <groupId>org.springframework.boot</groupId>
+                  <artifactId>spring-boot-maven-plugin</artifactId>
+                  <version>\${spring-boot.version}</version>
+                  <configuration>
+                    <mainClass>${PACKAGE_NAME}.${APP_NAME}</mainClass>
+                  </configuration>
                 </plugin>
                 <plugin>
-                  <groupId>org.apache.maven.plugins</groupId><artifactId>maven-compiler-plugin</artifactId><version>3.13.0</version>
+                  <groupId>org.apache.maven.plugins</groupId>
+                  <artifactId>maven-compiler-plugin</artifactId>
+                  <version>3.13.0</version>
                   <configuration>
-                    <release>${maven.compiler.release}</release>
+                    <release>\${maven.compiler.release}</release>
                     <annotationProcessorPaths>
-                      <path><groupId>org.mapstruct</groupId><artifactId>mapstruct-processor</artifactId><version>${mapstruct.version}</version></path>
+                      <path>
+                        <groupId>org.mapstruct</groupId>
+                        <artifactId>mapstruct-processor</artifactId>
+                        <version>\${mapstruct.version}</version>
+                      </path>
                     </annotationProcessorPaths>
                   </configuration>
                 </plugin>
-                <plugin><groupId>org.apache.maven.plugins</groupId><artifactId>maven-surefire-plugin</artifactId><version>3.2.5</version></plugin>
+                <plugin>
+                  <groupId>org.apache.maven.plugins</groupId>
+                  <artifactId>maven-surefire-plugin</artifactId>
+                  <version>3.2.5</version>
+                </plugin>
               </plugins>
             </build>
           </project>
@@ -206,7 +219,7 @@ jobs:
           java-version: ${{ env.JAVA_PRIMARY }}
           cache: maven
 
-      # ⬇️ (옵션) Temurin JDK curl 설치 — 환경변수로 토글
+      # (옵션) Temurin JDK curl 설치
       - name: Curl install Temurin JDK
         if: ${{ env.DOWNLOAD_JDK == 'true' }}
         env:
@@ -224,8 +237,7 @@ jobs:
           echo "$PWD/$JDK_DIR/bin" >> $GITHUB_PATH
           java -version
 
-      # ⬇️ (옵션) Maven curl 설치 — 환경변수로 토글
-        # 무결성 검증을 원하면 MAVEN_SHA256 변수 제공
+      # (옵션) Apache Maven curl 설치
       - name: Curl install Apache Maven
         if: ${{ env.DOWNLOAD_MAVEN == 'true' }}
         env:
@@ -651,11 +663,8 @@ jobs:
           }
           group = System.getenv('GROUP_ID') ?: 'com.example'
           version = '0.0.1-SNAPSHOT'
-          // ✅ Boot 의존성관리용 flyway.version 프로퍼티
-          ext { set('flyway.version', '10.12.0') }
-          java {
-            toolchain { languageVersion = JavaLanguageVersion.of(Integer.valueOf(System.getenv('JAVA_PRIMARY') ?: '17')) }
-          }
+          ext { set('flyway.version', '10.12.0') }   // for BOM override (reference)
+          java { toolchain { languageVersion = JavaLanguageVersion.of(Integer.valueOf(System.getenv('JAVA_PRIMARY') ?: '17')) } }
           repositories { mavenCentral() }
           dependencies {
             implementation 'org.springframework.boot:spring-boot-starter-web'
@@ -666,7 +675,8 @@ jobs:
             runtimeOnly 'com.h2database:h2'
             runtimeOnly 'org.postgresql:postgresql'
             runtimeOnly 'com.mysql:mysql-connector-j'
-            implementation 'org.flywaydb:flyway-core'   // 버전은 BOM + flyway.version
+            // 확실히 10.12.0 적용
+            implementation 'org.flywaydb:flyway-core:10.12.0'
             implementation 'org.liquibase:liquibase-core'
             testImplementation 'org.springframework.boot:spring-boot-starter-test'
             testImplementation 'org.testcontainers:junit-jupiter:1.20.1'
@@ -832,10 +842,23 @@ jobs:
           LOG=.github/echo_logs; mkdir -p "$LOG"
           nohup mvn -q -Dspring-boot.run.profiles=h2 spring-boot:run > "$LOG/app.log" 2>&1 &
           APP_PID=$!
-          for i in $(seq 1 90); do
-            curl -fsS "http://127.0.0.1:8080/actuator/health" >/dev/null 2>&1 && break
+          # 대기시간 증대 + 조기종료/타임아웃시 로그덤프
+          for i in $(seq 1 120); do
+            if curl -fsS "http://127.0.0.1:8080/actuator/health" >/dev/null 2>&1; then
+              READY=1; break
+            fi
+            if ! kill -0 "$APP_PID" 2>/dev/null; then
+              echo "[ERROR] Spring Boot process exited early. Dumping last 200 lines of log:"
+              tail -n 200 "$LOG/app.log" || true
+              exit 1
+            fi
             sleep 1
           done
+          if [ "${READY:-0}" -ne 1 ]; then
+            echo "[ERROR] App did not become healthy in time. Dumping last 200 lines of log:"
+            tail -n 200 "$LOG/app.log" || true
+            exit 7
+          fi
           curl -fsS "http://127.0.0.1:8080/v3/api-docs" | head -c 500 | tee "$LOG/openapi.json.head"
           curl -fsS "http://127.0.0.1:8080/swagger-ui/index.html" | head -c 500 | tee "$LOG/swagger.head"
           curl -fsS -X POST "http://127.0.0.1:8080/customers" \
