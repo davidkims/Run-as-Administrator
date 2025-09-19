@@ -685,7 +685,7 @@ jobs:
           POM
           mkdir -p src/main/java src/test/java
 
-      - name: Setup Java ${{ matrix.java }} (cache: maven)
+      - name: Setup Java ${{ matrix.java }} (cache:maven)
         uses: actions/setup-java@v4
         with:
           distribution: temurin
