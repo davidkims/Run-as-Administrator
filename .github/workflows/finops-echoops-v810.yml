@@ -1,4 +1,4 @@
-name: "🏗️ Customer MEGA — Gen + Echo + OpenAPI + Testcontainers + Flyway/Liquibase + MapStruct + Matrix CI (Fixed+Gradle)"
+name: "🏗️ Customer MEGA — Gen + Echo + OpenAPI + Testcontainers + Flyway/Liquibase + MapStruct + Matrix CI (Fixed+Gradle+CurlDL)"
 
 on:
   workflow_dispatch:
@@ -106,40 +106,7 @@ jobs:
           done
           chmod 600 "$ENV_FILE" "$TOKENS_FILE"
 
-      - name: Setup Java (primary) + Maven cache
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: ${{ env.JAVA_PRIMARY }}
-          cache: maven
-
-      - name: Ensure Maven is available
-        run: |
-          set -Eeuo pipefail
-          if ! command -v mvn >/dev/null 2>&1; then
-            sudo apt-get update -y
-            sudo apt-get install -y maven
-          fi
-          mvn -v
-
-      - name: Create ~/.m2/settings.xml (GH server optional)
-        run: |
-          mkdir -p ~/.m2
-          cat > ~/.m2/settings.xml <<XML
-          <settings xmlns="http://maven.apache.org/SETTINGS/1.0.0"
-                    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-                    xsi:schemaLocation="http://maven.apache.org/SETTINGS/1.0.0
-                                        https://maven.apache.org/xsd/settings-1.0.0.xsd">
-            <servers>
-              <server>
-                <id>github</id>
-                <username>${GITHUB_ACTOR}</username>
-                <password>${GITHUB_TOKEN}</password>
-              </server>
-            </servers>
-          </settings>
-          XML
-
+      # 🔽 먼저 소스/포맷 생성 → pom.xml을 만든 다음에 setup-java(cache:maven) 실행
       - name: Prepare source layout
         id: prep
         run: |
@@ -150,9 +117,7 @@ jobs:
           mkdir -p \
             "${PKG_DIR}"/{model,dto,repository,service,controller,advice,exception,mapper,config} \
             "${TEST_PKG_DIR}"
-          mkdir -p src/main/resources/db/migration
-          mkdir -p src/main/resources/db/changelog
-          mkdir -p src/main/resources/static
+          mkdir -p src/main/resources/{db/migration,db/changelog,static}
           echo "PKG_DIR=$PKG_DIR" >> $GITHUB_OUTPUT
           echo "TEST_PKG_DIR=$TEST_PKG_DIR" >> $GITHUB_OUTPUT
 
@@ -223,6 +188,78 @@ jobs:
             </build>
           </project>
           EOF
+
+      # ✅ 이제 pom.xml이 있으므로 cache:maven 사용해도 안전
+      - name: Setup Java (primary) + Maven cache
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_PRIMARY }}
+          cache: maven
+
+      # 🔽 공식 경로 curl 다운로드: JDK(Temurin) — 필요 시(환경변수로 제어)
+      - name: Curl install Temurin JDK if requested
+        if: ${{ env.DOWNLOAD_JDK == 'true' }}
+        env:
+          JDK_VERSION: ${{ env.JDK_VERSION || env.JAVA_PRIMARY }}
+          JDK_ARCH: ${{ env.JDK_ARCH || 'x64' }}
+        run: |
+          set -Eeuo pipefail
+          mkdir -p .github/downloads
+          echo "Downloading Temurin JDK ${JDK_VERSION} (${JDK_ARCH})..."
+          # Adoptium API: 최신 GA JDK 바이너리
+          URL="https://api.adoptium.net/v3/binary/latest/${JDK_VERSION}/ga/linux/${JDK_ARCH}/jdk/hotspot/normal/eclipse"
+          curl -fsSL --retry 3 --retry-connrefused -o .github/downloads/temurin.tar.gz "$URL"
+          tar -xzf .github/downloads/temurin.tar.gz -C .github/downloads
+          JDK_DIR="$(find .github/downloads -maxdepth 1 -type d -name 'jdk-*' | head -n1)"
+          if [ -d "$JDK_DIR" ]; then
+            echo "Using JDK at: $JDK_DIR"
+            echo "JAVA_HOME=$PWD/$JDK_DIR" >> $GITHUB_ENV
+            echo "$PWD/$JDK_DIR/bin" >> $GITHUB_PATH
+            java -version
+          else
+            echo "JDK directory not found after extraction."; exit 1
+          fi
+
+      # 🔽 공식 경로 curl 다운로드: Maven — 필요 시(환경변수로 제어)
+      - name: [Optional] Curl install Apache Maven if requested
+        if: ${{ env.DOWNLOAD_MAVEN == 'true' }}
+        env:
+          MAVEN_VERSION: ${{ env.MAVEN_VERSION || '3.9.9' }}
+          MAVEN_SHA256: ${{ env.MAVEN_SHA256 }}
+        run: |
+          set -Eeuo pipefail
+          mkdir -p .github/downloads
+          TAR="apache-maven-${MAVEN_VERSION}-bin.tar.gz"
+          URL="https://downloads.apache.org/maven/maven-3/${MAVEN_VERSION}/binaries/${TAR}"
+          echo "Downloading Maven ${MAVEN_VERSION} ..."
+          curl -fsSL --retry 3 --retry-connrefused -o ".github/downloads/${TAR}" "$URL"
+          if [ -n "${MAVEN_SHA256:-}" ]; then
+            echo "${MAVEN_SHA256}  .github/downloads/${TAR}" | sha256sum -c -
+          fi
+          tar -xzf ".github/downloads/${TAR}" -C .github/downloads
+          MVN_DIR=".github/downloads/apache-maven-${MAVEN_VERSION}"
+          echo "M2_HOME=$PWD/${MVN_DIR}" >> $GITHUB_ENV
+          echo "$PWD/${MVN_DIR}/bin" >> $GITHUB_PATH
+          mvn -v
+
+      - name: Create ~/.m2/settings.xml (GH server optional)
+        run: |
+          mkdir -p ~/.m2
+          cat > ~/.m2/settings.xml <<XML
+          <settings xmlns="http://maven.apache.org/SETTINGS/1.0.0"
+                    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                    xsi:schemaLocation="http://maven.apache.org/SETTINGS/1.0.0
+                                        https://maven.apache.org/xsd/settings-1.0.0.xsd">
+            <servers>
+              <server>
+                <id>github</id>
+                <username>${GITHUB_ACTOR}</username>
+                <password>${GITHUB_TOKEN}</password>
+              </server>
+            </servers>
+          </settings>
+          XML
 
       - name: application properties & profiles (OpenAPI + Flyway/Liquibase)
         run: |
@@ -410,7 +447,7 @@ jobs:
           }
           EOF
 
-      - name: Guard:detect leftover ${...} and auto-fix
+      - name: Guard: detect leftover ${...} and auto-fix
         run: |
           set -Eeuo pipefail
           if grep -R --include='*.java' '\${PACKAGE_NAME}' src/main/java >/dev/null 2>&1; then
@@ -425,11 +462,11 @@ jobs:
         run: |
           set -Eeuo pipefail
           TEST_PKG_DIR="${{ steps.prep.outputs.TEST_PKG_DIR }}"
-          cat > "${TEST_PKG_DIR}/CustomerServiceTest.java" <<EOF
-          package ${PACKAGE_NAME};
-          import ${PACKAGE_NAME}.model.Customer;
-          import ${PACKAGE_NAME}.repository.CustomerRepository;
-          import ${PACKAGE_NAME}.service.CustomerService;
+          cat > "${TEST_PKG_DIR}/CustomerServiceTest.java" <<'EOF'
+          package PACKAGE_NAME_REPLACE;
+          import PACKAGE_NAME_REPLACE.model.Customer;
+          import PACKAGE_NAME_REPLACE.repository.CustomerRepository;
+          import PACKAGE_NAME_REPLACE.service.CustomerService;
           import org.junit.jupiter.api.Test;
           import org.mockito.Mockito;
           import static org.junit.jupiter.api.Assertions.*;
@@ -454,9 +491,11 @@ jobs:
             }
           }
           EOF
-          cat > "${TEST_PKG_DIR}/CustomerPostgresIT.java" <<EOF
-          package ${PACKAGE_NAME};
-          import ${PACKAGE_NAME}.dto.CustomerDto;
+          sed -i "s|PACKAGE_NAME_REPLACE|${PACKAGE_NAME}|g" "${TEST_PKG_DIR}/CustomerServiceTest.java"
+
+          cat > "${TEST_PKG_DIR}/CustomerPostgresIT.java" <<'EOF'
+          package PACKAGE_NAME_REPLACE;
+          import PACKAGE_NAME_REPLACE.dto.CustomerDto;
           import org.junit.jupiter.api.Test;
           import org.springframework.boot.test.context.SpringBootTest;
           import org.springframework.boot.test.web.client.TestRestTemplate;
@@ -493,9 +532,11 @@ jobs:
             }
           }
           EOF
-          cat > "${TEST_PKG_DIR}/CustomerMySQLIT.java" <<EOF
-          package ${PACKAGE_NAME};
-          import ${PACKAGE_NAME}.dto.CustomerDto;
+          sed -i "s|PACKAGE_NAME_REPLACE|${PACKAGE_NAME}|g" "${TEST_PKG_DIR}/CustomerPostgresIT.java"
+
+          cat > "${TEST_PKG_DIR}/CustomerMySQLIT.java" <<'EOF'
+          package PACKAGE_NAME_REPLACE;
+          import PACKAGE_NAME_REPLACE.dto.CustomerDto;
           import org.junit.jupiter.api.Test;
           import org.springframework.boot.test.context.SpringBootTest;
           import org.springframework.boot.test.web.client.TestRestTemplate;
@@ -532,6 +573,7 @@ jobs:
             }
           }
           EOF
+          sed -i "s|PACKAGE_NAME_REPLACE|${PACKAGE_NAME}|g" "${TEST_PKG_DIR}/CustomerMySQLIT.java"
 
       - name: Toggle Liquibase profile if requested
         if: ${{ env.USE_LIQUIBASE == 'true' }}
@@ -542,7 +584,7 @@ jobs:
       - name: Docker Echo Container (build & run)
         run: |
           set -Eeuo pipefail
-          cat > .github/echo_containers/Dockerfile <<DF
+          cat > .github/echo_containers/Dockerfile <<'DF'
           FROM alpine:3.20
           WORKDIR /echo
           COPY . /echo
@@ -558,7 +600,7 @@ jobs:
         run: |
           set -Eeuo pipefail
           mvn -N -q io.takari:maven:wrapper
-          git status --porcelain
+          chmod +x mvnw || true
 
       - name: Install Gradle (to generate wrapper)
         if: ${{ inputs.enable_gradle == 'true' }}
@@ -597,14 +639,11 @@ jobs:
             implementation 'org.springframework.boot:spring-boot-starter-validation'
             implementation 'org.springdoc:springdoc-openapi-starter-webmvc-ui:2.6.0'
             implementation 'org.mapstruct:mapstruct:1.5.5.Final'
-
             runtimeOnly 'com.h2database:h2'
             runtimeOnly 'org.postgresql:postgresql'
             runtimeOnly 'com.mysql:mysql-connector-j'
-
             implementation 'org.flywaydb:flyway-core'
             implementation 'org.liquibase:liquibase-core'
-
             testImplementation 'org.springframework.boot:spring-boot-starter-test'
             testImplementation 'org.testcontainers:junit-jupiter:1.20.1'
             testImplementation 'org.testcontainers:postgresql:1.20.1'
@@ -617,7 +656,6 @@ jobs:
           BG
           gradle wrapper --gradle-version 8.10.2
           chmod +x gradlew
-          ./gradlew -v
 
       - name: Commit & Push (optional)
         if: ${{ inputs.commit_changes == 'true' }}
@@ -629,7 +667,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "No changes."
           else
-            git commit -m "[ECHO] Full MEGA init + mvnw/gradlew + OpenAPI/Testcontainers/Migrations/MapStruct"
+            git commit -m "[ECHO] MEGA init + mvnw/gradlew + OpenAPI/Testcontainers/Migrations/MapStruct + curl JDK/Maven optional"
             git push
           fi
 
@@ -671,10 +709,7 @@ jobs:
           set -Eeuo pipefail
           shopt -s dotglob nullglob
           SRC_DIR="customer-mega-src"
-          if [ -d "$SRC_DIR" ]; then
-            rsync -a "$SRC_DIR"/ ./
-          fi
-          # Guarantee minimal structure for caches
+          [ -d "$SRC_DIR" ] && rsync -a "$SRC_DIR"/ ./
           [ -f pom.xml ] || cat > pom.xml <<'POM'
           <project xmlns="http://maven.apache.org/POM/4.0.0"
                    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
@@ -685,22 +720,12 @@ jobs:
           POM
           mkdir -p src/main/java src/test/java
 
-      - name: Setup Java ${{ matrix.java }} (cache:maven)
+      - name: Setup Java ${{ matrix.java }} (cache: maven)
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: ${{ matrix.java }}
           cache: maven
-
-      - name: Ensure Maven exists (for Maven build & cache key)
-        if: ${{ matrix.build == 'maven' }}
-        run: |
-          set -Eeuo pipefail
-          if ! command -v mvn >/dev/null 2>&1; then
-            sudo apt-get update -y
-            sudo apt-get install -y maven
-          fi
-          mvn -v
 
       - name: Gradle cache
         if: ${{ matrix.build == 'gradle' }}
@@ -770,15 +795,6 @@ jobs:
           </project>
           POM
           mkdir -p src/main/java src/test/java
-
-      - name: Ensure Maven is available
-        run: |
-          set -Eeuo pipefail
-          if ! command -v mvn >/dev/null 2>&1; then
-            sudo apt-get update -y
-            sudo apt-get install -y maven
-          fi
-          mvn -v
 
       - name: Setup Java (for smoke)
         uses: actions/setup-java@v4
