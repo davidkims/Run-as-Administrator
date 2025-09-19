@@ -1,0 +1,5 @@
+{ "users": [
+    {"username": "svc_admin", "roles": ["ADMIN","OPS"]},
+    {"username": "svc_app",   "roles": ["APP"]},
+    {"username": "svc_ro",    "roles": ["READONLY"]}
+] }

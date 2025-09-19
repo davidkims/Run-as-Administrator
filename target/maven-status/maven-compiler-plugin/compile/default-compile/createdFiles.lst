@@ -1,0 +1,8 @@
+com/example/demo/model/Customer.class
+com/example/demo/repository/CustomerRepository.class
+com/example/demo/service/CustomerService.class
+com/example/demo/controller/CustomerController.class
+com/example/demo/mapper/CustomerMapper.class
+com/example/demo/DemoApplication.class
+com/example/demo/dto/CustomerDto.class
+com/example/demo/mapper/CustomerMapperImpl.class
