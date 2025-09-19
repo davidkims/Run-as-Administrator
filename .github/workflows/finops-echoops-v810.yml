@@ -1,4 +1,4 @@
-name: "🏗️ Customer MEGA — Gen + Echo + OpenAPI + Testcontainers + Flyway/Liquibase + MapStruct + Matrix CI (Fixed+Gradle+CurlDL)"
+name: "🏗️ Customer MEGA — Gen + Echo + OpenAPI + Testcontainers + Flyway/Liquibase + MapStruct + Matrix CI (Unified)"
 
 on:
   workflow_dispatch:
@@ -32,7 +32,7 @@ on:
         required: true
         default: "false"
       build_matrix:
-        description: "Matrix build across Java versions 17,21 (true/false)"
+        description: "Matrix build across Java 17,21 (true/false)"
         required: true
         default: "true"
       use_liquibase:
@@ -50,6 +50,14 @@ permissions:
 env:
   SRC_MAIN: src/main/java
   SRC_TEST: src/test/java
+  # 아래 두 값으로 curl 기반 대량 다운로드를 토글할 수 있습니다(옵션).
+  # 리포지토리 Variables/Secrets에 설정해두면 자동 동작.
+  # DOWNLOAD_JDK: "true"  # Temurin JDK curl 설치
+  # DOWNLOAD_MAVEN: "true"  # Apache Maven curl 설치
+  # JDK_VERSION: ""   # 미설정 시 inputs.java_version 사용
+  # JDK_ARCH: "x64"
+  # MAVEN_VERSION: "3.9.9"
+  # MAVEN_SHA256: ""  # 제공 시 무결성 검증
 
 jobs:
   generate:
@@ -68,8 +76,7 @@ jobs:
       - name: Echo helpers & massive dir tree
         run: |
           set -Eeuo pipefail
-          TS(){ date +'%F %T'; }
-          echoe(){ printf '[%s] %s\n' "$(TS)" "$*"; }
+          TS(){ date +'%F %T'; }; echoe(){ printf '[%s] %s\n' "$(TS)" "$*"; }
           mkdir -p \
             .github/echo_logs \
             .github/echo_dirs/{app,db,docs,ops,tests,containers} \
@@ -106,7 +113,7 @@ jobs:
           done
           chmod 600 "$ENV_FILE" "$TOKENS_FILE"
 
-      # 🔽 먼저 소스/포맷 생성 → pom.xml을 만든 다음에 setup-java(cache:maven) 실행
+      # ⚠️ setup-java(cache:maven)는 pom.xml 생성 후로 이동 (캐시 키 생성을 위해)
       - name: Prepare source layout
         id: prep
         run: |
@@ -116,15 +123,15 @@ jobs:
           TEST_PKG_DIR="${SRC_TEST}/${PKG_PATH}"
           mkdir -p \
             "${PKG_DIR}"/{model,dto,repository,service,controller,advice,exception,mapper,config} \
-            "${TEST_PKG_DIR}"
-          mkdir -p src/main/resources/{db/migration,db/changelog,static}
+            "${TEST_PKG_DIR}" \
+            src/main/resources/{db/migration,db/changelog,static}
           echo "PKG_DIR=$PKG_DIR" >> $GITHUB_OUTPUT
           echo "TEST_PKG_DIR=$TEST_PKG_DIR" >> $GITHUB_OUTPUT
 
-      - name: Generate pom.xml
+      - name: Generate pom.xml (Flyway 10.12.0 override)
         run: |
           set -Eeuo pipefail
-          cat > pom.xml <<EOF
+          cat > pom.xml <<'EOF'
           <project xmlns="http://maven.apache.org/POM/4.0.0"
                    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
                    xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
@@ -139,13 +146,15 @@ jobs:
               <mapstruct.version>1.5.5.Final</mapstruct.version>
               <testcontainers.version>1.20.1</testcontainers.version>
               <maven.compiler.release>${JAVA_PRIMARY}</maven.compiler.release>
+              <!-- ✅ Flyway 10.12.0로 상향: MySQL 8.4 / PostgreSQL 16.x 지원 -->
+              <flyway.version>10.12.0</flyway.version>
             </properties>
             <dependencyManagement>
               <dependencies>
                 <dependency>
                   <groupId>org.springframework.boot</groupId>
                   <artifactId>spring-boot-dependencies</artifactId>
-                  <version>\${spring-boot.version}</version>
+                  <version>${spring-boot.version}</version>
                   <type>pom</type>
                   <scope>import</scope>
                 </dependency>
@@ -160,13 +169,14 @@ jobs:
               <dependency><groupId>com.h2database</groupId><artifactId>h2</artifactId><scope>runtime</scope></dependency>
               <dependency><groupId>org.postgresql</groupId><artifactId>postgresql</artifactId><scope>runtime</scope></dependency>
               <dependency><groupId>com.mysql</groupId><artifactId>mysql-connector-j</artifactId><scope>runtime</scope></dependency>
+              <!-- ✅ 버전은 Boot BOM + flyway.version으로 관리 -->
               <dependency><groupId>org.flywaydb</groupId><artifactId>flyway-core</artifactId></dependency>
               <dependency><groupId>org.liquibase</groupId><artifactId>liquibase-core</artifactId></dependency>
-              <dependency><groupId>org.mapstruct</groupId><artifactId>mapstruct</artifactId><version>\${mapstruct.version}</version></dependency>
+              <dependency><groupId>org.mapstruct</groupId><artifactId>mapstruct</artifactId><version>${mapstruct.version}</version></dependency>
               <dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-test</artifactId><scope>test</scope></dependency>
-              <dependency><groupId>org.testcontainers</groupId><artifactId>junit-jupiter</artifactId><version>\${testcontainers.version}</version><scope>test</scope></dependency>
-              <dependency><groupId>org.testcontainers</groupId><artifactId>postgresql</artifactId><version>\${testcontainers.version}</version><scope>test</scope></dependency>
-              <dependency><groupId>org.testcontainers</groupId><artifactId>mysql</artifactId><version>\${testcontainers.version}</version><scope>test</scope></dependency>
+              <dependency><groupId>org.testcontainers</groupId><artifactId>junit-jupiter</artifactId><version>${testcontainers.version}</version><scope>test</scope></dependency>
+              <dependency><groupId>org.testcontainers</groupId><artifactId>postgresql</artifactId><version>${testcontainers.version}</version><scope>test</scope></dependency>
+              <dependency><groupId>org.testcontainers</groupId><artifactId>mysql</artifactId><version>${testcontainers.version}</version><scope>test</scope></dependency>
             </dependencies>
             <build>
               <plugins>
@@ -177,9 +187,9 @@ jobs:
                 <plugin>
                   <groupId>org.apache.maven.plugins</groupId><artifactId>maven-compiler-plugin</artifactId><version>3.13.0</version>
                   <configuration>
-                    <release>\${maven.compiler.release}</release>
+                    <release>${maven.compiler.release}</release>
                     <annotationProcessorPaths>
-                      <path><groupId>org.mapstruct</groupId><artifactId>mapstruct-processor</artifactId><version>\${mapstruct.version}</version></path>
+                      <path><groupId>org.mapstruct</groupId><artifactId>mapstruct-processor</artifactId><version>${mapstruct.version}</version></path>
                     </annotationProcessorPaths>
                   </configuration>
                 </plugin>
@@ -189,7 +199,6 @@ jobs:
           </project>
           EOF
 
-      # ✅ 이제 pom.xml이 있으므로 cache:maven 사용해도 안전
       - name: Setup Java (primary) + Maven cache
         uses: actions/setup-java@v4
         with:
@@ -197,8 +206,8 @@ jobs:
           java-version: ${{ env.JAVA_PRIMARY }}
           cache: maven
 
-      # 🔽 공식 경로 curl 다운로드: JDK(Temurin) — 필요 시(환경변수로 제어)
-      - name: Curl install Temurin JDK if requested
+      # ⬇️ (옵션) Temurin JDK curl 설치 — 환경변수로 토글
+      - name: Curl install Temurin JDK
         if: ${{ env.DOWNLOAD_JDK == 'true' }}
         env:
           JDK_VERSION: ${{ env.JDK_VERSION || env.JAVA_PRIMARY }}
@@ -206,23 +215,18 @@ jobs:
         run: |
           set -Eeuo pipefail
           mkdir -p .github/downloads
-          echo "Downloading Temurin JDK ${JDK_VERSION} (${JDK_ARCH})..."
-          # Adoptium API: 최신 GA JDK 바이너리
           URL="https://api.adoptium.net/v3/binary/latest/${JDK_VERSION}/ga/linux/${JDK_ARCH}/jdk/hotspot/normal/eclipse"
+          echo "Downloading Temurin JDK: $URL"
           curl -fsSL --retry 3 --retry-connrefused -o .github/downloads/temurin.tar.gz "$URL"
           tar -xzf .github/downloads/temurin.tar.gz -C .github/downloads
           JDK_DIR="$(find .github/downloads -maxdepth 1 -type d -name 'jdk-*' | head -n1)"
-          if [ -d "$JDK_DIR" ]; then
-            echo "Using JDK at: $JDK_DIR"
-            echo "JAVA_HOME=$PWD/$JDK_DIR" >> $GITHUB_ENV
-            echo "$PWD/$JDK_DIR/bin" >> $GITHUB_PATH
-            java -version
-          else
-            echo "JDK directory not found after extraction."; exit 1
-          fi
+          echo "JAVA_HOME=$PWD/$JDK_DIR" >> $GITHUB_ENV
+          echo "$PWD/$JDK_DIR/bin" >> $GITHUB_PATH
+          java -version
 
-      # 🔽 공식 경로 curl 다운로드: Maven — 필요 시(환경변수로 제어)
-      - name: Curl install Apache Maven if requested
+      # ⬇️ (옵션) Maven curl 설치 — 환경변수로 토글
+        # 무결성 검증을 원하면 MAVEN_SHA256 변수 제공
+      - name: Curl install Apache Maven
         if: ${{ env.DOWNLOAD_MAVEN == 'true' }}
         env:
           MAVEN_VERSION: ${{ env.MAVEN_VERSION || '3.9.9' }}
@@ -447,6 +451,28 @@ jobs:
           }
           EOF
 
+      - name: Patch existing build files to Flyway 10.12.0 (safety net)
+        run: |
+          set -Eeuo pipefail
+          if [ -f pom.xml ]; then
+            if grep -q '<flyway.version>' pom.xml; then
+              sed -i 's|<flyway.version>.*</flyway.version>|<flyway.version>10.12.0</flyway.version>|' pom.xml
+            else
+              awk '1;/<properties>/{p=1} p&&/<\/properties>/{print "    <flyway.version>10.12.0</flyway.version>";p=0}' pom.xml > pom.xml.tmp && mv pom.xml.tmp pom.xml
+            fi
+          fi
+          if [ -f build.gradle ]; then
+            if grep -Eq "set\\('flyway.version'\\s*,\\s*'[^']+'\\)" build.gradle; then
+              sed -i "s|set('flyway.version'\\s*,\\s*'[^']\\+')|set('flyway.version', '10.12.0')|g" build.gradle
+            else
+              awk '
+                /plugins *\{/ {inplug=1}
+                {print}
+                inplug && /\}/ && !done {print "\next { set('\''flyway.version'\'', '\''10.12.0'\'') }\n"; done=1; inplug=0}
+              ' build.gradle > build.gradle.tmp && mv build.gradle.tmp build.gradle
+            fi
+          fi
+
       - name: Guard:detect leftover ${...} and auto-fix
         run: |
           set -Eeuo pipefail
@@ -492,7 +518,6 @@ jobs:
           }
           EOF
           sed -i "s|PACKAGE_NAME_REPLACE|${PACKAGE_NAME}|g" "${TEST_PKG_DIR}/CustomerServiceTest.java"
-
           cat > "${TEST_PKG_DIR}/CustomerPostgresIT.java" <<'EOF'
           package PACKAGE_NAME_REPLACE;
           import PACKAGE_NAME_REPLACE.dto.CustomerDto;
@@ -533,7 +558,6 @@ jobs:
           }
           EOF
           sed -i "s|PACKAGE_NAME_REPLACE|${PACKAGE_NAME}|g" "${TEST_PKG_DIR}/CustomerPostgresIT.java"
-
           cat > "${TEST_PKG_DIR}/CustomerMySQLIT.java" <<'EOF'
           package PACKAGE_NAME_REPLACE;
           import PACKAGE_NAME_REPLACE.dto.CustomerDto;
@@ -612,7 +636,7 @@ jobs:
           fi
           gradle -v
 
-      - name: Generate Gradle build files + Wrapper
+      - name: Generate Gradle build files + Wrapper (Flyway 10.12.0)
         if: ${{ inputs.enable_gradle == 'true' }}
         run: |
           set -Eeuo pipefail
@@ -627,10 +651,10 @@ jobs:
           }
           group = System.getenv('GROUP_ID') ?: 'com.example'
           version = '0.0.1-SNAPSHOT'
+          // ✅ Boot 의존성관리용 flyway.version 프로퍼티
+          ext { set('flyway.version', '10.12.0') }
           java {
-            toolchain {
-              languageVersion = JavaLanguageVersion.of(Integer.valueOf(System.getenv('JAVA_PRIMARY') ?: '17'))
-            }
+            toolchain { languageVersion = JavaLanguageVersion.of(Integer.valueOf(System.getenv('JAVA_PRIMARY') ?: '17')) }
           }
           repositories { mavenCentral() }
           dependencies {
@@ -642,7 +666,7 @@ jobs:
             runtimeOnly 'com.h2database:h2'
             runtimeOnly 'org.postgresql:postgresql'
             runtimeOnly 'com.mysql:mysql-connector-j'
-            implementation 'org.flywaydb:flyway-core'
+            implementation 'org.flywaydb:flyway-core'   // 버전은 BOM + flyway.version
             implementation 'org.liquibase:liquibase-core'
             testImplementation 'org.springframework.boot:spring-boot-starter-test'
             testImplementation 'org.testcontainers:junit-jupiter:1.20.1'
@@ -650,9 +674,7 @@ jobs:
             testImplementation 'org.testcontainers:mysql:1.20.1'
             annotationProcessor 'org.mapstruct:mapstruct-processor:1.5.5.Final'
           }
-          tasks.withType(Test).configureEach {
-            useJUnitPlatform()
-          }
+          tasks.withType(Test).configureEach { useJUnitPlatform() }
           BG
           gradle wrapper --gradle-version 8.10.2
           chmod +x gradlew
@@ -667,7 +689,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "No changes."
           else
-            git commit -m "[ECHO] MEGA init + mvnw/gradlew + OpenAPI/Testcontainers/Migrations/MapStruct + curl JDK/Maven optional"
+            git commit -m "[ECHO] Unified init + mvnw/gradlew + OpenAPI/Testcontainers/Migrations/MapStruct + Flyway 10.12.0 + curl JDK/Maven optional"
             git push
           fi
 
@@ -710,6 +732,7 @@ jobs:
           shopt -s dotglob nullglob
           SRC_DIR="customer-mega-src"
           [ -d "$SRC_DIR" ] && rsync -a "$SRC_DIR"/ ./
+          # 루트에 pom.xml 보장 → setup-java cache:maven 정상 동작
           [ -f pom.xml ] || cat > pom.xml <<'POM'
           <project xmlns="http://maven.apache.org/POM/4.0.0"
                    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
