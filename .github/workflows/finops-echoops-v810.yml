@@ -447,7 +447,7 @@ jobs:
           }
           EOF
 
-      - name: Guard: detect leftover ${...} and auto-fix
+      - name: Guard:detect leftover ${...} and auto-fix
         run: |
           set -Eeuo pipefail
           if grep -R --include='*.java' '\${PACKAGE_NAME}' src/main/java >/dev/null 2>&1; then
