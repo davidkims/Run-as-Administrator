@@ -2,17 +2,17 @@
          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
          xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
   <modelVersion>4.0.0</modelVersion>
-  <groupId>${GROUP_ID}</groupId>
-  <artifactId>${ARTIFACT_ID}</artifactId>
+  <groupId>com.example</groupId>
+  <artifactId>demo</artifactId>
   <version>0.0.1-SNAPSHOT</version>
-  <name>${ARTIFACT_ID}</name>
+  <name>demo</name>
   <properties>
-    <java.version>${JAVA_PRIMARY}</java.version>
+    <java.version>17</java.version>
     <spring-boot.version>3.3.3</spring-boot.version>
     <mapstruct.version>1.5.5.Final</mapstruct.version>
     <testcontainers.version>1.20.1</testcontainers.version>
-    <maven.compiler.release>${JAVA_PRIMARY}</maven.compiler.release>
-    <!-- ✅ Flyway 10.12.0로 상향: MySQL 8.4 / PostgreSQL 16.x 지원 -->
+    <maven.compiler.release>17</maven.compiler.release>
+    <!-- Flyway 10.12.0: MySQL 8.4 / PostgreSQL 16.x 지원 -->
     <flyway.version>10.12.0</flyway.version>
   </properties>
   <dependencyManagement>
@@ -35,7 +35,7 @@
     <dependency><groupId>com.h2database</groupId><artifactId>h2</artifactId><scope>runtime</scope></dependency>
     <dependency><groupId>org.postgresql</groupId><artifactId>postgresql</artifactId><scope>runtime</scope></dependency>
     <dependency><groupId>com.mysql</groupId><artifactId>mysql-connector-j</artifactId><scope>runtime</scope></dependency>
-    <!-- ✅ 버전은 Boot BOM + flyway.version으로 관리 -->
+    <!-- Boot BOM + flyway.version -->
     <dependency><groupId>org.flywaydb</groupId><artifactId>flyway-core</artifactId></dependency>
     <dependency><groupId>org.liquibase</groupId><artifactId>liquibase-core</artifactId></dependency>
     <dependency><groupId>org.mapstruct</groupId><artifactId>mapstruct</artifactId><version>${mapstruct.version}</version></dependency>
@@ -47,19 +47,33 @@
   <build>
     <plugins>
       <plugin>
-        <groupId>org.springframework.boot</groupId><artifactId>spring-boot-maven-plugin</artifactId>
-        <configuration><mainClass>${PACKAGE_NAME}.${APP_NAME}</mainClass></configuration>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-maven-plugin</artifactId>
+        <version>${spring-boot.version}</version>
+        <configuration>
+          <mainClass>com.example.demo.DemoApplication</mainClass>
+        </configuration>
       </plugin>
       <plugin>
-        <groupId>org.apache.maven.plugins</groupId><artifactId>maven-compiler-plugin</artifactId><version>3.13.0</version>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-compiler-plugin</artifactId>
+        <version>3.13.0</version>
         <configuration>
           <release>${maven.compiler.release}</release>
           <annotationProcessorPaths>
-            <path><groupId>org.mapstruct</groupId><artifactId>mapstruct-processor</artifactId><version>${mapstruct.version}</version></path>
+            <path>
+              <groupId>org.mapstruct</groupId>
+              <artifactId>mapstruct-processor</artifactId>
+              <version>${mapstruct.version}</version>
+            </path>
           </annotationProcessorPaths>
         </configuration>
       </plugin>
-      <plugin><groupId>org.apache.maven.plugins</groupId><artifactId>maven-surefire-plugin</artifactId><version>3.2.5</version></plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-surefire-plugin</artifactId>
+        <version>3.2.5</version>
+      </plugin>
     </plugins>
   </build>
 </project>

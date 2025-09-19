@@ -5,11 +5,8 @@ plugins {
 }
 group = System.getenv('GROUP_ID') ?: 'com.example'
 version = '0.0.1-SNAPSHOT'
-// ✅ Boot 의존성관리용 flyway.version 프로퍼티
-ext { set('flyway.version', '10.12.0') }
-java {
-  toolchain { languageVersion = JavaLanguageVersion.of(Integer.valueOf(System.getenv('JAVA_PRIMARY') ?: '17')) }
-}
+ext { set('flyway.version', '10.12.0') }   // for BOM override (reference)
+java { toolchain { languageVersion = JavaLanguageVersion.of(Integer.valueOf(System.getenv('JAVA_PRIMARY') ?: '17')) } }
 repositories { mavenCentral() }
 dependencies {
   implementation 'org.springframework.boot:spring-boot-starter-web'
@@ -20,7 +17,8 @@ dependencies {
   runtimeOnly 'com.h2database:h2'
   runtimeOnly 'org.postgresql:postgresql'
   runtimeOnly 'com.mysql:mysql-connector-j'
-  implementation 'org.flywaydb:flyway-core'   // 버전은 BOM + flyway.version
+  // 확실히 10.12.0 적용
+  implementation 'org.flywaydb:flyway-core:10.12.0'
   implementation 'org.liquibase:liquibase-core'
   testImplementation 'org.springframework.boot:spring-boot-starter-test'
   testImplementation 'org.testcontainers:junit-jupiter:1.20.1'
