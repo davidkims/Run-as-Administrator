@@ -222,7 +222,7 @@ jobs:
           fi
 
       # 🔽 공식 경로 curl 다운로드: Maven — 필요 시(환경변수로 제어)
-      - name: [Optional] Curl install Apache Maven if requested
+      - name: Curl install Apache Maven if requested
         if: ${{ env.DOWNLOAD_MAVEN == 'true' }}
         env:
           MAVEN_VERSION: ${{ env.MAVEN_VERSION || '3.9.9' }}
