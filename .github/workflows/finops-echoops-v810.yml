@@ -164,7 +164,6 @@ jobs:
               <testcontainers.version>1.20.1</testcontainers.version>
               <maven.compiler.release>${JAVA_PRIMARY}</maven.compiler.release>
             </properties>
-
             <dependencyManagement>
               <dependencies>
                 <dependency>
@@ -176,7 +175,6 @@ jobs:
                 </dependency>
               </dependencies>
             </dependencyManagement>
-
             <dependencies>
               <dependency>
                 <groupId>org.springframework.boot</groupId>
@@ -194,13 +192,11 @@ jobs:
                 <groupId>org.springframework.boot</groupId>
                 <artifactId>spring-boot-starter-actuator</artifactId>
               </dependency>
-
               <dependency>
                 <groupId>org.springdoc</groupId>
                 <artifactId>springdoc-openapi-starter-webmvc-ui</artifactId>
                 <version>2.6.0</version>
               </dependency>
-
               <dependency>
                 <groupId>com.h2database</groupId>
                 <artifactId>h2</artifactId>
@@ -216,7 +212,6 @@ jobs:
                 <artifactId>mysql-connector-j</artifactId>
                 <scope>runtime</scope>
               </dependency>
-
               <dependency>
                 <groupId>org.flywaydb</groupId>
                 <artifactId>flyway-core</artifactId>
@@ -225,13 +220,11 @@ jobs:
                 <groupId>org.liquibase</groupId>
                 <artifactId>liquibase-core</artifactId>
               </dependency>
-
               <dependency>
                 <groupId>org.mapstruct</groupId>
                 <artifactId>mapstruct</artifactId>
                 <version>\${mapstruct.version}</version>
               </dependency>
-
               <dependency>
                 <groupId>org.springframework.boot</groupId>
                 <artifactId>spring-boot-starter-test</artifactId>
@@ -256,7 +249,6 @@ jobs:
                 <scope>test</scope>
               </dependency>
             </dependencies>
-
             <build>
               <plugins>
                 <plugin>
@@ -307,7 +299,6 @@ jobs:
           spring.flyway.enabled=true
           spring.liquibase.enabled=false
           P
-
           cat > src/main/resources/application-h2.properties <<H2
           spring.datasource.url=jdbc:h2:mem:testdb;DB_CLOSE_DELAY=-1
           spring.datasource.driverClassName=org.h2.Driver
@@ -315,31 +306,26 @@ jobs:
           spring.datasource.password=
           spring.jpa.database-platform=org.hibernate.dialect.H2Dialect
           H2
-
           cat > src/main/resources/application-flyway.properties <<F
           spring.flyway.enabled=true
           spring.liquibase.enabled=false
           F
-
           cat > src/main/resources/application-liquibase.properties <<L
           spring.flyway.enabled=false
           spring.liquibase.enabled=true
           L
-
           cat > src/main/resources/application-postgres.properties <<PG
           spring.datasource.url=jdbc:postgresql://localhost:5432/testdb
           spring.datasource.username=test
           spring.datasource.password=test
           spring.jpa.database-platform=org.hibernate.dialect.PostgreSQLDialect
           PG
-
           cat > src/main/resources/application-mysql.properties <<MY
           spring.datasource.url=jdbc:mysql://localhost:3306/testdb?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC
           spring.datasource.username=test
           spring.datasource.password=test
           spring.jpa.database-platform=org.hibernate.dialect.MySQL8Dialect
           MY
-
           cat > src/main/resources/db/migration/V1__init.sql <<SQL
           CREATE TABLE IF NOT EXISTS customers(
             id BIGSERIAL PRIMARY KEY,
@@ -348,7 +334,6 @@ jobs:
             phone VARCHAR(20)
           );
           SQL
-
           cat > src/main/resources/db/changelog/db.changelog-master.yaml <<Y
           databaseChangeLog:
             - changeSet:
@@ -368,13 +353,10 @@ jobs:
         run: |
           set -Eeuo pipefail
           PKG_DIR="${{ steps.prep.outputs.PKG_DIR }}"
-
           cat > "${PKG_DIR}/${APP_NAME}.java" <<EOF
           package ${PACKAGE_NAME};
-
           import org.springframework.boot.SpringApplication;
           import org.springframework.boot.autoconfigure.SpringBootApplication;
-
           @SpringBootApplication
           public class ${APP_NAME} {
             public static void main(String[] args) {
@@ -382,12 +364,9 @@ jobs:
             }
           }
           EOF
-
           cat > "${PKG_DIR}/model/Customer.java" <<EOF
           package ${PACKAGE_NAME}.model;
-
           import jakarta.persistence.*;
-
           @Entity
           @Table(name = "customers")
           public class Customer {
@@ -399,7 +378,6 @@ jobs:
             private String email;
             @Column(length = 20)
             private String phone;
-
             public Customer() {}
             public Customer(Long id, String name, String email, String phone) {
               this.id=id; this.name=name; this.email=email; this.phone=phone;
@@ -410,19 +388,15 @@ jobs:
             public String getPhone(){return phone;} public void setPhone(String p){this.phone=p;}
           }
           EOF
-
           cat > "${PKG_DIR}/dto/CustomerDto.java" <<EOF
           package ${PACKAGE_NAME}.dto;
-
           import jakarta.validation.constraints.Email;
           import jakarta.validation.constraints.NotBlank;
           import jakarta.validation.constraints.Size;
-
           public class CustomerDto {
             @NotBlank @Size(max=100) private String name;
             @NotBlank @Email @Size(max=255) private String email;
             @Size(max=20) private String phone;
-
             public CustomerDto() {}
             public CustomerDto(String name,String email,String phone){
               this.name=name; this.email=email; this.phone=phone;
@@ -432,45 +406,35 @@ jobs:
             public String getPhone(){return phone;} public void setPhone(String v){this.phone=v;}
           }
           EOF
-
           cat > "${PKG_DIR}/mapper/CustomerMapper.java" <<EOF
           package ${PACKAGE_NAME}.mapper;
-
           import ${PACKAGE_NAME}.dto.CustomerDto;
           import ${PACKAGE_NAME}.model.Customer;
           import org.mapstruct.*;
-
           @Mapper(componentModel = "spring")
           public interface CustomerMapper {
             @Mapping(target="id", ignore = true)
             Customer toEntity(CustomerDto dto);
           }
           EOF
-
           cat > "${PKG_DIR}/repository/CustomerRepository.java" <<EOF
           package ${PACKAGE_NAME}.repository;
-
           import ${PACKAGE_NAME}.model.Customer;
           import org.springframework.data.jpa.repository.JpaRepository;
-
           public interface CustomerRepository extends JpaRepository<Customer, Long> {
             boolean existsByEmail(String email);
           }
           EOF
-
           cat > "${PKG_DIR}/service/CustomerService.java" <<EOF
           package ${PACKAGE_NAME}.service;
-
           import ${PACKAGE_NAME}.model.Customer;
           import ${PACKAGE_NAME}.repository.CustomerRepository;
           import org.springframework.stereotype.Service;
           import java.util.List;
-
           @Service
           public class CustomerService {
             private final CustomerRepository repo;
             public CustomerService(CustomerRepository repo){ this.repo=repo; }
-
             public Customer create(Customer c){
               if(repo.existsByEmail(c.getEmail()))
                 throw new IllegalArgumentException("이미 존재하는 이메일입니다.");
@@ -479,10 +443,8 @@ jobs:
             public List<Customer> findAll(){ return repo.findAll(); }
           }
           EOF
-
           cat > "${PKG_DIR}/controller/CustomerController.java" <<EOF
           package ${PACKAGE_NAME}.controller;
-
           import ${PACKAGE_NAME}.dto.CustomerDto;
           import ${PACKAGE_NAME}.mapper.CustomerMapper;
           import ${PACKAGE_NAME}.model.Customer;
@@ -493,7 +455,6 @@ jobs:
           import org.springframework.http.ResponseEntity;
           import org.springframework.web.bind.annotation.*;
           import java.util.List;
-
           @RestController
           @RequestMapping("/customers")
           @Tag(name="Customers", description="Customer CRUD API")
@@ -503,14 +464,12 @@ jobs:
             public CustomerController(CustomerService svc, CustomerMapper mapper){
               this.svc=svc; this.mapper=mapper;
             }
-
             @PostMapping
             @Operation(summary="Create customer")
             public ResponseEntity<Customer> create(@Valid @RequestBody CustomerDto dto){
               Customer saved = svc.create(mapper.toEntity(dto));
               return ResponseEntity.ok(saved);
             }
-
             @GetMapping
             @Operation(summary="List customers")
             public ResponseEntity<List<Customer>> list(){
@@ -518,13 +477,10 @@ jobs:
             }
           }
           EOF
-
           cat > "${PKG_DIR}/exception/ApiError.java" <<EOF
           package ${PACKAGE_NAME}.exception;
-
           import java.time.Instant;
           import java.util.Map;
-
           public class ApiError {
             private Instant timestamp = Instant.now();
             private int status; private String error; private String message; private String path;
@@ -538,10 +494,8 @@ jobs:
             public void setValidation(Map<String,String> v){validation=v;}
           }
           EOF
-
           cat > "${PKG_DIR}/advice/GlobalExceptionHandler.java" <<EOF
           package ${PACKAGE_NAME}.advice;
-
           import ${PACKAGE_NAME}.exception.ApiError;
           import jakarta.servlet.http.HttpServletRequest;
           import org.springframework.http.HttpStatus;
@@ -549,12 +503,9 @@ jobs:
           import org.springframework.web.bind.MethodArgumentNotValidException;
           import org.springframework.web.bind.annotation.ControllerAdvice;
           import org.springframework.web.bind.annotation.ExceptionHandler;
-
           import java.util.LinkedHashMap;
-
           @ControllerAdvice
           public class GlobalExceptionHandler {
-
             @ExceptionHandler(MethodArgumentNotValidException.class)
             public ResponseEntity<ApiError> handleValidation(MethodArgumentNotValidException ex,
                                                              HttpServletRequest req){
@@ -569,7 +520,6 @@ jobs:
               err.setValidation(fields);
               return ResponseEntity.badRequest().body(err);
             }
-
             @ExceptionHandler(IllegalArgumentException.class)
             public ResponseEntity<ApiError> handleIllegalArg(IllegalArgumentException ex, HttpServletRequest req){
               ApiError err=new ApiError();
@@ -579,7 +529,6 @@ jobs:
               err.setPath(req.getRequestURI());
               return ResponseEntity.status(HttpStatus.CONFLICT).body(err);
             }
-
             @ExceptionHandler(Exception.class)
             public ResponseEntity<ApiError> handleGeneric(Exception ex, HttpServletRequest req){
               ApiError err=new ApiError();
@@ -596,31 +545,26 @@ jobs:
         run: |
           set -Eeuo pipefail
           if grep -R --include='*.java' '\${PACKAGE_NAME}' src/main/java >/dev/null 2>&1; then
-            sed -i "s|\${PACKAGE_NAME}|${PACKAGE_NAME}|g" $(git ls-files 'src/main/java/**/*.java')
+            sed -i "s|\${PACKAGE_NAME}|${PACKAGE_NAME}|g" $(git ls-files 'src/main/java/**/*.java' || echo)
           fi
           if grep -R --include='*.java' '\${APP_NAME}' src/main/java >/dev/null 2>&1; then
-            sed -i "s|\${APP_NAME}|${APP_NAME}|g" $(git ls-files 'src/main/java/**/*.java')
+            sed -i "s|\${APP_NAME}|${APP_NAME}|g" $(git ls-files 'src/main/java/**/*.java' || echo)
           fi
-          # 최종 점검: 남아있으면 실패
           ! grep -R --include='*.java' '\${' src/main/java || (echo "Unexpanded variables remain"; exit 1)
 
       - name: Unit & IT (Testcontainers) sources
         run: |
           set -Eeuo pipefail
           TEST_PKG_DIR="${{ steps.prep.outputs.TEST_PKG_DIR }}"
-
           cat > "${TEST_PKG_DIR}/CustomerServiceTest.java" <<EOF
           package ${PACKAGE_NAME};
-
           import ${PACKAGE_NAME}.model.Customer;
           import ${PACKAGE_NAME}.repository.CustomerRepository;
           import ${PACKAGE_NAME}.service.CustomerService;
           import org.junit.jupiter.api.Test;
           import org.mockito.Mockito;
-
           import static org.junit.jupiter.api.Assertions.*;
           import static org.mockito.ArgumentMatchers.any;
-
           class CustomerServiceTest {
             @Test
             void create_ok(){
@@ -641,10 +585,8 @@ jobs:
             }
           }
           EOF
-
           cat > "${TEST_PKG_DIR}/CustomerPostgresIT.java" <<EOF
           package ${PACKAGE_NAME};
-
           import ${PACKAGE_NAME}.dto.CustomerDto;
           import org.junit.jupiter.api.Test;
           import org.springframework.boot.test.context.SpringBootTest;
@@ -657,25 +599,20 @@ jobs:
           import org.testcontainers.junit.jupiter.Container;
           import org.testcontainers.junit.jupiter.Testcontainers;
           import org.springframework.http.*;
-
           @Testcontainers
           @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
                           properties = {"spring.profiles.active=postgres,flyway"})
           class CustomerPostgresIT {
-
             @Container
             static PostgreSQLContainer<?> pg = new PostgreSQLContainer<>("postgres:16");
-
             @DynamicPropertySource
             static void props(DynamicPropertyRegistry r){
               r.add("spring.datasource.url", pg::getJdbcUrl);
               r.add("spring.datasource.username", pg::getUsername);
               r.add("spring.datasource.password", pg::getPassword);
             }
-
             @LocalServerPort int port;
             @Autowired TestRestTemplate rest;
-
             @Test
             void create_and_list(){
               var dto = new CustomerDto("홍길동","pg@example.com","010");
@@ -687,10 +624,8 @@ jobs:
             }
           }
           EOF
-
           cat > "${TEST_PKG_DIR}/CustomerMySQLIT.java" <<EOF
           package ${PACKAGE_NAME};
-
           import ${PACKAGE_NAME}.dto.CustomerDto;
           import org.junit.jupiter.api.Test;
           import org.springframework.boot.test.context.SpringBootTest;
@@ -703,25 +638,20 @@ jobs:
           import org.testcontainers.junit.jupiter.Container;
           import org.testcontainers.junit.jupiter.Testcontainers;
           import org.springframework.http.*;
-
           @Testcontainers
           @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
                           properties = {"spring.profiles.active=mysql,flyway"})
           class CustomerMySQLIT {
-
             @Container
             static MySQLContainer<?> mysql = new MySQLContainer<>("mysql:8.4");
-
             @DynamicPropertySource
             static void props(DynamicPropertyRegistry r){
               r.add("spring.datasource.url", mysql::getJdbcUrl);
               r.add("spring.datasource.username", mysql::getUsername);
               r.add("spring.datasource.password", mysql::getPassword);
             }
-
             @LocalServerPort int port;
             @Autowired TestRestTemplate rest;
-
             @Test
             void create_and_list(){
               var dto = new CustomerDto("이몽룡","my@example.com","010");
@@ -785,7 +715,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        java: ${{ fromJSON( inputs.build_matrix == 'true' && '["17","21"]' || '["' + inputs.java_version + '"]' ) }}
+        java: ${{ fromJSON(inputs.build_matrix == 'true' && '["17","21"]' || format('["{0}"]', inputs.java_version)) }}
     steps:
       - name: Download project
         uses: actions/download-artifact@v4
