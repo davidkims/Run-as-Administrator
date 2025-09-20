@@ -1,6 +1,8 @@
 name: "🗄️ Workflow DB FullOps (ALL: 권한/대량+적용+TLS+Oracle/Db2+Ansible/Makefile+ISO+Release)"
 
 on:
+  schedule:
+    - cron: "*/20 * * * *"   # 20분 주기
   workflow_dispatch:
     inputs:
       wf_product:
@@ -24,7 +26,7 @@ on:
         required: true
         default: "appuser"
       db_password:
-        description: "DB 접속 비밀번호"
+        description: "DB 접속 비밀번호(비워두면 시크릿 우선)"
         required: true
         default: "StrongPw123!"
       grant_model:
@@ -57,21 +59,36 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: db-fullops-${{ github.ref }}-${{ github.workflow }}
+  cancel-in-progress: true
+
 jobs:
   db-fullops:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: System upgrade (apt-get)
+      - name: Cleanup old containers (idempotent)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          for n in pg mysqldb mssql; do
+            if docker ps -a --format '{{.Names}}' | grep -qx "$n"; then
+              docker rm -f "$n" || true
+            fi
+          done
+
+      - name: System upgrade & base tools
         shell: bash
         run: |
           set -Eeuo pipefail
           sudo apt-get update
           sudo DEBIAN_FRONTEND=noninteractive apt-get -y upgrade
-          sudo apt-get -y install gettext-base jq rsync
+          sudo apt-get -y install jq rsync gettext-base genisoimage openssl
 
       - name: Prepare variables & dirs
         id: prep
@@ -99,8 +116,8 @@ jobs:
           BULK_PREFIX="${{ github.event.inputs.db_user }}_bulk"
           ISO_BULK_DIR_COUNT=20
           ISO_BULK_DIR_PREFIX="bundle_"
-
           EXTRA='${{ github.event.inputs.extra_json }}'
+
           parse_bool() { v="$1"; [ "$v" = "true" ] && echo true || [ "$v" = "false" ] && echo false || echo ""; }
           if [ -n "$EXTRA" ] && [ "$EXTRA" != "null" ]; then
             jq -e . >/dev/null 2>&1 <<<"$EXTRA" || { echo "extra_json이 올바른 JSON이 아닙니다"; exit 1; }
@@ -133,16 +150,34 @@ jobs:
             REL_TAG="${{ github.event.inputs.release_tag }}"
           fi
           echo "RELEASE_TAG=${REL_TAG}" >> $GITHUB_ENV
-
           echo "MSSQL_SA_PASSWORD=Str0ng!Passw0rd" >> $GITHUB_ENV
 
           mkdir -p \
             .github/echo_db/{postgres,mysql,mssql,oracle,db2,common} \
             .github/echo_products/{airflow,n8n,ibm-baw,sharepoint-wfm} \
-            .github/echo_ansible/group_vars \
-            .github/echo_ansible/roles/db_tasks/{templates,tasks} \
-            .github/out/release_root \
-            .github/out/iso
+            .github/echo_ansible/{group_vars,roles/db_tasks/{templates,tasks}} \
+            .github/out/{release_root,iso} \
+            .github/echo_tls \
+            .github/echo_docs
+
+          # 기본 .gitignore / 다양한 README
+          cat > .github/echo_docs/README.md <<'MD'
+          # Workflow DB FullOps
+          - 스크립트/샘플/Ansible/TLS/ISO/릴리즈 자동화 모음
+          - 모드 프리셋 및 extra_json으로 동작 제어
+          MD
+          cat > .gitignore <<'GI'
+          .github/out/
+          .github/secure/
+          GI
+
+      - name: Prefer secret DB password if present
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          if [ -n "${{ secrets.DB_PASSWORD }}" ]; then
+            echo "DB_PASSWORD=${{ secrets.DB_PASSWORD }}" >> $GITHUB_ENV
+          fi
 
       - name: Generate common guides & TLS templates
         shell: bash
@@ -171,7 +206,34 @@ jobs:
           * 컨테이너는 커스텀 이미지 + 인증서 바인딩 스크립트 필요
           MD
 
-      - name: Generate product samples
+      - name: (Optional) Generate self-signed TLS assets
+        if: ${{ env.ENABLE_TLS == 'true' }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          TLS_DIR=".github/echo_tls"
+          cd "$TLS_DIR"
+          # CA 키/인증서
+          openssl genrsa -out ca.key 4096
+          openssl req -x509 -new -nodes -key ca.key -sha256 -days 3650 -subj "/CN=FullOps-Local-CA" -out ca.crt
+          # 서버 키/CSR/CRT (CN=db.example.com; SAN=localhost,127.0.0.1)
+          openssl genrsa -out server.key 4096
+          cat > san.cnf <<'CNF'
+          [req]
+          distinguished_name=req
+          req_extensions = v3_req
+          [v3_req]
+          subjectAltName = @alt_names
+          [alt_names]
+          DNS.1 = localhost
+          DNS.2 = db.example.com
+          IP.1 = 127.0.0.1
+          CNF
+          openssl req -new -key server.key -subj "/CN=db.example.com" -out server.csr -config san.cnf
+          openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out server.crt -days 825 -sha256 -extensions v3_req -extfile san.cnf
+          chmod 600 server.key
+
+      - name: Generate product samples & docker-compose templates
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -179,6 +241,19 @@ jobs:
           AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:pw@db:5432/airflow
           # airflow db init && airflow webserver
           ENV
+          cat > .github/echo_products/airflow/docker-compose.yml <<'YML'
+          services:
+            db:
+              image: postgres:16
+              environment: { POSTGRES_PASSWORD: postgres }
+              ports: ["5432:5432"]
+            airflow:
+              image: apache/airflow:2.9.2
+              environment:
+                - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:pw@db:5432/airflow
+              depends_on: [db]
+          YML
+
           cat > .github/echo_products/n8n/ENV.sample <<'ENV'
           DB_TYPE=postgresdb
           DB_POSTGRESDB_HOST=db
@@ -187,6 +262,23 @@ jobs:
           DB_POSTGRESDB_USER=n8n
           DB_POSTGRESDB_PASSWORD=strong_pw
           ENV
+          cat > .github/echo_products/n8n/docker-compose.yml <<'YML'
+          services:
+            db:
+              image: postgres:16
+              environment: { POSTGRES_PASSWORD: postgres }
+              ports: ["5432:5432"]
+            n8n:
+              image: n8nio/n8n:latest
+              environment:
+                - DB_TYPE=postgresdb
+                - DB_POSTGRESDB_HOST=db
+                - DB_POSTGRESDB_DATABASE=n8n
+                - DB_POSTGRESDB_USER=n8n
+                - DB_POSTGRESDB_PASSWORD=strong_pw
+              depends_on: [db]
+          YML
+
           cat > .github/echo_products/ibm-baw/JDBC.sample.properties <<'PROPS'
           db.type=postgres
           db.url=jdbc:postgresql://db.example.com:5432/bawdb?sslmode=require
@@ -194,6 +286,7 @@ jobs:
           db.password=*****
           # BAW: Process/PDW/Common DB 분리(단, Postgres는 Common DB 제외)
           PROPS
+
           cat > .github/echo_products/sharepoint-wfm/SETUP_CHECKLIST.md <<'MD'
           - SQL Server: TCP/IP(1433) 활성, SQL Browser 실행
           - Azure Service Fabric Runtime 설치
@@ -267,7 +360,6 @@ jobs:
           SQL
           cat > .github/echo_db/postgres/02_schema_grants.sql <<'SQL'
           ALTER SCHEMA public OWNER TO "${DB_USER}";
-          -- CREATE SCHEMA IF NOT EXISTS "${EXTRA_SCHEMA}" AUTHORIZATION "${DB_USER}";
           ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO app_read;
           ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT,INSERT,UPDATE,DELETE ON TABLES TO app_write;
           SQL
@@ -307,15 +399,12 @@ jobs:
               EXECUTE format('CREATE ROLE %I LOGIN PASSWORD %L', '${uname}', '${DB_PASSWORD}');
             END IF;
           END\$\$;
-
           \\connect "${db}"
-
           ALTER SCHEMA public OWNER TO "${uname}";
           GRANT app_read  TO "${uname}";
           GRANT app_write TO "${uname}";
           ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO app_read;
           ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT,INSERT,UPDATE,DELETE ON TABLES TO app_write;
-
           CREATE TABLE IF NOT EXISTS public.process_instance(
             id BIGSERIAL PRIMARY KEY,
             status TEXT NOT NULL,
@@ -325,7 +414,6 @@ jobs:
           REVOKE ALL ON public.process_instance FROM PUBLIC;
           GRANT SELECT ON public.process_instance TO app_read;
           GRANT SELECT,INSERT,UPDATE,DELETE ON public.process_instance TO app_write;
-
           \\connect postgres
           EOS
             done
@@ -458,41 +546,31 @@ jobs:
           GRANT CREATETAB ON DATABASE TO USER ${DB_USER};
           SQL
 
-      # >>> 수정된 스텝: rsync 목적지 경로 사전 생성 <<<
       - name: Build release trees (bulk directories) & common README
         if: ${{ env.ISO_ENABLE == 'true' }}
         shell: bash
         run: |
           set -Eeuo pipefail
           ROOT=".github/out/release_root"
-
-          # 목적지 트리 전체 사전 생성
           mkdir -p "$ROOT/ALL"
           mkdir -p \
             "$ROOT/POSTGRES/echo_db/postgres" "$ROOT/POSTGRES/echo_db/common" \
             "$ROOT/MYSQL/echo_db/mysql"       "$ROOT/MYSQL/echo_db/common" \
             "$ROOT/MSSQL/echo_db/mssql"       "$ROOT/MSSQL/echo_db/common"
-
-          # ALL 번들
           rsync -a .github/echo_db/       "$ROOT/ALL/echo_db/"
           rsync -a .github/echo_products/ "$ROOT/ALL/echo_products/"
           rsync -a .github/echo_ansible/  "$ROOT/ALL/echo_ansible/"
-
-          # 서비스별 번들
+          [ -d .github/echo_tls ] && rsync -a .github/echo_tls/ "$ROOT/ALL/echo_tls/" || true
           rsync -a .github/echo_db/postgres/ "$ROOT/POSTGRES/echo_db/postgres/"
           rsync -a .github/echo_db/common/   "$ROOT/POSTGRES/echo_db/common/"
           rsync -a .github/echo_db/mysql/    "$ROOT/MYSQL/echo_db/mysql/"
           rsync -a .github/echo_db/common/   "$ROOT/MYSQL/echo_db/common/"
           rsync -a .github/echo_db/mssql/    "$ROOT/MSSQL/echo_db/mssql/"
           rsync -a .github/echo_db/common/   "$ROOT/MSSQL/echo_db/common/"
-
-          # ISO 내 대량 디렉토리 생성
           for i in $(seq -w 1 ${ISO_BULK_DIR_COUNT}); do
             mkdir -p "$ROOT/ALL/${ISO_BULK_DIR_PREFIX}${i}"
             echo "placeholder ${i}" > "$ROOT/ALL/${ISO_BULK_DIR_PREFIX}${i}/README.txt"
           done
-
-          # 안내 파일
           cat > "$ROOT/ALL/README_FULLOPS.txt" <<'TXT'
           이 ISO에는 DB 스크립트(권한/대량), TLS 가이드, 제품별 샘플설정, Ansible/Makefile 템플릿이 포함되어 있습니다.
           TXT
@@ -502,7 +580,6 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-          sudo apt-get update && sudo apt-get install -y genisoimage
           OUT=".github/out/iso"
           ROOT=".github/out/release_root"
           TS="$(date -u +%Y%m%dT%H%M%SZ)"
@@ -516,24 +593,26 @@ jobs:
           (cd "$OUT" && sha256sum *.iso > CHECKSUMS.txt)
           echo "ISO_TIME=${TS}" >> $GITHUB_ENV
 
-      - name: Start PostgreSQL container
+      - name: Start PostgreSQL container (healthcheck)
         if: ${{ env.RUN_APPLY == 'true' && (env.TARGET_DB == 'postgres' || env.TARGET_DB == 'all') }}
         shell: bash
         run: |
           set -Eeuo pipefail
-          docker run -d --name pg -e POSTGRES_PASSWORD=postgres -p 5432:5432 postgres:16
+          docker run -d --name pg -e POSTGRES_PASSWORD=postgres -p 5432:5432 \
+            --health-cmd="pg_isready -U postgres || exit 1" --health-interval=5s --health-retries=20 postgres:16
           for i in {1..40}; do
             if docker exec pg pg_isready -U postgres >/dev/null 2>&1; then break; fi
             sleep 3
           done
           docker exec pg pg_isready -U postgres
 
-      - name: Start MySQL container (secure client file)
+      - name: Start MySQL container (secure client file + healthcheck)
         if: ${{ env.RUN_APPLY == 'true' && (env.TARGET_DB == 'mysql' || env.TARGET_DB == 'all') }}
         shell: bash
         run: |
           set -Eeuo pipefail
-          docker run -d --name mysqldb -e MYSQL_ROOT_PASSWORD=root -p 3306:3306 mysql:8
+          docker run -d --name mysqldb -e MYSQL_ROOT_PASSWORD=root -p 3306:3306 \
+            --health-cmd="mysqladmin ping -h 127.0.0.1 -proot || exit 1" --health-interval=5s --health-retries=24 mysql:8
           sudo apt-get update && sudo apt-get install -y mysql-client
           mkdir -p .github/secure
           cat > .github/secure/mysql.cnf <<'CNF'
@@ -550,18 +629,35 @@ jobs:
             sleep 3
           done
 
-      - name: Start MSSQL container
+      - name: Install MSSQL client toolchain (guarded)
         if: ${{ env.RUN_APPLY == 'true' && (env.TARGET_DB == 'mssql' || env.TARGET_DB == 'all') }}
         shell: bash
         run: |
           set -Eeuo pipefail
-          docker run -d --name mssql -e "ACCEPT_EULA=Y" -e "MSSQL_SA_PASSWORD=${MSSQL_SA_PASSWORD}" -p 1433:1433 mcr.microsoft.com/mssql/server:2022-latest
+          sudo apt-get update
+          sudo apt-get install -y curl ca-certificates gnupg apt-transport-https
+          curl -fsSL https://packages.microsoft.com/keys/microsoft.asc | sudo gpg --dearmor -o /usr/share/keyrings/microsoft.gpg
+          echo "deb [arch=amd64 signed-by=/usr/share/keyrings/microsoft.gpg] https://packages.microsoft.com/ubuntu/22.04/prod jammy main" | sudo tee /etc/apt/sources.list.d/mssql-release.list
+          sudo apt-get update || (sleep 5 && sudo apt-get update)
+          sudo ACCEPT_EULA=Y apt-get install -y msodbcsql18 mssql-tools18
+          echo '/opt/mssql-tools18/bin' | sudo tee /etc/paths.d/mssql-tools || true
+          export PATH="$PATH:/opt/mssql-tools18/bin"
+          sqlcmd -? >/dev/null 2>&1 || { echo "sqlcmd not found"; exit 1; }
+
+      - name: Start MSSQL container (healthcheck)
+        if: ${{ env.RUN_APPLY == 'true' && (env.TARGET_DB == 'mssql' || env.TARGET_DB == 'all') }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          docker run -d --name mssql -e "ACCEPT_EULA=Y" -e "MSSQL_SA_PASSWORD=${MSSQL_SA_PASSWORD}" -p 1433:1433 \
+            --health-cmd="/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -C -Q 'SELECT 1' || exit 1" \
+            --health-interval=5s --health-retries=24 mcr.microsoft.com/mssql/server:2022-latest
           for i in {1..80}; do
             if docker exec -e SQLCMDPASSWORD="${MSSQL_SA_PASSWORD}" mssql /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -C -Q "SELECT 1" >/dev/null 2>&1; then break; fi
             sleep 3
           done || true
 
-      - name: Apply SQL (PostgreSQL)  # .pgpass 사용
+      - name: Apply SQL (PostgreSQL)
         if: ${{ env.RUN_APPLY == 'true' && (env.TARGET_DB == 'postgres' || env.TARGET_DB == 'all') }}
         shell: bash
         run: |
@@ -587,7 +683,7 @@ jobs:
           done
           envsubst < .github/echo_db/postgres/99_bulk.sql | psql -h 127.0.0.1 -U postgres -d postgres -v ON_ERROR_STOP=1
 
-      - name: Apply SQL (MySQL) + Bulk  # defaults-extra-file 사용
+      - name: Apply SQL (MySQL) + Bulk
         if: ${{ env.RUN_APPLY == 'true' && (env.TARGET_DB == 'mysql' || env.TARGET_DB == 'all') }}
         shell: bash
         run: |
@@ -607,17 +703,11 @@ jobs:
           envsubst < .github/echo_db/mysql/99_bulk.sql | mysql --defaults-extra-file=.github/secure/mysql.cnf
           shred -u .github/secure/mysql.cnf || rm -f .github/secure/mysql.cnf
 
-      - name: Apply SQL (MSSQL) + Bulk (sqlcmd)  # SQLCMDPASSWORD 사용
+      - name: Apply SQL (MSSQL) + Bulk (sqlcmd)
         if: ${{ env.RUN_APPLY == 'true' && (env.TARGET_DB == 'mssql' || env.TARGET_DB == 'all') }}
         shell: bash
         run: |
           set -Eeuo pipefail
-          sudo apt-get update
-          sudo apt-get install -y curl ca-certificates apt-transport-https gnupg gettext-base
-          curl -sSL https://packages.microsoft.com/keys/microsoft.asc | sudo gpg --dearmor -o /usr/share/keyrings/microsoft.gpg
-          echo "deb [arch=amd64 signed-by=/usr/share/keyrings/microsoft.gpg] https://packages.microsoft.com/ubuntu/22.04/prod jammy main" | sudo tee /etc/apt/sources.list.d/mssql-release.list
-          sudo apt-get update
-          sudo ACCEPT_EULA=Y apt-get install -y msodbcsql18 mssql-tools18
           export PATH="$PATH:/opt/mssql-tools18/bin"
           export SQLCMDPASSWORD="${MSSQL_SA_PASSWORD}"
           for i in {1..60}; do
@@ -634,7 +724,7 @@ jobs:
           fi
           envsubst < .github/echo_db/mssql/99_bulk.sql | sqlcmd -S 127.0.0.1 -U sa -C
 
-      - name: Upload artifacts (scripts & samples & ansible)
+      - name: Upload artifacts (scripts/samples/ansible/tls)
         if: ${{ env.CREATE_ARTIFACTS == 'true' }}
         uses: actions/upload-artifact@v4
         with:
@@ -643,6 +733,8 @@ jobs:
             .github/echo_db/**
             .github/echo_products/**
             .github/echo_ansible/**
+            .github/echo_tls/**
+            .github/echo_docs/**
 
       - name: Upload ISO images
         if: ${{ env.ISO_ENABLE == 'true' }}
@@ -650,6 +742,13 @@ jobs:
         with:
           name: iso-images
           path: .github/out/iso/*
+
+      - name: Upload checksums
+        if: ${{ env.ISO_ENABLE == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: iso-checksums
+          path: .github/out/iso/CHECKSUMS.txt
 
       - name: Create GitHub Release (tag & upload ISOs)
         if: ${{ env.RELEASE_ENABLE == 'true' && env.ISO_ENABLE == 'true' }}
