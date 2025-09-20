@@ -545,7 +545,7 @@ jobs:
             envsubst < .github/echo_db/postgres/99_bulk.sql       | psql -h 127.0.0.1 -U postgres -d postgres -v ON_ERROR_STOP=1
           fi
 
-      - name: Apply SQL (MySQL: base + services + bulk-unique pref)
+      - name: Apply SQL (MySQL:base + services + bulk-unique pref)
         if: ${{ env.RUN_APPLY == 'true' && (env.TARGET_DB == 'mysql' || env.TARGET_DB == 'all') }}
         shell: bash
         run: |
@@ -570,7 +570,7 @@ jobs:
           fi
           shred -u .github/secure/mysql.cnf || rm -f .github/secure/mysql.cnf
 
-      - name: Apply SQL (MSSQL: base + services + bulk-unique pref)
+      - name: Apply SQL (MSSQL:base + services + bulk-unique pref)
         if: ${{ env.RUN_APPLY == 'true' && (env.TARGET_DB == 'mssql' || env.TARGET_DB == 'all') }}
         shell: bash
         run: |
