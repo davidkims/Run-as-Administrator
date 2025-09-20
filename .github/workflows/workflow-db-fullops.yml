@@ -454,11 +454,13 @@ jobs:
           set -Eeuo pipefail
           if ! docker ps --format '{{.Names}}' | grep -qx pg; then
             docker run -d --name pg -e POSTGRES_PASSWORD=postgres -p 5432:5432 \
-              --health-cmd="pg_isready -U postgres || exit 1" --health-interval=5s --health-retries=20 postgres:16
+              --health-cmd="pg_isready -U postgres || exit 1" --health-interval=5s --health-retries=30 postgres:16
           fi
-          for i in $(seq -w ${SHARD_START} ${SHARD_END}); do docker exec -u postgres pg createdb "${DB_NAME}_${i}" || true; done
-          docker exec -u postgres pg createdb "${DB_NAME}" || true
-          for i in {1..40}; do docker exec pg pg_isready -U postgres >/dev/null 2>&1 && break || sleep 3; done
+          # 대기 (health)
+          for i in {1..60}; do docker exec pg pg_isready -U postgres >/dev/null 2>&1 && break || sleep 2; done
+          # 샤드 DB 미리 생성
+          for i in $(seq -w ${SHARD_START} ${SHARD_END}); do docker exec -u postgres pg createdb "${DB_NAME}_${i}" >/dev/null 2>&1 || true; done
+          docker exec -u postgres pg createdb "${DB_NAME}" >/dev/null 2>&1 || true
       - name: Start MySQL (if needed)
         if: ${{ env.RUN_APPLY == 'true' && (env.TARGET_DB == 'mysql' || env.TARGET_DB == 'all') }}
         shell: bash
@@ -466,7 +468,7 @@ jobs:
           set -Eeuo pipefail
           if ! docker ps --format '{{.Names}}' | grep -qx mysqldb; then
             docker run -d --name mysqldb -e MYSQL_ROOT_PASSWORD=root -p 3306:3306 \
-              --health-cmd="mysqladmin ping -h 127.0.0.1 -proot || exit 1" --health-interval=5s --health-retries=24 mysql:8
+              --health-cmd="mysqladmin ping -h 127.0.0.1 -proot || exit 1" --health-interval=5s --health-retries=30 mysql:8
           fi
           mkdir -p .github/secure
           cat > .github/secure/mysql.cnf <<'CNF'
@@ -477,7 +479,7 @@ jobs:
           port=3306
           CNF
           chmod 600 .github/secure/mysql.cnf
-          for i in {1..60}; do mysqladmin --defaults-extra-file=.github/secure/mysql.cnf ping --silent && break || sleep 3; done
+          for i in {1..60}; do mysqladmin --defaults-extra-file=.github/secure/mysql.cnf ping --silent && break || sleep 2; done
       - name: Install MSSQL tools & Start MSSQL (if needed)
         if: ${{ env.RUN_APPLY == 'true' && (env.TARGET_DB == 'mssql' || env.TARGET_DB == 'all') }}
         shell: bash
@@ -493,9 +495,9 @@ jobs:
           if ! docker ps --format '{{.Names}}' | grep -qx mssql; then
             docker run -d --name mssql -e "ACCEPT_EULA=Y" -e "MSSQL_SA_PASSWORD=${MSSQL_SA_PASSWORD}" -p 1433:1433 \
               --health-cmd="/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -C -Q 'SELECT 1' || exit 1" \
-              --health-interval=5s --health-retries=24 mcr.microsoft.com/mssql/server:2022-latest
+              --health-interval=5s --health-retries=30 mcr.microsoft.com/mssql/server:2022-latest
           fi
-          for i in {1..80}; do docker exec -e SQLCMDPASSWORD="${MSSQL_SA_PASSWORD}" mssql /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -C -Q "SELECT 1" >/dev/null 2>&1 && break || sleep 3; done
+          for i in {1..80}; do docker exec -e SQLCMDPASSWORD="${MSSQL_SA_PASSWORD}" mssql /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -C -Q "SELECT 1" >/dev/null 2>&1 && break || sleep 2; done
       - name: Generate per-shard credentials & SQL (unique passwords)
         shell: bash
         run: |
@@ -512,7 +514,7 @@ jobs:
           END$$;
           EOS
             for i in $(seq -w ${SHARD_START} ${SHARD_END}); do
-              uname="${BULK_PREFIX}${i}"; db="${DB_NAME}_${i}"; pw="$(mkpw)"; echo "::add-mask::$pw"
+              uname="${BULK_PREFIX}${i}"; db="${DB_NAME}_${i}"; pw="$(mkpw)"; >&2 echo "::add-mask::$pw"
               printf "postgres,%s,%s,%s,%s\n" "$i" "$uname" "$pw" "$db" >> .github/secure/creds/tenants-shard-${SHARD_INDEX}.csv
               cat <<EOS
           DO $$
@@ -529,7 +531,7 @@ jobs:
           EOS
             done; } > .github/echo_db/postgres/98_bulk_creds.sql
           { echo "/* Shard ${SHARD_INDEX} (MySQL) */"; for i in $(seq -w ${SHARD_START} ${SHARD_END}); do
-              uname="${BULK_PREFIX}${i}"; db="${DB_NAME}_${i}"; pw="$(mkpw)"; echo "::add-mask::$pw"
+              uname="${BULK_PREFIX}${i}"; db="${DB_NAME}_${i}"; pw="$(mkpw)"; >&2 echo "::add-mask::$pw"
               printf "mysql,%s,%s,%s,%s\n" "$i" "$uname" "$pw" "$db" >> .github/secure/creds/tenants-shard-${SHARD_INDEX}.csv
               cat <<EOS
           CREATE DATABASE IF NOT EXISTS \`${db}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;
@@ -539,7 +541,7 @@ jobs:
           EOS
             done; } > .github/echo_db/mysql/98_bulk_creds.sql
           { echo "/* Shard ${SHARD_INDEX} (MSSQL) */"; for i in $(seq -w ${SHARD_START} ${SHARD_END}); do
-              uname="${BULK_PREFIX}${i}"; db="${DB_NAME}_${i}"; pw="$(mkpw)"; echo "::add-mask::$pw"
+              uname="${BULK_PREFIX}${i}"; db="${DB_NAME}_${i}"; pw="$(mkpw)"; >&2 echo "::add-mask::$pw"
               printf "mssql,%s,%s,%s,%s\n" "$i" "$uname" "$pw" "$db" >> .github/secure/creds/tenants-shard-${SHARD_INDEX}.csv
               cat <<EOS
           IF DB_ID(N'${db}') IS NULL CREATE DATABASE [${db}];
@@ -553,10 +555,7 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-          sudo apt-get update && sudo apt-get install -y postgresql-client gettext-base
           umask 077; printf "127.0.0.1:5432:*:postgres:postgres\n" > ~/.pgpass
-          psql -h 127.0.0.1 -U postgres -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname='${DB_NAME}'" | grep -q 1 || \
-            createdb -h 127.0.0.1 -p 5432 -U postgres "${DB_NAME}" || true
           envsubst < .github/echo_db/postgres/98_bulk_creds.sql | psql -h 127.0.0.1 -U postgres -d postgres -v ON_ERROR_STOP=1
       - name: Apply per-shard SQL (MySQL)
         if: ${{ env.RUN_APPLY == 'true' && (env.TARGET_DB == 'mysql' || env.TARGET_DB == 'all') }}
