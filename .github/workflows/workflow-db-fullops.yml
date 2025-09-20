@@ -520,7 +520,7 @@ jobs:
             sleep 3
           done || true
 
-      - name: Apply SQL (PostgreSQL: base + services + bulk-unique pref)
+      - name: Apply SQL (PostgreSQL:base + services + bulk-unique pref)
         if: ${{ env.RUN_APPLY == 'true' && (env.TARGET_DB == 'postgres' || env.TARGET_DB == 'all') }}
         shell: bash
         run: |
