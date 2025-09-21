@@ -1,877 +1,390 @@
-name: "🏗️ Customer MEGA — Gen + Echo + OpenAPI + Testcontainers + Flyway/Liquibase + MapStruct + Matrix CI (Unified)"
+name: "☕ Java Red Hat Resources + Spring Boot Upgrade (All-in-One)"
 
 on:
   workflow_dispatch:
     inputs:
-      group_id:
-        description: "Maven Group ID"
+      action:
+        description: "작업 유형 (generate | upgrade)"
+        type: choice
         required: true
+        default: "generate"
+        options: ["generate", "upgrade"]
+      build_tool:
+        description: "생성 대상 (maven | gradle | spring-boot)"
+        type: choice
+        required: true
+        default: "maven"
+        options: ["maven", "gradle", "spring-boot"]
+      target_version:
+        description: "Spring Boot 타겟 버전 (빈값=기본 3.5.6)"
+        required: false
+        default: "3.5.6"
+      group_id:
+        description: "Maven/Gradle groupId"
+        required: false
         default: "com.example"
       artifact_id:
-        description: "Maven Artifact ID"
-        required: true
-        default: "demo"
+        description: "프로젝트 artifactId"
+        required: false
+        default: "demo-app"
       package_name:
-        description: "Base package (e.g., com.example.demo)"
-        required: true
-        default: "com.example.demo"
-      app_name:
-        description: "Spring Boot main class (e.g., DemoApplication)"
-        required: true
-        default: "DemoApplication"
-      java_version:
-        description: "Primary Java version"
-        required: true
-        default: "17"
-      run_smoke_test:
-        description: "Run HTTP smoke test (true/false)"
-        required: true
-        default: "true"
-      commit_changes:
-        description: "Commit generated sources (true/false)"
-        required: true
-        default: "false"
-      build_matrix:
-        description: "Matrix build across Java 17,21 (true/false)"
-        required: true
-        default: "true"
-      use_liquibase:
-        description: "Use Liquibase profile instead of Flyway (true/false)"
-        required: true
-        default: "false"
-      enable_gradle:
-        description: "Also build with Gradle (true/false)"
-        required: true
-        default: "true"
+        description: "기본 패키지"
+        required: false
+        default: "com.example.app"
+      out_dir:
+        description: "생성 출력 경로 (예: ./demo-app)"
+        required: false
+        default: "./demo-app"
 
 permissions:
   contents: write
 
-env:
-  SRC_MAIN: src/main/java
-  SRC_TEST: src/test/java
-  # (옵션) curl 대량 다운로드 토글 — 리포지토리 Variables/Secrets에 설정 시 자동 동작
-  # DOWNLOAD_JDK: "true"
-  # DOWNLOAD_MAVEN: "true"
-  # JDK_VERSION: ""
-  # JDK_ARCH: "x64"
-  # MAVEN_VERSION: "3.9.9"
-  # MAVEN_SHA256: ""
+concurrency:
+  group: java-redhat-boot-upgrade-${{ github.ref }}-${{ github.event.inputs.action }}
+  cancel-in-progress: false
 
 jobs:
-  generate:
+  prepare:
+    name: "Prepare scripts"
     runs-on: ubuntu-latest
-    env:
-      GROUP_ID: ${{ inputs.group_id }}
-      ARTIFACT_ID: ${{ inputs.artifact_id }}
-      PACKAGE_NAME: ${{ inputs.package_name }}
-      APP_NAME: ${{ inputs.app_name }}
-      JAVA_PRIMARY: ${{ inputs.java_version }}
-      USE_LIQUIBASE: ${{ inputs.use_liquibase }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Echo helpers & massive dir tree
+      - name: Write generator scripts (Maven / Gradle / Spring Boot)
+        shell: bash
         run: |
           set -Eeuo pipefail
-          TS(){ date +'%F %T'; }; echoe(){ printf '[%s] %s\n' "$(TS)" "$*"; }
-          mkdir -p \
-            .github/echo_logs \
-            .github/echo_dirs/{app,db,docs,ops,tests,containers} \
-            .github/echo_files/{samples,templates,reports} \
-            .github/echo_secrets \
-            .github/echo_containers \
-            .github/echo_tmp
-          for i in $(seq 1 30); do
-            printf 'placeholder-%02d\n' "$i" > ".github/echo_files/samples/sample_${i}.txt"
+          mkdir -p .github/tools
+          # ----------------- gen-redhat-java.sh (Maven) -----------------
+          cat > .github/tools/gen-redhat-java.sh <<'EOS'
+          #!/usr/bin/env bash
+          set -Eeuo pipefail
+          GROUP_ID="${GROUP_ID:-com.example}"
+          ARTIFACT_ID="${ARTIFACT_ID:-demo-app}"
+          VERSION="${VERSION:-0.0.1-SNAPSHOT}"
+          PACKAGE_NAME="${PACKAGE_NAME:-com.example.app}"
+          OUT_DIR="${OUT_DIR:-./demo-app}"
+          while [[ $# -gt 0 ]]; do
+            case "$1" in
+              --groupId) GROUP_ID="$2"; shift 2 ;;
+              --artifactId) ARTIFACT_ID="$2"; shift 2 ;;
+              --version) VERSION="$2"; shift 2 ;;
+              --package) PACKAGE_NAME="$2"; shift 2 ;;
+              --out) OUT_DIR="$2"; shift 2 ;;
+              *) echo "Unknown arg: $1" >&2; exit 1 ;;
+            esac
           done
-          chmod -R 755 .github/echo_dirs .github/echo_containers
-          chmod -R 700 .github/echo_secrets
-          echoe "Echo dirs/files created."
-
-      - name: Generate virtual accounts & passwords (echo)
-        run: |
-          set -Eeuo pipefail
-          USERS_JSON=".github/echo_secrets/users.json"
-          ENV_FILE=".github/echo_secrets/.env"
-          TOKENS_FILE=".github/echo_secrets/tokens.txt"
-          cat > "$USERS_JSON" <<JSON
-          { "users": [
-              {"username": "svc_admin", "roles": ["ADMIN","OPS"]},
-              {"username": "svc_app",   "roles": ["APP"]},
-              {"username": "svc_ro",    "roles": ["READONLY"]}
-          ] }
-          JSON
-          for u in svc_admin svc_app svc_ro; do
-            P=$(openssl rand -base64 24)
-            echo "${u^^}_PASSWORD=$P" >> "$ENV_FILE"
-          done
-          for i in $(seq 1 5); do
-            openssl rand -hex 32 >> "$TOKENS_FILE"
-          done
-          chmod 600 "$ENV_FILE" "$TOKENS_FILE"
-
-      # setup-java(cache:maven)는 pom.xml 생성 후에 실행
-      - name: Prepare source layout
-        id: prep
-        run: |
-          set -Eeuo pipefail
-          PKG_PATH="$(echo "${PACKAGE_NAME}" | tr '.' '/')"
-          PKG_DIR="${SRC_MAIN}/${PKG_PATH}"
-          TEST_PKG_DIR="${SRC_TEST}/${PKG_PATH}"
-          mkdir -p \
-            "${PKG_DIR}"/{model,dto,repository,service,controller,advice,exception,mapper,config} \
-            "${TEST_PKG_DIR}" \
-            src/main/resources/{db/migration,db/changelog,static}
-          echo "PKG_DIR=$PKG_DIR" >> $GITHUB_OUTPUT
-          echo "TEST_PKG_DIR=$TEST_PKG_DIR" >> $GITHUB_OUTPUT
-
-      - name: Generate pom.xml (Flyway 10.12.0 override)
-        run: |
-          set -Eeuo pipefail
-          cat > pom.xml <<EOF
-          <project xmlns="http://maven.apache.org/POM/4.0.0"
-                   xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-                   xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+          PKG_PATH="${PACKAGE_NAME//./\/}"
+          ROOT="$(mkdir -p "$OUT_DIR" && cd "$OUT_DIR" && pwd)"
+          mkdir -p "$ROOT/src/main/java/$PKG_PATH" "$ROOT/src/test/java/$PKG_PATH" "$ROOT/src/main/resources" "$ROOT/.vscode"
+          cat > "$ROOT/pom.xml" <<EOF
+          <project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
             <modelVersion>4.0.0</modelVersion>
             <groupId>${GROUP_ID}</groupId>
             <artifactId>${ARTIFACT_ID}</artifactId>
-            <version>0.0.1-SNAPSHOT</version>
+            <version>${VERSION}</version>
             <name>${ARTIFACT_ID}</name>
+            <description>Red Hat Java ready project</description>
             <properties>
-              <java.version>${JAVA_PRIMARY}</java.version>
-              <spring-boot.version>3.3.3</spring-boot.version>
-              <mapstruct.version>1.5.5.Final</mapstruct.version>
-              <testcontainers.version>1.20.1</testcontainers.version>
-              <maven.compiler.release>${JAVA_PRIMARY}</maven.compiler.release>
-              <!-- Flyway 10.12.0: MySQL 8.4 / PostgreSQL 16.x 지원 -->
-              <flyway.version>10.12.0</flyway.version>
+              <java.version>17</java.version>
+              <maven.compiler.source>\${java.version}</maven.compiler.source>
+              <maven.compiler.target>\${java.version}</maven.compiler.target>
+              <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+              <junit.jupiter.version>5.10.2</junit.jupiter.version>
+              <surefire.plugin.version>3.2.5</surefire.plugin.version>
             </properties>
-            <dependencyManagement>
-              <dependencies>
-                <dependency>
-                  <groupId>org.springframework.boot</groupId>
-                  <artifactId>spring-boot-dependencies</artifactId>
-                  <version>\${spring-boot.version}</version>
-                  <type>pom</type>
-                  <scope>import</scope>
-                </dependency>
-              </dependencies>
-            </dependencyManagement>
             <dependencies>
-              <dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-web</artifactId></dependency>
-              <dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-data-jpa</artifactId></dependency>
-              <dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-validation</artifactId></dependency>
-              <dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-actuator</artifactId></dependency>
-              <dependency><groupId>org.springdoc</groupId><artifactId>springdoc-openapi-starter-webmvc-ui</artifactId><version>2.6.0</version></dependency>
-              <dependency><groupId>com.h2database</groupId><artifactId>h2</artifactId><scope>runtime</scope></dependency>
-              <dependency><groupId>org.postgresql</groupId><artifactId>postgresql</artifactId><scope>runtime</scope></dependency>
-              <dependency><groupId>com.mysql</groupId><artifactId>mysql-connector-j</artifactId><scope>runtime</scope></dependency>
-              <!-- Boot BOM + flyway.version -->
-              <dependency><groupId>org.flywaydb</groupId><artifactId>flyway-core</artifactId></dependency>
-              <dependency><groupId>org.liquibase</groupId><artifactId>liquibase-core</artifactId></dependency>
-              <dependency><groupId>org.mapstruct</groupId><artifactId>mapstruct</artifactId><version>\${mapstruct.version}</version></dependency>
-              <dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-test</artifactId><scope>test</scope></dependency>
-              <dependency><groupId>org.testcontainers</groupId><artifactId>junit-jupiter</artifactId><version>\${testcontainers.version}</version><scope>test</scope></dependency>
-              <dependency><groupId>org.testcontainers</groupId><artifactId>postgresql</artifactId><version>\${testcontainers.version}</version><scope>test</scope></dependency>
-              <dependency><groupId>org.testcontainers</groupId><artifactId>mysql</artifactId><version>\${testcontainers.version}</version><scope>test</scope></dependency>
+              <dependency>
+                <groupId>org.junit.jupiter</groupId>
+                <artifactId>junit-jupiter</artifactId>
+                <version>\${junit.jupiter.version}</version>
+                <scope>test</scope>
+              </dependency>
             </dependencies>
             <build>
               <plugins>
                 <plugin>
-                  <groupId>org.springframework.boot</groupId>
-                  <artifactId>spring-boot-maven-plugin</artifactId>
-                  <version>\${spring-boot.version}</version>
-                  <configuration>
-                    <mainClass>${PACKAGE_NAME}.${APP_NAME}</mainClass>
-                  </configuration>
-                </plugin>
-                <plugin>
-                  <groupId>org.apache.maven.plugins</groupId>
-                  <artifactId>maven-compiler-plugin</artifactId>
-                  <version>3.13.0</version>
-                  <configuration>
-                    <release>\${maven.compiler.release}</release>
-                    <annotationProcessorPaths>
-                      <path>
-                        <groupId>org.mapstruct</groupId>
-                        <artifactId>mapstruct-processor</artifactId>
-                        <version>\${mapstruct.version}</version>
-                      </path>
-                    </annotationProcessorPaths>
-                  </configuration>
-                </plugin>
-                <plugin>
                   <groupId>org.apache.maven.plugins</groupId>
                   <artifactId>maven-surefire-plugin</artifactId>
-                  <version>3.2.5</version>
+                  <version>\${surefire.plugin.version}</version>
+                  <configuration><useModulePath>false</useModulePath></configuration>
                 </plugin>
               </plugins>
             </build>
           </project>
           EOF
-
-      - name: Setup Java (primary) + Maven cache
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: ${{ env.JAVA_PRIMARY }}
-          cache: maven
-
-      # (옵션) Temurin JDK curl 설치
-      - name: Curl install Temurin JDK
-        if: ${{ env.DOWNLOAD_JDK == 'true' }}
-        env:
-          JDK_VERSION: ${{ env.JDK_VERSION || env.JAVA_PRIMARY }}
-          JDK_ARCH: ${{ env.JDK_ARCH || 'x64' }}
-        run: |
-          set -Eeuo pipefail
-          mkdir -p .github/downloads
-          URL="https://api.adoptium.net/v3/binary/latest/${JDK_VERSION}/ga/linux/${JDK_ARCH}/jdk/hotspot/normal/eclipse"
-          echo "Downloading Temurin JDK: $URL"
-          curl -fsSL --retry 3 --retry-connrefused -o .github/downloads/temurin.tar.gz "$URL"
-          tar -xzf .github/downloads/temurin.tar.gz -C .github/downloads
-          JDK_DIR="$(find .github/downloads -maxdepth 1 -type d -name 'jdk-*' | head -n1)"
-          echo "JAVA_HOME=$PWD/$JDK_DIR" >> $GITHUB_ENV
-          echo "$PWD/$JDK_DIR/bin" >> $GITHUB_PATH
-          java -version
-
-      # (옵션) Apache Maven curl 설치
-      - name: Curl install Apache Maven
-        if: ${{ env.DOWNLOAD_MAVEN == 'true' }}
-        env:
-          MAVEN_VERSION: ${{ env.MAVEN_VERSION || '3.9.9' }}
-          MAVEN_SHA256: ${{ env.MAVEN_SHA256 }}
-        run: |
-          set -Eeuo pipefail
-          mkdir -p .github/downloads
-          TAR="apache-maven-${MAVEN_VERSION}-bin.tar.gz"
-          URL="https://downloads.apache.org/maven/maven-3/${MAVEN_VERSION}/binaries/${TAR}"
-          echo "Downloading Maven ${MAVEN_VERSION} ..."
-          curl -fsSL --retry 3 --retry-connrefused -o ".github/downloads/${TAR}" "$URL"
-          if [ -n "${MAVEN_SHA256:-}" ]; then
-            echo "${MAVEN_SHA256}  .github/downloads/${TAR}" | sha256sum -c -
-          fi
-          tar -xzf ".github/downloads/${TAR}" -C .github/downloads
-          MVN_DIR=".github/downloads/apache-maven-${MAVEN_VERSION}"
-          echo "M2_HOME=$PWD/${MVN_DIR}" >> $GITHUB_ENV
-          echo "$PWD/${MVN_DIR}/bin" >> $GITHUB_PATH
-          mvn -v
-
-      - name: Create ~/.m2/settings.xml (GH server optional)
-        run: |
-          mkdir -p ~/.m2
-          cat > ~/.m2/settings.xml <<XML
-          <settings xmlns="http://maven.apache.org/SETTINGS/1.0.0"
-                    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-                    xsi:schemaLocation="http://maven.apache.org/SETTINGS/1.0.0
-                                        https://maven.apache.org/xsd/settings-1.0.0.xsd">
-            <servers>
-              <server>
-                <id>github</id>
-                <username>${GITHUB_ACTOR}</username>
-                <password>${GITHUB_TOKEN}</password>
-              </server>
-            </servers>
-          </settings>
-          XML
-
-      - name: application properties & profiles (OpenAPI + Flyway/Liquibase)
-        run: |
-          set -Eeuo pipefail
-          cat > src/main/resources/application.properties <<P
-          server.port=8080
-          spring.application.name=customer-mega
-          spring.profiles.active=flyway
-          spring.jpa.open-in-view=false
-          spring.jpa.hibernate.ddl-auto=validate
-          management.endpoints.web.exposure.include=health,info
-          management.endpoint.health.show-details=always
-          springdoc.api-docs.enabled=true
-          springdoc.swagger-ui.enabled=true
-          spring.flyway.enabled=true
-          spring.liquibase.enabled=false
-          P
-          cat > src/main/resources/application-h2.properties <<H2
-          spring.datasource.url=jdbc:h2:mem:testdb;DB_CLOSE_DELAY=-1
-          spring.datasource.driverClassName=org.h2.Driver
-          spring.datasource.username=sa
-          spring.datasource.password=
-          spring.jpa.database-platform=org.hibernate.dialect.H2Dialect
-          H2
-          cat > src/main/resources/application-flyway.properties <<F
-          spring.flyway.enabled=true
-          spring.liquibase.enabled=false
-          F
-          cat > src/main/resources/application-liquibase.properties <<L
-          spring.flyway.enabled=false
-          spring.liquibase.enabled=true
-          L
-          cat > src/main/resources/application-postgres.properties <<PG
-          spring.datasource.url=jdbc:postgresql://localhost:5432/testdb
-          spring.datasource.username=test
-          spring.datasource.password=test
-          spring.jpa.database-platform=org.hibernate.dialect.PostgreSQLDialect
-          PG
-          cat > src/main/resources/application-mysql.properties <<MY
-          spring.datasource.url=jdbc:mysql://localhost:3306/testdb?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC
-          spring.datasource.username=test
-          spring.datasource.password=test
-          spring.jpa.database-platform=org.hibernate.dialect.MySQL8Dialect
-          MY
-          cat > src/main/resources/db/migration/V1__init.sql <<SQL
-          CREATE TABLE IF NOT EXISTS customers(
-            id BIGSERIAL PRIMARY KEY,
-            name VARCHAR(100) NOT NULL,
-            email VARCHAR(255) NOT NULL UNIQUE,
-            phone VARCHAR(20)
-          );
-          SQL
-          cat > src/main/resources/db/changelog/db.changelog-master.yaml <<Y
-          databaseChangeLog:
-            - changeSet:
-                id: 1
-                author: chatgpt
-                changes:
-                  - createTable:
-                      tableName: customers
-                      columns:
-                        - column: { name: id, type: BIGINT, autoIncrement: true, constraints: { primaryKey: true } }
-                        - column: { name: name, type: VARCHAR(100), constraints: { nullable: false } }
-                        - column: { name: email, type: VARCHAR(255), constraints: { nullable: false, unique: true } }
-                        - column: { name: phone, type: VARCHAR(20) }
-          Y
-
-      - name: Generate Java sources (expand vars)
-        run: |
-          set -Eeuo pipefail
-          PKG_DIR="${{ steps.prep.outputs.PKG_DIR }}"
-          cat > "${PKG_DIR}/${APP_NAME}.java" <<EOF
+          cat > "$ROOT/src/main/java/$PKG_PATH/App.java" <<EOF
           package ${PACKAGE_NAME};
-          import org.springframework.boot.SpringApplication;
-          import org.springframework.boot.autoconfigure.SpringBootApplication;
-          @SpringBootApplication
-          public class ${APP_NAME} {
-            public static void main(String[] args) {
-              SpringApplication.run(${APP_NAME}.class, args);
-            }
-          }
+          public class App { public static void main(String[] args){ System.out.println("Hello, Red Hat Java + VS Code! ✔"); } }
           EOF
-          cat > "${PKG_DIR}/model/Customer.java" <<EOF
-          package ${PACKAGE_NAME}.model;
-          import jakarta.persistence.*;
-          @Entity @Table(name = "customers")
-          public class Customer {
-            @Id @GeneratedValue(strategy = GenerationType.IDENTITY) private Long id;
-            @Column(nullable = false, length = 100) private String name;
-            @Column(nullable = false, unique = true, length = 255) private String email;
-            @Column(length = 20) private String phone;
-            public Customer() {}
-            public Customer(Long id, String name, String email, String phone) { this.id=id; this.name=name; this.email=email; this.phone=phone; }
-            public Long getId(){return id;} public void setId(Long id){this.id=id;}
-            public String getName(){return name;} public void setName(String n){this.name=n;}
-            public String getEmail(){return email;} public void setEmail(String e){this.email=e;}
-            public String getPhone(){return phone;} public void setPhone(String p){this.phone=p;}
-          }
-          EOF
-          cat > "${PKG_DIR}/dto/CustomerDto.java" <<EOF
-          package ${PACKAGE_NAME}.dto;
-          import jakarta.validation.constraints.Email;
-          import jakarta.validation.constraints.NotBlank;
-          import jakarta.validation.constraints.Size;
-          public class CustomerDto {
-            @NotBlank @Size(max=100) private String name;
-            @NotBlank @Email @Size(max=255) private String email;
-            @Size(max=20) private String phone;
-            public CustomerDto() {}
-            public CustomerDto(String name,String email,String phone){ this.name=name; this.email=email; this.phone=phone; }
-            public String getName(){return name;} public void setName(String v){this.name=v;}
-            public String getEmail(){return email;} public void setEmail(String v){this.email=v;}
-            public String getPhone(){return phone;} public void setPhone(String v){this.phone=v;}
-          }
-          EOF
-          cat > "${PKG_DIR}/mapper/CustomerMapper.java" <<EOF
-          package ${PACKAGE_NAME}.mapper;
-          import ${PACKAGE_NAME}.dto.CustomerDto;
-          import ${PACKAGE_NAME}.model.Customer;
-          import org.mapstruct.*;
-          @Mapper(componentModel = "spring")
-          public interface CustomerMapper {
-            @Mapping(target="id", ignore = true)
-            Customer toEntity(CustomerDto dto);
-          }
-          EOF
-          cat > "${PKG_DIR}/repository/CustomerRepository.java" <<EOF
-          package ${PACKAGE_NAME}.repository;
-          import ${PACKAGE_NAME}.model.Customer;
-          import org.springframework.data.jpa.repository.JpaRepository;
-          public interface CustomerRepository extends JpaRepository<Customer, Long> {
-            boolean existsByEmail(String email);
-          }
-          EOF
-          cat > "${PKG_DIR}/service/CustomerService.java" <<EOF
-          package ${PACKAGE_NAME}.service;
-          import ${PACKAGE_NAME}.model.Customer;
-          import ${PACKAGE_NAME}.repository.CustomerRepository;
-          import org.springframework.stereotype.Service;
-          import java.util.List;
-          @Service
-          public class CustomerService {
-            private final CustomerRepository repo;
-            public CustomerService(CustomerRepository repo){ this.repo=repo; }
-            public Customer create(Customer c){
-              if(repo.existsByEmail(c.getEmail()))
-                throw new IllegalArgumentException("이미 존재하는 이메일입니다.");
-              return repo.save(c);
-            }
-            public List<Customer> findAll(){ return repo.findAll(); }
-          }
-          EOF
-          cat > "${PKG_DIR}/controller/CustomerController.java" <<EOF
-          package ${PACKAGE_NAME}.controller;
-          import ${PACKAGE_NAME}.dto.CustomerDto;
-          import ${PACKAGE_NAME}.mapper.CustomerMapper;
-          import ${PACKAGE_NAME}.model.Customer;
-          import ${PACKAGE_NAME}.service.CustomerService;
-          import io.swagger.v3.oas.annotations.Operation;
-          import io.swagger.v3.oas.annotations.tags.Tag;
-          import jakarta.validation.Valid;
-          import org.springframework.http.ResponseEntity;
-          import org.springframework.web.bind.annotation.*;
-          import java.util.List;
-          @RestController
-          @RequestMapping("/customers")
-          @Tag(name="Customers", description="Customer CRUD API")
-          public class CustomerController {
-            private final CustomerService svc;
-            private final CustomerMapper mapper;
-            public CustomerController(CustomerService svc, CustomerMapper mapper){
-              this.svc=svc; this.mapper=mapper;
-            }
-            @PostMapping
-            @Operation(summary="Create customer")
-            public ResponseEntity<Customer> create(@Valid @RequestBody CustomerDto dto){
-              Customer saved = svc.create(mapper.toEntity(dto));
-              return ResponseEntity.ok(saved);
-            }
-            @GetMapping
-            @Operation(summary="List customers")
-            public ResponseEntity<List<Customer>> list(){
-              return ResponseEntity.ok(svc.findAll());
-            }
-          }
-          EOF
-
-      - name: Patch existing build files to Flyway 10.12.0 (safety net)
-        run: |
-          set -Eeuo pipefail
-          if [ -f pom.xml ]; then
-            if grep -q '<flyway.version>' pom.xml; then
-              sed -i 's|<flyway.version>.*</flyway.version>|<flyway.version>10.12.0</flyway.version>|' pom.xml
-            else
-              awk '1;/<properties>/{p=1} p&&/<\/properties>/{print "    <flyway.version>10.12.0</flyway.version>";p=0}' pom.xml > pom.xml.tmp && mv pom.xml.tmp pom.xml
-            fi
-          fi
-          if [ -f build.gradle ]; then
-            if grep -Eq "set\\('flyway.version'\\s*,\\s*'[^']+'\\)" build.gradle; then
-              sed -i "s|set('flyway.version'\\s*,\\s*'[^']\\+')|set('flyway.version', '10.12.0')|g" build.gradle
-            else
-              awk '
-                /plugins *\{/ {inplug=1}
-                {print}
-                inplug && /\}/ && !done {print "\next { set('\''flyway.version'\'', '\''10.12.0'\'') }\n"; done=1; inplug=0}
-              ' build.gradle > build.gradle.tmp && mv build.gradle.tmp build.gradle
-            fi
-          fi
-
-      - name: Guard:detect leftover ${...} and auto-fix
-        run: |
-          set -Eeuo pipefail
-          if grep -R --include='*.java' '\${PACKAGE_NAME}' src/main/java >/dev/null 2>&1; then
-            sed -i "s|\${PACKAGE_NAME}|${PACKAGE_NAME}|g" $(git ls-files 'src/main/java/**/*.java' || echo)
-          fi
-          if grep -R --include='*.java' '\${APP_NAME}' src/main/java >/dev/null 2>&1; then
-            sed -i "s|\${APP_NAME}|${APP_NAME}|g" $(git ls-files 'src/main/java/**/*.java' || echo)
-          fi
-          ! grep -R --include='*.java' '\${' src/main/java || (echo "Unexpanded variables remain"; exit 1)
-
-      - name: Unit & IT (Testcontainers) sources
-        run: |
-          set -Eeuo pipefail
-          TEST_PKG_DIR="${{ steps.prep.outputs.TEST_PKG_DIR }}"
-          cat > "${TEST_PKG_DIR}/CustomerServiceTest.java" <<'EOF'
-          package PACKAGE_NAME_REPLACE;
-          import PACKAGE_NAME_REPLACE.model.Customer;
-          import PACKAGE_NAME_REPLACE.repository.CustomerRepository;
-          import PACKAGE_NAME_REPLACE.service.CustomerService;
+          cat > "$ROOT/src/test/java/$PKG_PATH/AppTest.java" <<EOF
+          package ${PACKAGE_NAME};
+          import static org.junit.jupiter.api.Assertions.assertTrue;
           import org.junit.jupiter.api.Test;
-          import org.mockito.Mockito;
-          import static org.junit.jupiter.api.Assertions.*;
-          import static org.mockito.ArgumentMatchers.any;
-          class CustomerServiceTest {
-            @Test
-            void create_ok(){
-              var repo = Mockito.mock(CustomerRepository.class);
-              Mockito.when(repo.existsByEmail("a@b.c")).thenReturn(false);
-              Mockito.when(repo.save(any(Customer.class))).thenAnswer(inv -> inv.getArgument(0));
-              var svc = new CustomerService(repo);
-              var saved = svc.create(new Customer(null,"A","a@b.c","010"));
-              assertEquals("A", saved.getName());
-            }
-            @Test
-            void dup_email(){
-              var repo = Mockito.mock(CustomerRepository.class);
-              Mockito.when(repo.existsByEmail("dup@x.com")).thenReturn(true);
-              var svc = new CustomerService(repo);
-              assertThrows(IllegalArgumentException.class,
-                () -> svc.create(new Customer(null,"D","dup@x.com",null)));
-            }
-          }
+          class AppTest { @Test void sanity(){ assertTrue(true); } }
           EOF
-          sed -i "s|PACKAGE_NAME_REPLACE|${PACKAGE_NAME}|g" "${TEST_PKG_DIR}/CustomerServiceTest.java"
-          cat > "${TEST_PKG_DIR}/CustomerPostgresIT.java" <<'EOF'
-          package PACKAGE_NAME_REPLACE;
-          import PACKAGE_NAME_REPLACE.dto.CustomerDto;
-          import org.junit.jupiter.api.Test;
-          import org.springframework.boot.test.context.SpringBootTest;
-          import org.springframework.boot.test.web.client.TestRestTemplate;
-          import org.springframework.boot.test.web.server.LocalServerPort;
-          import org.springframework.test.context.DynamicPropertyRegistry;
-          import org.springframework.test.context.DynamicPropertySource;
-          import org.springframework.beans.factory.annotation.Autowired;
-          import org.testcontainers.containers.PostgreSQLContainer;
-          import org.testcontainers.junit.jupiter.Container;
-          import org.testcontainers.junit.jupiter.Testcontainers;
-          import org.springframework.http.*;
-          @Testcontainers
-          @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
-                          properties = {"spring.profiles.active=postgres,flyway"})
-          class CustomerPostgresIT {
-            @Container
-            static PostgreSQLContainer<?> pg = new PostgreSQLContainer<>("postgres:16");
-            @DynamicPropertySource
-            static void props(DynamicPropertyRegistry r){
-              r.add("spring.datasource.url", pg::getJdbcUrl);
-              r.add("spring.datasource.username", pg::getUsername);
-              r.add("spring.datasource.password", pg::getPassword);
-            }
-            @LocalServerPort int port;
-            @Autowired TestRestTemplate rest;
-            @Test
-            void create_and_list(){
-              var dto = new CustomerDto("홍길동","pg@example.com","010");
-              var base = "http://localhost:"+port;
-              var res = rest.postForEntity(base+"/customers", dto, String.class);
-              assert(res.getStatusCode()==HttpStatus.OK);
-              var list = rest.getForObject(base+"/customers", String.class);
-              assert(list.contains("pg@example.com"));
-            }
-          }
+          cat > "$ROOT/.vscode/launch.json" <<EOF
+          { "version":"0.2.0", "configurations":[{ "type":"java","name":"Run App","request":"launch","mainClass":"${PACKAGE_NAME}.App","projectName":"${ARTIFACT_ID}","console":"integratedTerminal"}] }
           EOF
-          sed -i "s|PACKAGE_NAME_REPLACE|${PACKAGE_NAME}|g" "${TEST_PKG_DIR}/CustomerPostgresIT.java"
-          cat > "${TEST_PKG_DIR}/CustomerMySQLIT.java" <<'EOF'
-          package PACKAGE_NAME_REPLACE;
-          import PACKAGE_NAME_REPLACE.dto.CustomerDto;
-          import org.junit.jupiter.api.Test;
-          import org.springframework.boot.test.context.SpringBootTest;
-          import org.springframework.boot.test.web.client.TestRestTemplate;
-          import org.springframework.boot.test.web.server.LocalServerPort;
-          import org.springframework.test.context.DynamicPropertyRegistry;
-          import org.springframework.test.context.DynamicPropertySource;
-          import org.springframework.beans.factory.annotation.Autowired;
-          import org.testcontainers.containers.MySQLContainer;
-          import org.testcontainers.junit.jupiter.Container;
-          import org.testcontainers.junit.jupiter.Testcontainers;
-          import org.springframework.http.*;
-          @Testcontainers
-          @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
-                          properties = {"spring.profiles.active=mysql,flyway"})
-          class CustomerMySQLIT {
-            @Container
-            static MySQLContainer<?> mysql = new MySQLContainer<>("mysql:8.4");
-            @DynamicPropertySource
-            static void props(DynamicPropertyRegistry r){
-              r.add("spring.datasource.url", mysql::getJdbcUrl);
-              r.add("spring.datasource.username", mysql::getUsername);
-              r.add("spring.datasource.password", mysql::getPassword);
-            }
-            @LocalServerPort int port;
-            @Autowired TestRestTemplate rest;
-            @Test
-            void create_and_list(){
-              var dto = new CustomerDto("이몽룡","my@example.com","010");
-              var base="http://localhost:"+port;
-              var res = rest.postForEntity(base+"/customers", dto, String.class);
-              assert(res.getStatusCode()==HttpStatus.OK);
-              var list = rest.getForObject(base+"/customers", String.class);
-              assert(list.contains("my@example.com"));
-            }
-          }
-          EOF
-          sed -i "s|PACKAGE_NAME_REPLACE|${PACKAGE_NAME}|g" "${TEST_PKG_DIR}/CustomerMySQLIT.java"
+          echo "Generated (Maven): $ROOT"
+          EOS
+          chmod +x .github/tools/gen-redhat-java.sh
 
-      - name: Toggle Liquibase profile if requested
-        if: ${{ env.USE_LIQUIBASE == 'true' }}
-        run: |
-          sed -i 's/spring.profiles.active=flyway/spring.profiles.active=liquibase/g' src/main/resources/application.properties
-          echo "Liquibase profile enabled."
-
-      - name: Docker Echo Container (build & run)
-        run: |
+          # ----------------- gen-redhat-java-gradle.sh -----------------
+          cat > .github/tools/gen-redhat-java-gradle.sh <<'EOS'
+          #!/usr/bin/env bash
           set -Eeuo pipefail
-          cat > .github/echo_containers/Dockerfile <<'DF'
-          FROM alpine:3.20
-          WORKDIR /echo
-          COPY . /echo
-          CMD ["sh", "-c", "echo '[ECHO] Listing /echo && env'; ls -R /echo | head -n 50; env | sort | head -n 50"]
-          DF
-          docker build -t echo-container:latest .github/echo_containers
-          docker run --rm -e ECHO_FLAG=on echo-container:latest
-
-      - name: Build (compile only, Maven)
-        run: mvn -B -q -DskipTests package
-
-      - name: Generate Maven Wrapper (mvnw)
-        run: |
-          set -Eeuo pipefail
-          mvn -N -q io.takari:maven:wrapper
-          chmod +x mvnw || true
-
-      - name: Install Gradle (to generate wrapper)
-        if: ${{ inputs.enable_gradle == 'true' }}
-        run: |
-          set -Eeuo pipefail
-          if ! command -v gradle >/dev/null 2>&1; then
-            sudo apt-get update -y
-            sudo apt-get install -y gradle
-          fi
-          gradle -v
-
-      - name: Generate Gradle build files + Wrapper (Flyway 10.12.0)
-        if: ${{ inputs.enable_gradle == 'true' }}
-        run: |
-          set -Eeuo pipefail
-          cat > settings.gradle <<SG
-          rootProject.name = "${ARTIFACT_ID}"
-          SG
-          cat > build.gradle <<'BG'
-          plugins {
-            id 'java'
-            id 'org.springframework.boot' version '3.3.3'
-            id 'io.spring.dependency-management' version '1.1.6'
-          }
-          group = System.getenv('GROUP_ID') ?: 'com.example'
-          version = '0.0.1-SNAPSHOT'
-          ext { set('flyway.version', '10.12.0') }   // for BOM override (reference)
-          java { toolchain { languageVersion = JavaLanguageVersion.of(Integer.valueOf(System.getenv('JAVA_PRIMARY') ?: '17')) } }
+          GROUP_ID="${GROUP_ID:-com.example}"
+          ARTIFACT_ID="${ARTIFACT_ID:-demo-gradle}"
+          PACKAGE_NAME="${PACKAGE_NAME:-com.example.app}"
+          OUT_DIR="${OUT_DIR:-./demo-gradle}"
+          JAVA_VERSION="${JAVA_VERSION:-17}"
+          while [[ $# -gt 0 ]]; do
+            case "$1" in
+              --groupId) GROUP_ID="$2"; shift 2 ;;
+              --artifactId) ARTIFACT_ID="$2"; shift 2 ;;
+              --package) PACKAGE_NAME="$2"; shift 2 ;;
+              --out) OUT_DIR="$2"; shift 2 ;;
+              --java) JAVA_VERSION="$2"; shift 2 ;;
+              *) echo "Unknown arg: $1" >&2; exit 1 ;;
+            esac
+          done
+          PKG_PATH="${PACKAGE_NAME//./\/}"
+          ROOT="$(mkdir -p "$OUT_DIR" && cd "$OUT_DIR" && pwd)"
+          mkdir -p "$ROOT/src/main/java/$PKG_PATH" "$ROOT/src/test/java/$PKG_PATH" "$ROOT/.vscode"
+          cat > "$ROOT/settings.gradle" <<< "rootProject.name = '${ARTIFACT_ID}'"
+          cat > "$ROOT/build.gradle" <<EOF
+          plugins { id 'java'; id 'application' }
+          group='${GROUP_ID}'; version='1.0.0'
+          java { toolchain { languageVersion = JavaLanguageVersion.of(${JAVA_VERSION}) } }
           repositories { mavenCentral() }
-          dependencies {
-            implementation 'org.springframework.boot:spring-boot-starter-web'
-            implementation 'org.springframework.boot:spring-boot-starter-data-jpa'
-            implementation 'org.springframework.boot:spring-boot-starter-validation'
-            implementation 'org.springdoc:springdoc-openapi-starter-webmvc-ui:2.6.0'
-            implementation 'org.mapstruct:mapstruct:1.5.5.Final'
-            runtimeOnly 'com.h2database:h2'
-            runtimeOnly 'org.postgresql:postgresql'
-            runtimeOnly 'com.mysql:mysql-connector-j'
-            // 확실히 10.12.0 적용
-            implementation 'org.flywaydb:flyway-core:10.12.0'
-            implementation 'org.liquibase:liquibase-core'
-            testImplementation 'org.springframework.boot:spring-boot-starter-test'
-            testImplementation 'org.testcontainers:junit-jupiter:1.20.1'
-            testImplementation 'org.testcontainers:postgresql:1.20.1'
-            testImplementation 'org.testcontainers:mysql:1.20.1'
-            annotationProcessor 'org.mapstruct:mapstruct-processor:1.5.5.Final'
-          }
-          tasks.withType(Test).configureEach { useJUnitPlatform() }
-          BG
-          gradle wrapper --gradle-version 8.10.2
-          chmod +x gradlew
+          dependencies { testImplementation 'org.junit.jupiter:junit-jupiter:5.10.2' }
+          test { useJUnitPlatform() }
+          application { mainClass = '${PACKAGE_NAME}.App' }
+          EOF
+          cat > "$ROOT/src/main/java/$PKG_PATH/App.java" <<EOF
+          package ${PACKAGE_NAME};
+          public class App { public static void main(String[] args){ System.out.println("Hello, Red Hat Java + Gradle! ✔"); } }
+          EOF
+          cat > "$ROOT/src/test/java/$PKG_PATH/AppTest.java" <<'EOF'
+          package ${PACKAGE_NAME};
+          import static org.junit.jupiter.api.Assertions.assertTrue;
+          import org.junit.jupiter.api.Test;
+          class AppTest { @Test void sanity(){ assertTrue(true); } }
+          EOF
+          cat > "$ROOT/.vscode/launch.json" <<EOF
+          { "version":"0.2.0", "configurations":[{ "type":"java","name":"Run App (Gradle)","request":"launch","mainClass":"${PACKAGE_NAME}.App","projectName":"${ARTIFACT_ID}","console":"integratedTerminal"}] }
+          EOF
+          echo "Generated (Gradle): $ROOT"
+          EOS
+          chmod +x .github/tools/gen-redhat-java-gradle.sh
 
-      - name: Commit & Push (optional)
-        if: ${{ inputs.commit_changes == 'true' }}
-        run: |
+          # ----------------- gen-redhat-springboot.sh -----------------
+          cat > .github/tools/gen-redhat-springboot.sh <<'EOS'
+          #!/usr/bin/env bash
           set -Eeuo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -A
-          if git diff --cached --quiet; then
-            echo "No changes."
-          else
-            git commit -m "[ECHO] Unified init + mvnw/gradlew + OpenAPI/Testcontainers/Migrations/MapStruct + Flyway 10.12.0 + curl JDK/Maven optional"
-            git push
-          fi
+          GROUP_ID="${GROUP_ID:-com.example}"
+          ARTIFACT_ID="${ARTIFACT_ID:-demo-boot}"
+          PACKAGE_NAME="${PACKAGE_NAME:-com.example.app}"
+          OUT_DIR="${OUT_DIR:-./demo-boot}"
+          SPRING_BOOT_VERSION="${SPRING_BOOT_VERSION:-3.5.6}"
+          JAVA_VERSION="${JAVA_VERSION:-17}"
+          while [[ $# -gt 0 ]]; do
+            case "$1" in
+              --groupId) GROUP_ID="$2"; shift 2 ;;
+              --artifactId) ARTIFACT_ID="$2"; shift 2 ;;
+              --package) PACKAGE_NAME="$2"; shift 2 ;;
+              --out) OUT_DIR="$2"; shift 2 ;;
+              --boot) SPRING_BOOT_VERSION="$2"; shift 2 ;;
+              --java) JAVA_VERSION="$2"; shift 2 ;;
+              *) echo "Unknown arg: $1" >&2; exit 1 ;;
+            esac
+          done
+          PKG_PATH="${PACKAGE_NAME//./\/}"
+          ROOT="$(mkdir -p "$OUT_DIR" && cd "$OUT_DIR" && pwd)"
+          mkdir -p "$ROOT/src/main/java/$PKG_PATH" "$ROOT/src/test/java/$PKG_PATH" "$ROOT/src/main/resources" "$ROOT/.vscode"
+          cat > "$ROOT/pom.xml" <<EOF
+          <project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+            <modelVersion>4.0.0</modelVersion>
+            <parent>
+              <groupId>org.springframework.boot</groupId>
+              <artifactId>spring-boot-starter-parent</artifactId>
+              <version>${SPRING_BOOT_VERSION}</version>
+              <relativePath/>
+            </parent>
+            <groupId>${GROUP_ID}</groupId>
+            <artifactId>${ARTIFACT_ID}</artifactId>
+            <version>0.0.1-SNAPSHOT</version>
+            <name>${ARTIFACT_ID}</name>
+            <description>Spring Boot minimal app (VS Code + Red Hat Java)</description>
+            <properties><java.version>${JAVA_VERSION}</java.version></properties>
+            <dependencies>
+              <dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter</artifactId></dependency>
+              <dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-test</artifactId><scope>test</scope></dependency>
+            </dependencies>
+            <build><plugins><plugin><groupId>org.springframework.boot</groupId><artifactId>spring-boot-maven-plugin</artifactId></plugin></plugins></build>
+          </project>
+          EOF
+          cat > "$ROOT/src/main/java/$PKG_PATH/Application.java" <<EOF
+          package ${PACKAGE_NAME};
+          import org.springframework.boot.SpringApplication; import org.springframework.boot.autoconfigure.SpringBootApplication; import org.springframework.web.bind.annotation.*;
+          @SpringBootApplication @RestController class Application {
+            @GetMapping("/hello") public String hello(){ return "Hello, Spring Boot + VS Code ✔"; }
+            public static void main(String[] args){ SpringApplication.run(Application.class, args); }
+          }
+          EOF
+          cat > "$ROOT/src/test/java/$PKG_PATH/ApplicationTests.java" <<'EOF'
+          package ${PACKAGE_NAME};
+          import org.junit.jupiter.api.Test; import org.springframework.boot.test.context.SpringBootTest;
+          @SpringBootTest class ApplicationTests { @Test void contextLoads() {} }
+          EOF
+          echo "server.port=8080" > "$ROOT/src/main/resources/application.properties"
+          echo "Generated (Spring Boot): $ROOT"
+          EOS
+          chmod +x .github/tools/gen-redhat-springboot.sh
 
-      - name: Upload project artifact
+      - name: Upload generator scripts
         uses: actions/upload-artifact@v4
         with:
-          name: customer-mega-src
-          path: |
-            pom.xml
-            mvnw
-            mvnw.cmd
-            .mvn/**
-            build.gradle
-            settings.gradle
-            gradlew
-            gradlew.bat
-            gradle/wrapper/**
-            src/**
-            .github/echo_*/**
+          name: redhat-java-generators
+          path: .github/tools/*.sh
           if-no-files-found: error
 
-  build-test:
-    needs: generate
+  run:
+    name: "Generate or Upgrade"
+    needs: [prepare]
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        java:  ${{ fromJSON(inputs.build_matrix == 'true' && '["17","21"]' || format('["{0}"]', inputs.java_version)) }}
-        build: ${{ fromJSON(inputs.enable_gradle == 'true' && '["maven","gradle"]' || '["maven"]') }}
+    env:
+      TARGET_BOOT: ${{ inputs.target_version != '' && inputs.target_version || '3.5.6' }}
     steps:
-      - name: Download project artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: customer-mega-src
-          path: ./
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - name: Materialize sources into workspace root
-        run: |
-          set -Eeuo pipefail
-          shopt -s dotglob nullglob
-          SRC_DIR="customer-mega-src"
-          [ -d "$SRC_DIR" ] && rsync -a "$SRC_DIR"/ ./
-          # 루트에 pom.xml 보장 → setup-java cache:maven 정상 동작
-          [ -f pom.xml ] || cat > pom.xml <<'POM'
-          <project xmlns="http://maven.apache.org/POM/4.0.0"
-                   xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-                   xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
-            <modelVersion>4.0.0</modelVersion>
-            <groupId>temp.fallback</groupId><artifactId>temp-fallback</artifactId><version>0.0.1-SNAPSHOT</version>
-          </project>
-          POM
-          mkdir -p src/main/java src/test/java
-
-      - name: Setup Java ${{ matrix.java }} (cache:maven)
+      - name: Setup Temurin JDK (17)
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: ${{ matrix.java }}
+          java-version: '17'
           cache: maven
 
-      - name: Gradle cache
-        if: ${{ matrix.build == 'gradle' }}
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.gradle/caches
-            ~/.gradle/wrapper
-          key: gradle-${{ runner.os }}-${{ matrix.java }}-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
-
-      - name: Build & test (Maven)
-        if: ${{ matrix.build == 'maven' }}
-        run: |
-          set -Eeuo pipefail
-          mvn -B -q -DskipITs=false -Dtest=* test package
-
-      - name: Build & test (Gradle)
-        if: ${{ matrix.build == 'gradle' }}
-        run: |
-          set -Eeuo pipefail
-          chmod +x ./gradlew || true
-          ./gradlew test build --no-daemon
-
-      - name: Upload surefire/failsafe reports (Maven)
-        if: ${{ always() && matrix.build == 'maven' }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: surefire-reports-java-${{ matrix.java }}-maven
-          path: |
-            target/surefire-reports/**
-            target/failsafe-reports/**
-          if-no-files-found: warn
-
-      - name: Upload Gradle test reports
-        if: ${{ always() && matrix.build == 'gradle' }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: gradle-reports-java-${{ matrix.java }}
-          path: |
-            build/test-results/test/**
-            build/reports/tests/test/**
-          if-no-files-found: warn
-
-  smoke:
-    needs: [generate]
-    if: ${{ inputs.run_smoke_test == 'true' }}
-    runs-on: ubuntu-latest
-    steps:
-      - name: Download project artifact
+      - name: Download generator scripts
         uses: actions/download-artifact@v4
         with:
-          name: customer-mega-src
-          path: ./
+          name: redhat-java-generators
+          path: .github/tools
 
-      - name: Materialize sources into workspace root
+      - name: Ensure executables
+        run: chmod +x .github/tools/*.sh
+
+      # ----------------- Generate -----------------
+      - name: Generate (Maven)
+        if: ${{ inputs.action == 'generate' && inputs.build_tool == 'maven' }}
         run: |
-          set -Eeuo pipefail
-          shopt -s dotglob nullglob
-          SRC_DIR="customer-mega-src"
-          [ -d "$SRC_DIR" ] && rsync -a "$SRC_DIR"/ ./
-          [ -f pom.xml ] || cat > pom.xml <<'POM'
-          <project xmlns="http://maven.apache.org/POM/4.0.0"
-                   xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-                   xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
-            <modelVersion>4.0.0</modelVersion>
-            <groupId>temp.fallback</groupId><artifactId>temp-fallback</artifactId><version>0.0.1-SNAPSHOT</version>
-          </project>
-          POM
-          mkdir -p src/main/java src/test/java
+          .github/tools/gen-redhat-java.sh \
+            --groupId "${{ inputs.group_id }}" \
+            --artifactId "${{ inputs.artifact_id }}" \
+            --package "${{ inputs.package_name }}" \
+            --out "${{ inputs.out_dir }}"
+          echo "GEN_DIR=${{ inputs.out_dir }}" >> $GITHUB_ENV
 
-      - name: Setup Java (for smoke)
-        uses: actions/setup-java@v4
+      - name: Generate (Gradle)
+        if: ${{ inputs.action == 'generate' && inputs.build_tool == 'gradle' }}
+        run: |
+          .github/tools/gen-redhat-java-gradle.sh \
+            --groupId "${{ inputs.group_id }}" \
+            --artifactId "${{ inputs.artifact_id }}" \
+            --package "${{ inputs.package_name }}" \
+            --out "${{ inputs.out_dir }}"
+          echo "GEN_DIR=${{ inputs.out_dir }}" >> $GITHUB_ENV
+
+      - name: Generate (Spring Boot Maven)
+        if: ${{ inputs.action == 'generate' && inputs.build_tool == 'spring-boot' }}
+        run: |
+          .github/tools/gen-redhat-springboot.sh \
+            --groupId "${{ inputs.group_id }}" \
+            --artifactId "${{ inputs.artifact_id }}" \
+            --package "${{ inputs.package_name }}" \
+            --out "${{ inputs.out_dir }}" \
+            --boot "${TARGET_BOOT}"
+          echo "GEN_DIR=${{ inputs.out_dir }}" >> $GITHUB_ENV
+
+      - name: Build generated project (Maven)
+        if: ${{ inputs.action == 'generate' && (inputs.build_tool == 'maven' || inputs.build_tool == 'spring-boot') }}
+        run: |
+          mvn -q -e -DskipTests=false -f "${{ env.GEN_DIR }}/pom.xml" clean verify
+
+      - name: Build generated project (Gradle)
+        if: ${{ inputs.action == 'generate' && inputs.build_tool == 'gradle' }}
+        run: |
+          cd "${{ env.GEN_DIR }}"
+          ./gradlew --version >/dev/null 2>&1 || (echo "Gradle wrapper absent; installing Gradle" && sudo apt-get update -y && sudo apt-get install -y gradle)
+          ./gradlew -q --no-daemon clean build || gradle -q clean build
+
+      - name: Upload generated project
+        if: ${{ inputs.action == 'generate' }}
+        uses: actions/upload-artifact@v4
         with:
-          distribution: temurin
-          java-version: ${{ inputs.java_version }}
-          cache: maven
+          name: generated-${{ inputs.build_tool }}
+          path: ${{ env.GEN_DIR }}
 
-      - name: Boot run & curl check (H2 + OpenAPI)
+      # ----------------- Upgrade -----------------
+      - name: Detect build tool
+        id: detect
+        if: ${{ inputs.action == 'upgrade' }}
+        shell: bash
         run: |
           set -Eeuo pipefail
-          LOG=.github/echo_logs; mkdir -p "$LOG"
-          nohup mvn -q -Dspring-boot.run.profiles=h2 spring-boot:run > "$LOG/app.log" 2>&1 &
-          APP_PID=$!
-          # 대기시간 증대 + 조기종료/타임아웃시 로그덤프
-          for i in $(seq 1 120); do
-            if curl -fsS "http://127.0.0.1:8080/actuator/health" >/dev/null 2>&1; then
-              READY=1; break
-            fi
-            if ! kill -0 "$APP_PID" 2>/dev/null; then
-              echo "[ERROR] Spring Boot process exited early. Dumping last 200 lines of log:"
-              tail -n 200 "$LOG/app.log" || true
-              exit 1
-            fi
-            sleep 1
-          done
-          if [ "${READY:-0}" -ne 1 ]; then
-            echo "[ERROR] App did not become healthy in time. Dumping last 200 lines of log:"
-            tail -n 200 "$LOG/app.log" || true
-            exit 7
+          if [[ -f "pom.xml" ]]; then
+            echo "tool=maven" >> $GITHUB_OUTPUT
+          elif [[ -f "build.gradle" || -f "build.gradle.kts" ]]; then
+            echo "tool=gradle" >> $GITHUB_OUTPUT
+          else
+            echo "No build file found (pom.xml or build.gradle*)."; exit 1
           fi
-          curl -fsS "http://127.0.0.1:8080/v3/api-docs" | head -c 500 | tee "$LOG/openapi.json.head"
-          curl -fsS "http://127.0.0.1:8080/swagger-ui/index.html" | head -c 500 | tee "$LOG/swagger.head"
-          curl -fsS -X POST "http://127.0.0.1:8080/customers" \
-            -H "Content-Type: application/json" \
-            -d '{"name":"스모크","email":"smoke@example.com","phone":"010"}' | tee "$LOG/post.json"
-          curl -fsS "http://127.0.0.1:8080/customers" | tee "$LOG/get.json"
-          kill "$APP_PID" || true
-          sleep 2
-          pkill -f 'spring-boot:run' || true
 
-      - name: Upload smoke logs
-        uses: actions/upload-artifact@v4
-        with:
-          name: smoke-logs
-          path: .github/echo_logs/**
-          if-no-files-found: warn
+      - name: Upgrade Spring Boot (Maven)
+        if: ${{ inputs.action == 'upgrade' && steps.detect.outputs.tool == 'maven' }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          TARGET="${TARGET_BOOT}"
+          echo "Upgrading Spring Boot (Maven) -> ${TARGET}"
+          # xmlstarlet가 있으면 안전 업데이트, 없으면 sed fallback
+          if command -v xmlstarlet >/dev/null 2>&1; then
+            xmlstarlet ed -P -L \
+              -u "/project/parent/version" -v "${TARGET}" \
+              pom.xml || true
+          else
+            sed -i -E "s|(<artifactId>spring-boot-starter-parent</artifactId>[^<]*</parent>.*?<version>)[^<]+(</version>)|\1${TARGET}\2|s" pom.xml || true
+            sed -i -E "s|(<parent>[^<]*<groupId>org.springframework.boot</groupId>[^<]*<artifactId>spring-boot-starter-parent</artifactId>[^<]*<version>)[^<]+(</version>)|\1${TARGET}\2|g" pom.xml || true
+          fi
+          ./mvnw -q -V -U -e -DskipTests=false clean verify || mvn -q -V -U -e clean verify
+
+      - name: Upgrade Spring Boot (Gradle)
+        if: ${{ inputs.action == 'upgrade' && steps.detect.outputs.tool == 'gradle' }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          TARGET="${TARGET_BOOT}"
+          echo "Upgrading Spring Boot (Gradle) -> ${TARGET}"
+          GRADLE_FILE=""
+          [[ -f build.gradle.kts ]] && GRADLE_FILE="build.gradle.kts" || GRADLE_FILE="build.gradle"
+          # plugin 버전 치환 (Groovy/Kotlin DSL 모두 지원하는 단순 패턴)
+          sed -i -E "s|(id[[:space:]]+'org\\.springframework\\.boot'[[:space:]]+version[[:space:]]+')[^']+(')|\\1${TARGET}\\2|g" "${GRADLE_FILE}" || true
+          sed -i -E 's|(id\\("org\\.springframework\\.boot"\\)[[:space:]]*version[[:space:]]*")[^"]+(")|\\1'${TARGET}'\\2|g' "${GRADLE_FILE}" || true
+          ./gradlew -q --no-daemon clean build || gradle -q clean build
+
+      - name: Commit changes (upgrade only)
+        if: ${{ inputs.action == 'upgrade' }}
+        run: |
+          set -Eeuo pipefail
+          if ! git diff --quiet; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add -A
+            git commit -m "[AUTO] Spring Boot upgrade -> ${TARGET_BOOT}"
+            git push
+          else
+            echo "No changes to commit."
+          fi
