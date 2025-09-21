@@ -1,4 +1,4 @@
-name: "☕ Java Red Hat — Generate ALL + Spring Boot Upgrade (No-Skip)"
+name: "☕ Java Red Hat — Generate ALL + Spring Boot Upgrade (No-Skip, Fixed)"
 
 on:
   workflow_dispatch:
@@ -8,15 +8,15 @@ on:
         required: true
         default: "com.example"
       artifact_id_base:
-        description: "프로젝트 이름 베이스(각 템플릿 접두로 사용)"
+        description: "프로젝트 이름 베이스(각 템플릿 접두)"
         required: true
         default: "demo"
       package_name:
-        description: "기본 패키지"
+        description: "기본 패키지 (예: com.example.app)"
         required: true
         default: "com.example.app"
       target_version:
-        description: "Spring Boot 타겟 버전 (예: 3.5.6)"
+        description: "Spring Boot 타겟 버전"
         required: true
         default: "3.5.6"
       out_base:
@@ -33,7 +33,7 @@ concurrency:
 
 jobs:
   all:
-    name: "Generate EVERYTHING + Upgrade (no skip)"
+    name: "Generate EVERYTHING + Upgrade (no skip, fixed)"
     runs-on: ubuntu-latest
 
     steps:
@@ -54,7 +54,7 @@ jobs:
           mkdir -p .github/tools
           mkdir -p "${{ inputs.out_base }}"
 
-      - name: Write generator scripts (Maven/Gradle/Spring Boot)
+      - name: Write generator scripts (Maven/Gradle/Spring Boot) — FIXED heredocs
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -117,15 +117,21 @@ jobs:
             </build>
           </project>
           EOF
+          # App.java (expand variables)
           cat > "$ROOT/src/main/java/$PKG_PATH/App.java" <<EOF
           package ${PACKAGE_NAME};
-          public class App { public static void main(String[] args){ System.out.println("Hello, Red Hat Java + VS Code! ✔"); } }
+          public class App {
+              public static void main(String[] args){ System.out.println("Hello, Red Hat Java + VS Code! ✔"); }
+          }
           EOF
-          cat > "$ROOT/src/test/java/$PKG_PATH/AppTest.java" <<'EOF'
+          # AppTest.java (FIX: unquoted heredoc so ${PACKAGE_NAME} expands)
+          cat > "$ROOT/src/test/java/$PKG_PATH/AppTest.java" <<EOF
           package ${PACKAGE_NAME};
           import static org.junit.jupiter.api.Assertions.assertTrue;
           import org.junit.jupiter.api.Test;
-          class AppTest { @Test void sanity(){ assertTrue(true); } }
+          class AppTest {
+              @Test void sanity(){ assertTrue(true); }
+          }
           EOF
           echo "$ROOT"
           EOS
@@ -165,13 +171,18 @@ jobs:
           EOF
           cat > "$ROOT/src/main/java/$PKG_PATH/App.java" <<EOF
           package ${PACKAGE_NAME};
-          public class App { public static void main(String[] args){ System.out.println("Hello, Red Hat Java + Gradle! ✔"); } }
+          public class App {
+              public static void main(String[] args){ System.out.println("Hello, Red Hat Java + Gradle! ✔"); }
+          }
           EOF
-          cat > "$ROOT/src/test/java/$PKG_PATH/AppTest.java" <<'EOF'
+          # FIX: unquoted heredoc
+          cat > "$ROOT/src/test/java/$PKG_PATH/AppTest.java" <<EOF
           package ${PACKAGE_NAME};
           import static org.junit.jupiter.api.Assertions.assertTrue;
           import org.junit.jupiter.api.Test;
-          class AppTest { @Test void sanity(){ assertTrue(true); } }
+          class AppTest {
+              @Test void sanity(){ assertTrue(true); }
+          }
           EOF
           echo "$ROOT"
           EOS
@@ -231,12 +242,13 @@ jobs:
             public static void main(String[] args){ SpringApplication.run(Application.class, args); }
           }
           EOF
-          echo "server.port=8080" > "$ROOT/src/main/resources/application.properties"
-          cat > "$ROOT/src/test/java/$PKG_PATH/ApplicationTests.java" <<'EOF'
+          # FIX: unquoted heredoc
+          cat > "$ROOT/src/test/java/$PKG_PATH/ApplicationTests.java" <<EOF
           package ${PACKAGE_NAME};
           import org.junit.jupiter.api.Test; import org.springframework.boot.test.context.SpringBootTest;
           @SpringBootTest class ApplicationTests { @Test void contextLoads() {} }
           EOF
+          echo "server.port=8080" > "$ROOT/src/main/resources/application.properties"
           echo "$ROOT"
           EOS
           chmod +x .github/tools/gen-redhat-springboot.sh
@@ -251,25 +263,22 @@ jobs:
           TARGET_BOOT: ${{ inputs.target_version }}
         run: |
           set -Eeuo pipefail
-
-          # Maven
           MAVEN_DIR="${OUT_BASE}/maven-${ART_BASE}"
+          GRADLE_DIR="${OUT_BASE}/gradle-${ART_BASE}"
+          BOOT_DIR="${OUT_BASE}/boot-${ART_BASE}"
+
           .github/tools/gen-redhat-java.sh \
             --groupId "$GROUP_ID" \
             --artifactId "maven-${ART_BASE}" \
             --package "$PACKAGE_NAME" \
             --out "$MAVEN_DIR"
 
-          # Gradle
-          GRADLE_DIR="${OUT_BASE}/gradle-${ART_BASE}"
           .github/tools/gen-redhat-java-gradle.sh \
             --groupId "$GROUP_ID" \
             --artifactId "gradle-${ART_BASE}" \
             --package "$PACKAGE_NAME" \
             --out "$GRADLE_DIR"
 
-          # Spring Boot (Maven)
-          BOOT_DIR="${OUT_BASE}/boot-${ART_BASE}"
           .github/tools/gen-redhat-springboot.sh \
             --groupId "$GROUP_ID" \
             --artifactId "boot-${ART_BASE}" \
@@ -280,6 +289,31 @@ jobs:
           echo "MAVEN_DIR=$MAVEN_DIR"  >> $GITHUB_ENV
           echo "GRADLE_DIR=$GRADLE_DIR" >> $GITHUB_ENV
           echo "BOOT_DIR=$BOOT_DIR"    >> $GITHUB_ENV
+
+      - name: SANITY FIX — package lines & placeholders
+        shell: bash
+        env:
+          PACKAGE_NAME: ${{ inputs.package_name }}
+        run: |
+          set -Eeuo pipefail
+          fix_tree () {
+            local ROOT="$1"
+            # 1) ${PACKAGE_NAME} 리터럴이 남아있으면 실제 값으로 치환
+            grep -RIl '\${PACKAGE_NAME}' "$ROOT" | xargs -r sed -i "s|\${PACKAGE_NAME}|${PACKAGE_NAME}|g"
+            # 2) package 라인에 슬래시가 들어간 경우 점으로 교체
+            grep -RIl '^package .*[/].*;' "$ROOT" | xargs -r sed -i -E 's|^package +([^;]+);|package \1;|; s|/|.|g'
+            # 3) package 라인이 없으면 파일 경로로부터 자동 추가
+            while IFS= read -r -d '' f; do
+              if ! grep -q '^package ' "$f"; then
+                # src/.../java/ 이후 경로로 패키지 추론
+                pkg=$(echo "$f" | sed -E 's|.*src/(main|test)/java/||; s|/[^/]+$||; s|/|.|g')
+                [[ -n "$pkg" ]] && sed -i "1i package ${pkg};" "$f"
+              fi
+            done < <(find "$ROOT" -type f -name '*.java' -print0)
+          }
+          fix_tree "${MAVEN_DIR}"
+          fix_tree "${GRADLE_DIR}"
+          fix_tree "${BOOT_DIR}"
 
       - name: Build — Maven template
         shell: bash
@@ -301,7 +335,7 @@ jobs:
           set -Eeuo pipefail
           mvn -q -e -DskipTests=false -f "${BOOT_DIR}/pom.xml" clean verify
 
-      - name: Upgrade — Try to upgrade current repo OR upgrade a generated fallback
+      - name: Upgrade — Try current repo OR generated fallback
         shell: bash
         env:
           TARGET_BOOT: ${{ inputs.target_version }}
@@ -316,7 +350,6 @@ jobs:
             if command -v xmlstarlet >/dev/null 2>&1; then
               xmlstarlet ed -P -L -u "/project/parent/version" -v "${TARGET_BOOT}" pom.xml || true
             else
-              # 안전 대체 패턴(Parent 의 version만 교체)
               awk -v tgt="${TARGET_BOOT}" '
                 BEGIN{RS="</parent>"; ORS="</parent>"}
                 {gsub(/<version>[^<]+<\/version>/,"<version>"tgt"</version>"); print}
@@ -327,21 +360,18 @@ jobs:
 
           upgrade_gradle () {
             echo "[UPGRADE] Gradle project -> ${TARGET_BOOT}"
-            FILE="build.gradle"
-            [[ -f build.gradle.kts ]] && FILE="build.gradle.kts"
+            FILE="build.gradle"; [[ -f build.gradle.kts ]] && FILE="build.gradle.kts"
             sed -i -E "s|(id[[:space:]]+'org\\.springframework\\.boot'[[:space:]]+version[[:space:]]+')[^']+(')|\\1${TARGET_BOOT}\\2|g" "$FILE" || true
             sed -i -E 's|(id\\("org\\.springframework\\.boot"\\)[[:space:]]*version[[:space:]]*")[^"]+(")|\\1'${TARGET_BOOT}'\\2|g' "$FILE" || true
             ./gradlew --version >/dev/null 2>&1 || (sudo apt-get update -y && sudo apt-get install -y gradle)
             ./gradlew -q --no-daemon clean build || gradle -q clean build
           }
 
-          # 1) 현재 리포에 Maven/Gradle 있으면 그걸 업그레이드
           if [[ -f pom.xml ]]; then
             upgrade_maven
           elif [[ -f build.gradle || -f build.gradle.kts ]]; then
             upgrade_gradle
           else
-            # 2) 없으면 Fallback: 임시 Spring Boot(Maven) 생성→구버전→업그레이드 실행
             FALL="${OUT_BASE}/upgrade-target"
             rm -rf "$FALL"
             .github/tools/gen-redhat-springboot.sh \
@@ -350,9 +380,10 @@ jobs:
               --package "$PACKAGE_NAME" \
               --out "$FALL" \
               --boot "3.3.4"
-            cd "$FALL"
-            upgrade_maven
-            cd - >/dev/null
+            # 보정 후 업그레이드
+            grep -RIl '\${PACKAGE_NAME}' "$FALL" | xargs -r sed -i "s|\${PACKAGE_NAME}|${PACKAGE_NAME}|g"
+            grep -RIl '^package .*[/].*;' "$FALL" | xargs -r sed -i -E 's|^package +([^;]+);|package \1;|; s|/|.|g'
+            ( cd "$FALL" && upgrade_maven )
           fi
 
       - name: Upload artifacts
