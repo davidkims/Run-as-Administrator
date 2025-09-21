@@ -1,76 +1,265 @@
-name: Dependabot Auto Generation
+name: Dependabot Auto Generation — Extended
 
 on:
   workflow_dispatch:
+    inputs:
+      mode:
+        description: "실행 모드 (all | generate | build | docker | release)"
+        required: true
+        default: "all"
+      echo_level:
+        description: "로그 레벨 (silent|normal|debug|trace)"
+        required: true
+        default: "normal"
+      dry_run:
+        description: "드라이런 (true/false)"
+        required: true
+        default: "false"
+      continue_on_error:
+        description: "에러 발생해도 계속 (true/false)"
+        required: true
+        default: "false"
+      retries:
+        description: "재시도 횟수 1~3"
+        required: true
+        default: "1"
   schedule:
     - cron: '0 3 * * *'
   pull_request:
-    branches:
-      - main
-    paths:
-      - '**'
+    branches: [ main ]
+    paths: [ '**' ]
   push:
-    branches:
-      - 'dependabot/**'
+    branches: [ 'dependabot/**' ]
+
+concurrency:
+  group: dependabot-auto-generation-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  generate-artifacts:
-    name: Generate reusable assets
-    runs-on: ubuntu-latest
-    if: github.actor == 'dependabot[bot]' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+  # =========================================================
+  # 1) Java 빌드/테스트: 3 OS × JDK 17/21/23 매트릭스 (도커 제외)
+  # =========================================================
+  java-matrix:
+    name: "Java build — ${{ matrix.os }} / JDK ${{ matrix.java }}"
+    runs-on: ${{ matrix.os }}
+    if: github.actor == 'dependabot[bot]' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' || github.event_name == 'pull_request' || github.event_name == 'push'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        java: [17, 21, 23]
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Java
+      - name: Setup Temurin JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ matrix.java }}
+          cache: maven
+
+      - name: Bootstrap helpers (ECHO/RUN/RETRY/MODE)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          MODE="${{ inputs.mode }}"
+          ECHO_LEVEL="${{ inputs.echo_level }}"
+          DRY_RUN="${{ inputs.dry_run }}"
+          CONT_ON_ERR="${{ inputs.continue_on_error }}"
+          RETRIES="${{ inputs.retries }}"
+          # 디스패치가 아닌 트리거에서도 기본값 보장
+          MODE="${MODE:-all}"; ECHO_LEVEL="${ECHO_LEVEL:-normal}"
+          DRY_RUN="${DRY_RUN:-false}"; CONT_ON_ERR="${CONT_ON_ERR:-false}"
+          [[ "$RETRIES" =~ ^[1-3]$ ]] || RETRIES=1
+
+          group(){ echo "::group::$*"; }
+          endgroup(){ echo "::endgroup::"; }
+          _ts(){ date +"%Y-%m-%d %H:%M:%S"; }
+          echon(){ echo "[$(_ts)] $*"; }
+          e_info(){ [[ "$ECHO_LEVEL" != "silent" ]] && echon "ℹ️  $*"; }
+          e_debug(){ [[ "$ECHO_LEVEL" =~ ^(debug|trace)$ ]] && echon "🔍 $*"; }
+          e_trace(){ [[ "$ECHO_LEVEL" == "trace" ]] && echon "🧵 $*"; }
+          e_warn(){ echon "⚠️  $*" >&2; }
+          e_err(){ echon "❌ $*" >&2; }
+          RUN(){
+            local cmd="$*"
+            e_info "▶ $cmd"
+            if [[ "$DRY_RUN" == "true" ]]; then e_info "(dry-run)"; return 0; fi
+            if [[ "$CONT_ON_ERR" == "true" ]]; then set +e; eval "$cmd"; local rc=$?; set -e; [[ $rc -ne 0 ]] && e_warn "rc=$rc (continue)"; return 0; fi
+            eval "$cmd"
+          }
+          RETRY(){
+            local cmd="$*"; local n=1; local max=${RETRIES}
+            until RUN "$cmd"; do
+              [[ $n -ge $max ]] && return 1
+              e_warn "retry $n/$max → $cmd"; n=$((n+1)); sleep $n || true
+            done
+          }
+          need_generate(){ [[ "$MODE" == "all" || "$MODE" == "generate" ]]; }
+          need_build(){ [[ "$MODE" == "all" || "$MODE" == "build" || "$MODE" == "docker" ]]; }
+          need_docker(){ [[ "$MODE" == "all" || "$MODE" == "docker" ]]; }
+          need_release(){ [[ "$MODE" == "all" || "$MODE" == "release" ]]; }
+          {
+            declare -f group endgroup echon e_info e_debug e_trace e_warn e_err RUN RETRY need_generate need_build need_docker need_release
+            echo "export MODE='$MODE' ECHO_LEVEL='$ECHO_LEVEL' DRY_RUN='$DRY_RUN' CONT_ON_ERR='$CONT_ON_ERR' RETRIES='$RETRIES'"
+          } > .github/helpers.sh
+          chmod +x .github/helpers.sh
+          group "Inputs"; e_info "mode=$MODE echo=$ECHO_LEVEL dry_run=$DRY_RUN continue_on_error=$CONT_ON_ERR retries=$RETRIES"; endgroup
+
+      - name: Generate Java/Maven/Docker/RedHat templates
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          source .github/helpers.sh
+          group "Generate"
+          # 기존 스크립트 호출 (존재 가정). 없으면 실패 처리.
+          RETRY "bash scripts/dependabot-autogen.sh generated"
+          endgroup
+
+      - name: Build Maven sample (wrapper 우선, mvn 대체)
+        shell: bash
+        working-directory: generated/maven
+        run: |
+          set -Eeuo pipefail
+          source ../../.github/helpers.sh
+          group "Maven build"
+          if [[ -x "./mvnw" ]]; then RETRY "./mvnw -B -ntp -e -DskipTests=false clean package"
+          elif command -v mvn >/dev/null 2>&1; then RETRY "mvn -B -ntp -e -DskipTests=false clean package"
+          else e_err "Maven not available"; exit 1; fi
+          endgroup
+
+      - name: Upload generated (per OS/JDK)
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependabot-generated-${{ matrix.os }}-jdk${{ matrix.java }}
+          path: generated
+          if-no-files-found: error
+
+      - name: Clean (matrix)
+        if: always()
+        shell: bash
+        run: rm -rf generated
+
+  # =========================================================
+  # 2) Docker/Red Hat 이미지 빌드 (Linux 전용)
+  #    - 필요 시 재생성/재빌드하여 독립 실행
+  # =========================================================
+  docker-images:
+    name: "Docker buildx (Linux only)"
+    runs-on: ubuntu-latest
+    needs: [java-matrix]
+    if: github.actor == 'dependabot[bot]' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' || github.event_name == 'pull_request' || github.event_name == 'push'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Temurin JDK 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
           cache: maven
 
-      - name: Generate Java, Maven, Docker and Red Hat templates
+      - name: Helpers
+        shell: bash
         run: |
-          bash scripts/dependabot-autogen.sh generated
+          set -Eeuo pipefail
+          # 디스패치 기본값
+          MODE="${{ inputs.mode }}"; MODE="${MODE:-all}"
+          ECHO_LEVEL="${{ inputs.echo_level }}"; ECHO_LEVEL="${ECHO_LEVEL:-normal}"
+          DRY_RUN="${{ inputs.dry_run }}"; DRY_RUN="${DRY_RUN:-false}"
+          CONT_ON_ERR="${{ inputs.continue_on_error }}"; CONT_ON_ERR="${CONT_ON_ERR:-false}"
+          RETRIES="${{ inputs.retries }}"; [[ "$RETRIES" =~ ^[1-3]$ ]] || RETRIES=1
 
-      - name: Build Maven sample project
-        working-directory: generated/maven
+          group(){ echo "::group::$*"; }
+          endgroup(){ echo "::endgroup::"; }
+          _ts(){ date +"%Y-%m-%d %H:%M:%S"; }
+          echon(){ echo "[$(_ts)] $*"; }
+          e_info(){ [[ "$ECHO_LEVEL" != "silent" ]] && echon "ℹ️  $*"; }
+          e_warn(){ echon "⚠️  $*" >&2; }
+          e_err(){ echon "❌ $*" >&2; }
+          RUN(){ local cmd="$*"; e_info "▶ $cmd"; [[ "$DRY_RUN" == "true" ]] && { e_info "(dry-run)"; return 0; }; if [[ "$CONT_ON_ERR" == "true" ]]; then set +e; eval "$cmd"; local rc=$?; set -e; [[ $rc -ne 0 ]] && e_warn "rc=$rc (continue)"; return 0; fi; eval "$cmd"; }
+          RETRY(){ local cmd="$*"; local n=1; local max=${RETRIES}; until RUN "$cmd"; do [[ $n -ge $max ]] && return 1; e_warn "retry $n/$max → $cmd"; n=$((n+1)); sleep $n || true; done; }
+          need_docker(){ [[ "$MODE" == "all" || "$MODE" == "docker" ]]; }
+          {
+            declare -f group endgroup echon e_info e_warn e_err RUN RETRY need_docker
+            echo "export MODE='$MODE' ECHO_LEVEL='$ECHO_LEVEL' DRY_RUN='$DRY_RUN' CONT_ON_ERR='$CONT_ON_ERR' RETRIES='$RETRIES'"
+          } > .github/helpers.sh
+          chmod +x .github/helpers.sh
+
+      - name: (Mode gate) Generate + Build for Docker
+        shell: bash
         run: |
-          if command -v mvn >/dev/null 2>&1; then
-            mvn -B -ntp package
-          else
-            echo "Maven is not available on this runner" >&2
-            exit 1
+          set -Eeuo pipefail
+          source .github/helpers.sh
+          if need_docker; then
+            group "Generate (for Docker)"
+            RETRY "bash scripts/dependabot-autogen.sh generated"
+            endgroup
+
+            group "Maven package (for Docker)"
+            if [[ -x "generated/maven/mvnw" ]]; then RETRY "cd generated/maven && ./mvnw -B -ntp -e -DskipTests=false clean package"
+            elif command -v mvn >/dev/null 2>&1; then RETRY "cd generated/maven && mvn -B -ntp -e -DskipTests=false clean package"
+            else e_err "Maven not available"; exit 1; fi
+            endgroup
           fi
 
-      - name: Prepare container build context
+      - name: Resolve JAR & prepare contexts
+        if: always()
+        shell: bash
         run: |
-          cp generated/maven/target/dependabot-automation-1.0.0.jar generated/docker/dependabot-automation.jar
-          cp generated/maven/target/dependabot-automation-1.0.0.jar generated/redhat/dependabot-automation.jar
+          set -Eeuo pipefail
+          source .github/helpers.sh
+          group "Resolve JAR"
+          JAR=$(find generated/maven/target -maxdepth 1 -type f -name '*.jar' ! -name '*-sources.jar' ! -name '*-javadoc.jar' | head -n 1 || true)
+          if [[ -z "$JAR" ]]; then e_err "Jar not found under generated/maven/target"; exit 1; fi
+          e_info "Jar: $JAR"
+          RETRY "cp -f \"$JAR\" generated/docker/dependabot-automation.jar"
+          RETRY "cp -f \"$JAR\" generated/redhat/dependabot-automation.jar"
+          endgroup
 
-      - name: Build Docker image
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image (local tag)
+        shell: bash
         run: |
-          docker buildx build \
+          set -Eeuo pipefail
+          source .github/helpers.sh
+          group "Docker build (generic)"
+          RETRY "docker buildx build \
             --file generated/docker/Dockerfile \
             --tag dependabot-autogen:latest \
-            generated/docker
+            --cache-from type=gha \
+            --cache-to type=gha,mode=max \
+            generated/docker"
+          endgroup
 
-      - name: Build Red Hat compatible image
+      - name: Build Red Hat compatible image (Containerfile)
+        shell: bash
         run: |
-          docker buildx build \
+          set -Eeuo pipefail
+          source .github/helpers.sh
+          group "Docker build (RHEL/UBI)"
+          RETRY "docker buildx build \
             --file generated/redhat/Containerfile \
             --tag dependabot-autogen:rhel \
-            generated/redhat
+            --cache-from type=gha \
+            --cache-to type=gha,mode=max \
+            generated/redhat"
+          endgroup
 
-      - name: Upload generated templates
+      - name: Upload generated templates (Linux)
         uses: actions/upload-artifact@v4
         with:
-          name: dependabot-generated-assets
+          name: dependabot-generated-assets-linux
           path: generated
           if-no-files-found: error
 
-      - name: Clean workspace artifacts
+      - name: Clean (docker)
         if: always()
-        run: |
-          rm -rf generated
+        shell: bash
+        run: rm -rf generated
