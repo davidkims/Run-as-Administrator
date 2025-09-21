@@ -1,70 +1,73 @@
-name: "☕ Java Red Hat Resources + Spring Boot Upgrade (All-in-One)"
+name: "☕ Java Red Hat — Generate ALL + Spring Boot Upgrade (No-Skip)"
 
 on:
   workflow_dispatch:
     inputs:
-      action:
-        description: "작업 유형 (generate | upgrade)"
-        type: choice
-        required: true
-        default: "generate"
-        options: ["generate", "upgrade"]
-      build_tool:
-        description: "생성 대상 (maven | gradle | spring-boot)"
-        type: choice
-        required: true
-        default: "maven"
-        options: ["maven", "gradle", "spring-boot"]
-      target_version:
-        description: "Spring Boot 타겟 버전 (빈값=기본 3.5.6)"
-        required: false
-        default: "3.5.6"
       group_id:
         description: "Maven/Gradle groupId"
-        required: false
+        required: true
         default: "com.example"
-      artifact_id:
-        description: "프로젝트 artifactId"
-        required: false
-        default: "demo-app"
+      artifact_id_base:
+        description: "프로젝트 이름 베이스(각 템플릿 접두로 사용)"
+        required: true
+        default: "demo"
       package_name:
         description: "기본 패키지"
-        required: false
+        required: true
         default: "com.example.app"
-      out_dir:
-        description: "생성 출력 경로 (예: ./demo-app)"
-        required: false
-        default: "./demo-app"
+      target_version:
+        description: "Spring Boot 타겟 버전 (예: 3.5.6)"
+        required: true
+        default: "3.5.6"
+      out_base:
+        description: "생성 출력 루트 디렉토리"
+        required: true
+        default: "./out"
 
 permissions:
   contents: write
 
 concurrency:
-  group: java-redhat-boot-upgrade-${{ github.ref }}-${{ github.event.inputs.action }}
+  group: java-redhat-boot-all-run-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  prepare:
-    name: "Prepare scripts"
+  all:
+    name: "Generate EVERYTHING + Upgrade (no skip)"
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Write generator scripts (Maven / Gradle / Spring Boot)
+      - name: Setup Temurin JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+
+      - name: Prepare directories
         shell: bash
         run: |
           set -Eeuo pipefail
           mkdir -p .github/tools
-          # ----------------- gen-redhat-java.sh (Maven) -----------------
+          mkdir -p "${{ inputs.out_base }}"
+
+      - name: Write generator scripts (Maven/Gradle/Spring Boot)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          # =============== gen-redhat-java.sh (Maven) ===============
           cat > .github/tools/gen-redhat-java.sh <<'EOS'
           #!/usr/bin/env bash
           set -Eeuo pipefail
           GROUP_ID="${GROUP_ID:-com.example}"
-          ARTIFACT_ID="${ARTIFACT_ID:-demo-app}"
+          ARTIFACT_ID="${ARTIFACT_ID:-demo-maven}"
           VERSION="${VERSION:-0.0.1-SNAPSHOT}"
           PACKAGE_NAME="${PACKAGE_NAME:-com.example.app}"
-          OUT_DIR="${OUT_DIR:-./demo-app}"
+          OUT_DIR="${OUT_DIR:-./out/demo-maven}"
           while [[ $# -gt 0 ]]; do
             case "$1" in
               --groupId) GROUP_ID="$2"; shift 2 ;;
@@ -118,27 +121,24 @@ jobs:
           package ${PACKAGE_NAME};
           public class App { public static void main(String[] args){ System.out.println("Hello, Red Hat Java + VS Code! ✔"); } }
           EOF
-          cat > "$ROOT/src/test/java/$PKG_PATH/AppTest.java" <<EOF
+          cat > "$ROOT/src/test/java/$PKG_PATH/AppTest.java" <<'EOF'
           package ${PACKAGE_NAME};
           import static org.junit.jupiter.api.Assertions.assertTrue;
           import org.junit.jupiter.api.Test;
           class AppTest { @Test void sanity(){ assertTrue(true); } }
           EOF
-          cat > "$ROOT/.vscode/launch.json" <<EOF
-          { "version":"0.2.0", "configurations":[{ "type":"java","name":"Run App","request":"launch","mainClass":"${PACKAGE_NAME}.App","projectName":"${ARTIFACT_ID}","console":"integratedTerminal"}] }
-          EOF
-          echo "Generated (Maven): $ROOT"
+          echo "$ROOT"
           EOS
           chmod +x .github/tools/gen-redhat-java.sh
 
-          # ----------------- gen-redhat-java-gradle.sh -----------------
+          # =============== gen-redhat-java-gradle.sh ===============
           cat > .github/tools/gen-redhat-java-gradle.sh <<'EOS'
           #!/usr/bin/env bash
           set -Eeuo pipefail
           GROUP_ID="${GROUP_ID:-com.example}"
           ARTIFACT_ID="${ARTIFACT_ID:-demo-gradle}"
           PACKAGE_NAME="${PACKAGE_NAME:-com.example.app}"
-          OUT_DIR="${OUT_DIR:-./demo-gradle}"
+          OUT_DIR="${OUT_DIR:-./out/demo-gradle}"
           JAVA_VERSION="${JAVA_VERSION:-17}"
           while [[ $# -gt 0 ]]; do
             case "$1" in
@@ -153,7 +153,7 @@ jobs:
           PKG_PATH="${PACKAGE_NAME//./\/}"
           ROOT="$(mkdir -p "$OUT_DIR" && cd "$OUT_DIR" && pwd)"
           mkdir -p "$ROOT/src/main/java/$PKG_PATH" "$ROOT/src/test/java/$PKG_PATH" "$ROOT/.vscode"
-          cat > "$ROOT/settings.gradle" <<< "rootProject.name = '${ARTIFACT_ID}'"
+          echo "rootProject.name = '${ARTIFACT_ID}'" > "$ROOT/settings.gradle"
           cat > "$ROOT/build.gradle" <<EOF
           plugins { id 'java'; id 'application' }
           group='${GROUP_ID}'; version='1.0.0'
@@ -173,21 +173,18 @@ jobs:
           import org.junit.jupiter.api.Test;
           class AppTest { @Test void sanity(){ assertTrue(true); } }
           EOF
-          cat > "$ROOT/.vscode/launch.json" <<EOF
-          { "version":"0.2.0", "configurations":[{ "type":"java","name":"Run App (Gradle)","request":"launch","mainClass":"${PACKAGE_NAME}.App","projectName":"${ARTIFACT_ID}","console":"integratedTerminal"}] }
-          EOF
-          echo "Generated (Gradle): $ROOT"
+          echo "$ROOT"
           EOS
           chmod +x .github/tools/gen-redhat-java-gradle.sh
 
-          # ----------------- gen-redhat-springboot.sh -----------------
+          # =============== gen-redhat-springboot.sh (Maven) ===============
           cat > .github/tools/gen-redhat-springboot.sh <<'EOS'
           #!/usr/bin/env bash
           set -Eeuo pipefail
           GROUP_ID="${GROUP_ID:-com.example}"
           ARTIFACT_ID="${ARTIFACT_ID:-demo-boot}"
           PACKAGE_NAME="${PACKAGE_NAME:-com.example.app}"
-          OUT_DIR="${OUT_DIR:-./demo-boot}"
+          OUT_DIR="${OUT_DIR:-./out/demo-boot}"
           SPRING_BOOT_VERSION="${SPRING_BOOT_VERSION:-3.5.6}"
           JAVA_VERSION="${JAVA_VERSION:-17}"
           while [[ $# -gt 0 ]]; do
@@ -217,7 +214,7 @@ jobs:
             <artifactId>${ARTIFACT_ID}</artifactId>
             <version>0.0.1-SNAPSHOT</version>
             <name>${ARTIFACT_ID}</name>
-            <description>Spring Boot minimal app (VS Code + Red Hat Java)</description>
+            <description>Spring Boot minimal app</description>
             <properties><java.version>${JAVA_VERSION}</java.version></properties>
             <dependencies>
               <dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter</artifactId></dependency>
@@ -234,157 +231,136 @@ jobs:
             public static void main(String[] args){ SpringApplication.run(Application.class, args); }
           }
           EOF
+          echo "server.port=8080" > "$ROOT/src/main/resources/application.properties"
           cat > "$ROOT/src/test/java/$PKG_PATH/ApplicationTests.java" <<'EOF'
           package ${PACKAGE_NAME};
           import org.junit.jupiter.api.Test; import org.springframework.boot.test.context.SpringBootTest;
           @SpringBootTest class ApplicationTests { @Test void contextLoads() {} }
           EOF
-          echo "server.port=8080" > "$ROOT/src/main/resources/application.properties"
-          echo "Generated (Spring Boot): $ROOT"
+          echo "$ROOT"
           EOS
           chmod +x .github/tools/gen-redhat-springboot.sh
 
-      - name: Upload generator scripts
-        uses: actions/upload-artifact@v4
-        with:
-          name: redhat-java-generators
-          path: .github/tools/*.sh
-          if-no-files-found: error
-
-  run:
-    name: "Generate or Upgrade"
-    needs: [prepare]
-    runs-on: ubuntu-latest
-    env:
-      TARGET_BOOT: ${{ inputs.target_version != '' && inputs.target_version || '3.5.6' }}
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Temurin JDK (17)
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: '17'
-          cache: maven
-
-      - name: Download generator scripts
-        uses: actions/download-artifact@v4
-        with:
-          name: redhat-java-generators
-          path: .github/tools
-
-      - name: Ensure executables
-        run: chmod +x .github/tools/*.sh
-
-      # ----------------- Generate -----------------
-      - name: Generate (Maven)
-        if: ${{ inputs.action == 'generate' && inputs.build_tool == 'maven' }}
+      - name: Generate ALL (Maven/Gradle/Spring Boot)
+        shell: bash
+        env:
+          GROUP_ID: ${{ inputs.group_id }}
+          PACKAGE_NAME: ${{ inputs.package_name }}
+          OUT_BASE: ${{ inputs.out_base }}
+          ART_BASE: ${{ inputs.artifact_id_base }}
+          TARGET_BOOT: ${{ inputs.target_version }}
         run: |
+          set -Eeuo pipefail
+
+          # Maven
+          MAVEN_DIR="${OUT_BASE}/maven-${ART_BASE}"
           .github/tools/gen-redhat-java.sh \
-            --groupId "${{ inputs.group_id }}" \
-            --artifactId "${{ inputs.artifact_id }}" \
-            --package "${{ inputs.package_name }}" \
-            --out "${{ inputs.out_dir }}"
-          echo "GEN_DIR=${{ inputs.out_dir }}" >> $GITHUB_ENV
+            --groupId "$GROUP_ID" \
+            --artifactId "maven-${ART_BASE}" \
+            --package "$PACKAGE_NAME" \
+            --out "$MAVEN_DIR"
 
-      - name: Generate (Gradle)
-        if: ${{ inputs.action == 'generate' && inputs.build_tool == 'gradle' }}
-        run: |
+          # Gradle
+          GRADLE_DIR="${OUT_BASE}/gradle-${ART_BASE}"
           .github/tools/gen-redhat-java-gradle.sh \
-            --groupId "${{ inputs.group_id }}" \
-            --artifactId "${{ inputs.artifact_id }}" \
-            --package "${{ inputs.package_name }}" \
-            --out "${{ inputs.out_dir }}"
-          echo "GEN_DIR=${{ inputs.out_dir }}" >> $GITHUB_ENV
+            --groupId "$GROUP_ID" \
+            --artifactId "gradle-${ART_BASE}" \
+            --package "$PACKAGE_NAME" \
+            --out "$GRADLE_DIR"
 
-      - name: Generate (Spring Boot Maven)
-        if: ${{ inputs.action == 'generate' && inputs.build_tool == 'spring-boot' }}
-        run: |
+          # Spring Boot (Maven)
+          BOOT_DIR="${OUT_BASE}/boot-${ART_BASE}"
           .github/tools/gen-redhat-springboot.sh \
-            --groupId "${{ inputs.group_id }}" \
-            --artifactId "${{ inputs.artifact_id }}" \
-            --package "${{ inputs.package_name }}" \
-            --out "${{ inputs.out_dir }}" \
-            --boot "${TARGET_BOOT}"
-          echo "GEN_DIR=${{ inputs.out_dir }}" >> $GITHUB_ENV
+            --groupId "$GROUP_ID" \
+            --artifactId "boot-${ART_BASE}" \
+            --package "$PACKAGE_NAME" \
+            --out "$BOOT_DIR" \
+            --boot "$TARGET_BOOT"
 
-      - name: Build generated project (Maven)
-        if: ${{ inputs.action == 'generate' && (inputs.build_tool == 'maven' || inputs.build_tool == 'spring-boot') }}
-        run: |
-          mvn -q -e -DskipTests=false -f "${{ env.GEN_DIR }}/pom.xml" clean verify
+          echo "MAVEN_DIR=$MAVEN_DIR"  >> $GITHUB_ENV
+          echo "GRADLE_DIR=$GRADLE_DIR" >> $GITHUB_ENV
+          echo "BOOT_DIR=$BOOT_DIR"    >> $GITHUB_ENV
 
-      - name: Build generated project (Gradle)
-        if: ${{ inputs.action == 'generate' && inputs.build_tool == 'gradle' }}
+      - name: Build — Maven template
+        shell: bash
         run: |
-          cd "${{ env.GEN_DIR }}"
-          ./gradlew --version >/dev/null 2>&1 || (echo "Gradle wrapper absent; installing Gradle" && sudo apt-get update -y && sudo apt-get install -y gradle)
+          set -Eeuo pipefail
+          mvn -q -e -DskipTests=false -f "${MAVEN_DIR}/pom.xml" clean verify
+
+      - name: Build — Gradle template
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cd "${GRADLE_DIR}"
+          ./gradlew --version >/dev/null 2>&1 || (sudo apt-get update -y && sudo apt-get install -y gradle)
           ./gradlew -q --no-daemon clean build || gradle -q clean build
 
-      - name: Upload generated project
-        if: ${{ inputs.action == 'generate' }}
+      - name: Build — Spring Boot template (Maven)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mvn -q -e -DskipTests=false -f "${BOOT_DIR}/pom.xml" clean verify
+
+      - name: Upgrade — Try to upgrade current repo OR upgrade a generated fallback
+        shell: bash
+        env:
+          TARGET_BOOT: ${{ inputs.target_version }}
+          OUT_BASE: ${{ inputs.out_base }}
+          GROUP_ID: ${{ inputs.group_id }}
+          PACKAGE_NAME: ${{ inputs.package_name }}
+        run: |
+          set -Eeuo pipefail
+
+          upgrade_maven () {
+            echo "[UPGRADE] Maven project -> ${TARGET_BOOT}"
+            if command -v xmlstarlet >/dev/null 2>&1; then
+              xmlstarlet ed -P -L -u "/project/parent/version" -v "${TARGET_BOOT}" pom.xml || true
+            else
+              # 안전 대체 패턴(Parent 의 version만 교체)
+              awk -v tgt="${TARGET_BOOT}" '
+                BEGIN{RS="</parent>"; ORS="</parent>"}
+                {gsub(/<version>[^<]+<\/version>/,"<version>"tgt"</version>"); print}
+              ' pom.xml > pom.tmp && mv pom.tmp pom.xml
+            fi
+            mvn -q -V -U -e -DskipTests=false clean verify
+          }
+
+          upgrade_gradle () {
+            echo "[UPGRADE] Gradle project -> ${TARGET_BOOT}"
+            FILE="build.gradle"
+            [[ -f build.gradle.kts ]] && FILE="build.gradle.kts"
+            sed -i -E "s|(id[[:space:]]+'org\\.springframework\\.boot'[[:space:]]+version[[:space:]]+')[^']+(')|\\1${TARGET_BOOT}\\2|g" "$FILE" || true
+            sed -i -E 's|(id\\("org\\.springframework\\.boot"\\)[[:space:]]*version[[:space:]]*")[^"]+(")|\\1'${TARGET_BOOT}'\\2|g' "$FILE" || true
+            ./gradlew --version >/dev/null 2>&1 || (sudo apt-get update -y && sudo apt-get install -y gradle)
+            ./gradlew -q --no-daemon clean build || gradle -q clean build
+          }
+
+          # 1) 현재 리포에 Maven/Gradle 있으면 그걸 업그레이드
+          if [[ -f pom.xml ]]; then
+            upgrade_maven
+          elif [[ -f build.gradle || -f build.gradle.kts ]]; then
+            upgrade_gradle
+          else
+            # 2) 없으면 Fallback: 임시 Spring Boot(Maven) 생성→구버전→업그레이드 실행
+            FALL="${OUT_BASE}/upgrade-target"
+            rm -rf "$FALL"
+            .github/tools/gen-redhat-springboot.sh \
+              --groupId "$GROUP_ID" \
+              --artifactId "upgrade-target" \
+              --package "$PACKAGE_NAME" \
+              --out "$FALL" \
+              --boot "3.3.4"
+            cd "$FALL"
+            upgrade_maven
+            cd - >/dev/null
+          fi
+
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: generated-${{ inputs.build_tool }}
-          path: ${{ env.GEN_DIR }}
-
-      # ----------------- Upgrade -----------------
-      - name: Detect build tool
-        id: detect
-        if: ${{ inputs.action == 'upgrade' }}
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          if [[ -f "pom.xml" ]]; then
-            echo "tool=maven" >> $GITHUB_OUTPUT
-          elif [[ -f "build.gradle" || -f "build.gradle.kts" ]]; then
-            echo "tool=gradle" >> $GITHUB_OUTPUT
-          else
-            echo "No build file found (pom.xml or build.gradle*)."; exit 1
-          fi
-
-      - name: Upgrade Spring Boot (Maven)
-        if: ${{ inputs.action == 'upgrade' && steps.detect.outputs.tool == 'maven' }}
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          TARGET="${TARGET_BOOT}"
-          echo "Upgrading Spring Boot (Maven) -> ${TARGET}"
-          # xmlstarlet가 있으면 안전 업데이트, 없으면 sed fallback
-          if command -v xmlstarlet >/dev/null 2>&1; then
-            xmlstarlet ed -P -L \
-              -u "/project/parent/version" -v "${TARGET}" \
-              pom.xml || true
-          else
-            sed -i -E "s|(<artifactId>spring-boot-starter-parent</artifactId>[^<]*</parent>.*?<version>)[^<]+(</version>)|\1${TARGET}\2|s" pom.xml || true
-            sed -i -E "s|(<parent>[^<]*<groupId>org.springframework.boot</groupId>[^<]*<artifactId>spring-boot-starter-parent</artifactId>[^<]*<version>)[^<]+(</version>)|\1${TARGET}\2|g" pom.xml || true
-          fi
-          ./mvnw -q -V -U -e -DskipTests=false clean verify || mvn -q -V -U -e clean verify
-
-      - name: Upgrade Spring Boot (Gradle)
-        if: ${{ inputs.action == 'upgrade' && steps.detect.outputs.tool == 'gradle' }}
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          TARGET="${TARGET_BOOT}"
-          echo "Upgrading Spring Boot (Gradle) -> ${TARGET}"
-          GRADLE_FILE=""
-          [[ -f build.gradle.kts ]] && GRADLE_FILE="build.gradle.kts" || GRADLE_FILE="build.gradle"
-          # plugin 버전 치환 (Groovy/Kotlin DSL 모두 지원하는 단순 패턴)
-          sed -i -E "s|(id[[:space:]]+'org\\.springframework\\.boot'[[:space:]]+version[[:space:]]+')[^']+(')|\\1${TARGET}\\2|g" "${GRADLE_FILE}" || true
-          sed -i -E 's|(id\\("org\\.springframework\\.boot"\\)[[:space:]]*version[[:space:]]*")[^"]+(")|\\1'${TARGET}'\\2|g' "${GRADLE_FILE}" || true
-          ./gradlew -q --no-daemon clean build || gradle -q clean build
-
-      - name: Commit changes (upgrade only)
-        if: ${{ inputs.action == 'upgrade' }}
-        run: |
-          set -Eeuo pipefail
-          if ! git diff --quiet; then
-            git config user.name "github-actions[bot]"
-            git config user.email "github-actions[bot]@users.noreply.github.com"
-            git add -A
-            git commit -m "[AUTO] Spring Boot upgrade -> ${TARGET_BOOT}"
-            git push
-          else
-            echo "No changes to commit."
-          fi
+          name: java-redhat-all
+          path: |
+            ${{ env.MAVEN_DIR }}
+            ${{ env.GRADLE_DIR }}
+            ${{ env.BOOT_DIR }}
+          if-no-files-found: error
