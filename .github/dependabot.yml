@@ -1,0 +1,29 @@
+version: 2
+registries:
+  # (옵션) 프라이빗 Maven 레지스트리 예시
+  maven-internal:
+    type: maven-repository
+    url: https://maven.example.com/repository/releases
+    username: ${{secrets.MAVEN_USER}}
+    password: ${{secrets.MAVEN_PASS}}
+
+updates:
+  - package-ecosystem: "maven"
+    directory: "/"              # pom.xml이 있는 디렉토리
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "00:00"
+      timezone: "Asia/Seoul"
+    registries:
+      - maven-internal
+    open-pull-requests-limit: 10
+
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "00:00"
+      timezone: "Asia/Seoul"
+    open-pull-requests-limit: 10

@@ -1,0 +1,10 @@
+4.0K	/mnt/was_data/assets
+4.0K	/mnt/was_data/backups
+4.0K	/mnt/was_data/cache
+4.0K	/mnt/was_data/conf
+4.0K	/mnt/was_data/logs
+4.0K	/mnt/was_data/sessions
+4.0K	/mnt/was_data/static
+4.0K	/mnt/was_data/temp
+4.0K	/mnt/was_data/uploads
+16K	/mnt/was_data/lost+found

@@ -1,0 +1,634 @@
+name: "🗄️ Workflow DB FullOps ULTRA (Matrix Shards + Virtual Creds + TLS + ISO/Release)"
+
+on:
+  schedule:
+    - cron: "*/20 * * * *"   # 20분 주기
+  workflow_dispatch:
+    inputs:
+      wf_product:
+        description: "워크플로우 제품"
+        type: choice
+        required: true
+        default: "airflow"
+        options: ["airflow", "n8n", "ibm-baw", "sharepoint-wfm"]
+      target_db:
+        description: "대상 DB (all: 모두 실행)"
+        type: choice
+        required: true
+        default: "all"
+        options: ["postgres", "mysql", "mssql", "all"]
+      db_name:
+        description: "DB 이름(기준 접두)"
+        required: true
+        default: "appdb"
+      db_user:
+        description: "DB 접속 사용자(기준 접두)"
+        required: true
+        default: "appuser"
+      db_password:
+        description: "DB 접속 비밀번호(비워두면 시크릿 우선)"
+        required: true
+        default: "StrongPw123!"
+      grant_model:
+        description: "권한 모델"
+        type: choice
+        required: true
+        default: "strict"
+        options: ["strict", "basic"]
+      run_apply:
+        description: "컨테이너 기동 후 실제 적용(지원: postgres/mysql/mssql/all)"
+        type: choice
+        required: true
+        default: "true"
+        options: ["true", "false"]
+      release_tag:
+        description: "릴리즈 태그(예: v1.0.0 또는 AUTO)"
+        required: true
+        default: "AUTO"
+      mode_preset:
+        description: "모드 프리셋(full/iso-only/artifacts-only/release-only/minimal)"
+        type: choice
+        required: true
+        default: "full"
+        options: ["full","iso-only","artifacts-only","release-only","minimal"]
+      extra_json:
+        description: "추가설정 JSON — bulk_count, bulk_prefix, shard_size, max_shards, cred_export, enc_mode[aes|zip|none], iso_enable, iso_per_service, create_artifacts, enable_tls, release_enable, release_prerelease"
+        required: false
+        default: "{}"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: db-fullops-ultra-${{ github.ref }}-${{ github.workflow }}
+  cancel-in-progress: true
+
+jobs:
+  # 1) 매트릭스 산출 + 공통 파라미터/릴리즈 태그 계산 --------------------------------
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.mk.outputs.matrix }}
+      iso_enable: ${{ steps.mk.outputs.iso_enable }}
+      iso_per_service: ${{ steps.mk.outputs.iso_per_service }}
+      create_artifacts: ${{ steps.mk.outputs.create_artifacts }}
+      release_enable: ${{ steps.mk.outputs.release_enable }}
+      release_prerelease: ${{ steps.mk.outputs.release_prerelease }}
+      enable_tls: ${{ steps.mk.outputs.enable_tls }}
+      release_tag: ${{ steps.mk.outputs.release_tag }}
+      eff_wf_product: ${{ steps.mk.outputs.eff_wf_product }}
+      eff_target_db: ${{ steps.mk.outputs.eff_target_db }}
+      eff_db_name: ${{ steps.mk.outputs.eff_db_name }}
+      eff_db_user: ${{ steps.mk.outputs.eff_db_user }}
+      eff_db_password: ${{ steps.mk.outputs.eff_db_password }}
+      eff_grant_model: ${{ steps.mk.outputs.eff_grant_model }}
+      eff_run_apply: ${{ steps.mk.outputs.eff_run_apply }}
+    steps:
+      - id: mk
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          # 입력 기본값 안전 계산 (스케줄 트리거 대비)
+          E_WF_PRODUCT="${{ github.event.inputs.wf_product }}"; [ -z "$E_WF_PRODUCT" ] && E_WF_PRODUCT=airflow
+          E_TARGET_DB="${{ github.event.inputs.target_db }}"; [ -z "$E_TARGET_DB" ] && E_TARGET_DB=all
+          E_DB_NAME="${{ github.event.inputs.db_name }}"; [ -z "$E_DB_NAME" ] && E_DB_NAME=appdb
+          E_DB_USER="${{ github.event.inputs.db_user }}"; [ -z "$E_DB_USER" ] && E_DB_USER=appuser
+          E_DB_PASSWORD="${{ github.event.inputs.db_password }}"; [ -z "$E_DB_PASSWORD" ] && E_DB_PASSWORD=StrongPw123!
+          E_GRANT_MODEL="${{ github.event.inputs.grant_model }}"; [ -z "$E_GRANT_MODEL" ] && E_GRANT_MODEL=strict
+          E_RUN_APPLY="${{ github.event.inputs.run_apply }}"; [ -z "$E_RUN_APPLY" ] && E_RUN_APPLY=true
+          R_IN="${{ github.event.inputs.release_tag }}"; [ -z "$R_IN" ] && R_IN=AUTO
+          if [ "$R_IN" = "AUTO" ]; then
+            REL_TAG="vAUTO-${GITHUB_RUN_NUMBER}"
+          else
+            REL_TAG="$R_IN"
+          fi
+
+          echo "eff_wf_product=$E_WF_PRODUCT" >> "$GITHUB_OUTPUT"
+          echo "eff_target_db=$E_TARGET_DB" >> "$GITHUB_OUTPUT"
+          echo "eff_db_name=$E_DB_NAME" >> "$GITHUB_OUTPUT"
+          echo "eff_db_user=$E_DB_USER" >> "$GITHUB_OUTPUT"
+          echo "eff_db_password=$E_DB_PASSWORD" >> "$GITHUB_OUTPUT"
+          echo "eff_grant_model=$E_GRANT_MODEL" >> "$GITHUB_OUTPUT"
+          echo "eff_run_apply=$E_RUN_APPLY" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$REL_TAG" >> "$GITHUB_OUTPUT"
+
+          EXTRA='${{ github.event.inputs.extra_json }}'
+          # 기본값 (초대량)
+          BULK_COUNT=10000
+          BULK_PREFIX="${E_DB_USER}_bulk"
+          SHARD_SIZE=500
+          MAX_SHARDS=64
+          ISO_ENABLE=true
+          ISO_PER_SERVICE=true
+          CREATE_ARTIFACTS=true
+          RELEASE_ENABLE=true
+          RELEASE_PRERELEASE=false
+          ENABLE_TLS=true
+          parse_bool(){ v="$1"; [ "$v" = "true" ] && echo true || [ "$v" = "false" ] && echo false || echo ""; }
+          if [ -n "$EXTRA" ] && [ "$EXTRA" != "null" ]; then
+            jq -e . >/dev/null 2>&1 <<<"$EXTRA" || { echo "extra_json JSON 오류"; exit 1; }
+            v=$(jq -r 'select(.bulk_count!=null) | .bulk_count'         <<<"$EXTRA"); [ "$v" != "null" ] && [ -n "$v" ] && BULK_COUNT="$v"
+            v=$(jq -r 'select(.bulk_prefix!=null)| .bulk_prefix'        <<<"$EXTRA"); [ "$v" != "null" ] && [ -n "$v" ] && BULK_PREFIX="$v"
+            v=$(jq -r 'select(.shard_size!=null) | .shard_size'         <<<"$EXTRA"); [ "$v" != "null" ] && [ -n "$v" ] && SHARD_SIZE="$v"
+            v=$(jq -r 'select(.max_shards!=null)| .max_shards'          <<<"$EXTRA"); [ "$v" != "null" ] && [ -n "$v" ] && MAX_SHARDS="$v"
+            v=$(jq -r 'select(.iso_enable!=null) | .iso_enable'         <<<"$EXTRA"); b=$(parse_bool "$v"); [ -n "$b" ] && ISO_ENABLE=$b
+            v=$(jq -r 'select(.iso_per_service!=null)| .iso_per_service'<<<"$EXTRA"); b=$(parse_bool "$v"); [ -n "$b" ] && ISO_PER_SERVICE=$b
+            v=$(jq -r 'select(.create_artifacts!=null)| .create_artifacts'<<<"$EXTRA"); b=$(parse_bool "$v"); [ -n "$b" ] && CREATE_ARTIFACTS=$b
+            v=$(jq -r 'select(.enable_tls!=null) | .enable_tls'         <<<"$EXTRA"); b=$(parse_bool "$v"); [ -n "$b" ] && ENABLE_TLS=$b
+            v=$(jq -r 'select(.release_enable!=null)| .release_enable'  <<<"$EXTRA"); b=$(parse_bool "$v"); [ -n "$b" ] && RELEASE_ENABLE=$b
+            v=$(jq -r 'select(.release_prerelease!=null)| .release_prerelease'<<<"$EXTRA"); b=$(parse_bool "$v"); [ -n "$b" ] && RELEASE_PRERELEASE=$b
+          fi
+          # 샤드 수 계산
+          n=$(( (BULK_COUNT + SHARD_SIZE - 1) / SHARD_SIZE ))
+          [ "$n" -gt "$MAX_SHARDS" ] && n=$MAX_SHARDS
+          [ "$n" -lt 1 ] && n=1
+          # include JSON 생성(단일 라인)
+          json='{"include":['
+          for i in $(seq 0 $((n-1))); do
+            s=$(( i*SHARD_SIZE + 1 ))
+            e=$(( (i+1)*SHARD_SIZE ))
+            [ "$e" -gt "$BULK_COUNT" ] && e=$BULK_COUNT
+            json+="{\"shard_index\":$i,\"start\":$s,\"end\":$e,\"bulk_prefix\":\"$BULK_PREFIX\"}"
+            [ "$i" -lt $((n-1)) ] && json+="," || true
+          done
+          json+=']}'
+          echo "matrix=$json" >> "$GITHUB_OUTPUT"
+          echo "iso_enable=$ISO_ENABLE" >> "$GITHUB_OUTPUT"
+          echo "iso_per_service=$ISO_PER_SERVICE" >> "$GITHUB_OUTPUT"
+          echo "create_artifacts=$CREATE_ARTIFACTS" >> "$GITHUB_OUTPUT"
+          echo "release_enable=$RELEASE_ENABLE" >> "$GITHUB_OUTPUT"
+          echo "release_prerelease=$RELEASE_PRERELEASE" >> "$GITHUB_OUTPUT"
+          echo "enable_tls=$ENABLE_TLS" >> "$GITHUB_OUTPUT"
+
+  # 2) 베이스 자원/ISO -------------------------------------------------------------
+  base:
+    needs: prepare
+    runs-on: ubuntu-latest
+    env:
+      ISO_ENABLE: ${{ needs.prepare.outputs.iso_enable }}
+      ISO_PER_SERVICE: ${{ needs.prepare.outputs.iso_per_service }}
+      CREATE_ARTIFACTS: ${{ needs.prepare.outputs.create_artifacts }}
+      ENABLE_TLS: ${{ needs.prepare.outputs.enable_tls }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: System tools
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          sudo apt-get update
+          sudo apt-get -y install jq rsync gettext-base genisoimage openssl
+      - name: Prepare dirs & docs
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p \
+            .github/echo_db/{postgres,mysql,mssql,oracle,db2,common} \
+            .github/echo_products/{airflow,n8n,ibm-baw,sharepoint-wfm} \
+            .github/echo_ansible/{group_vars,roles/db_tasks/{templates,tasks}} \
+            .github/out/{release_root,iso} \
+            .github/echo_tls \
+            .github/echo_docs
+          cat > .github/echo_docs/README.md <<'MD'
+          # DB FullOps ULTRA
+          - 초대량 테넌트/가상계정, 서비스 전반(Airflow/n8n/BAW/SharePoint) 반영
+          - TLS/Ansible/샘플/ISO/릴리즈 포함
+          - 샤딩(matrix)으로 수평 확장 처리
+          MD
+          cat > .gitignore <<'GI'
+          .github/out/
+          .github/secure/
+          GI
+      - name: Common guides
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cat > .github/echo_db/common/SECURITY_TLS_GUIDE.md <<'MD'
+          # 보안/TLS 요약
+          - TLS 강제(서버 인증서), 최소권한(ROLE/GRANT), 비밀관리(Vault/KeyVault)
+          - 감사 로깅/로테이션, 백업/DR(PITR/스냅샷), 정기 복구 리허설
+          MD
+          cat > .github/echo_db/common/BACKUP_DR_CHECKLIST.md <<'MD'
+          # 백업/DR 체크리스트
+          - 전체/증분, RPO/RTO, DR Runbook
+          - 레플리카/클러스터(AG/Patroni/InnoDB Cluster 등) + 모니터링/알람
+          MD
+      - name: (Optional) Generate self-signed TLS assets
+        if: ${{ env.ENABLE_TLS == 'true' }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          TLS_DIR=".github/echo_tls"
+          cd "$TLS_DIR"
+          openssl genrsa -out ca.key 4096
+          openssl req -x509 -new -nodes -key ca.key -sha256 -days 3650 -subj "/CN=FullOps-Local-CA" -out ca.crt
+          openssl genrsa -out server.key 4096
+          cat > san.cnf <<'CNF'
+          [req]
+          distinguished_name=req
+          req_extensions = v3_req
+          [v3_req]
+          subjectAltName = @alt_names
+          [alt_names]
+          DNS.1 = localhost
+          DNS.2 = db.example.com
+          IP.1 = 127.0.0.1
+          CNF
+          openssl req -new -key server.key -subj "/CN=db.example.com" -out server.csr -config san.cnf
+          openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out server.crt -days 825 -sha256 -extensions v3_req -extfile san.cnf
+          chmod 600 server.key
+      - name: Product samples & Ansible skeleton
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cat > .github/echo_products/airflow/ENV.sample <<'ENV'
+          AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:pw@db:5432/airflow
+          ENV
+          cat > .github/echo_products/n8n/ENV.sample <<'ENV'
+          DB_TYPE=postgresdb
+          DB_POSTGRESDB_HOST=db
+          DB_POSTGRESDB_PORT=5432
+          DB_POSTGRESDB_DATABASE=n8n
+          DB_POSTGRESDB_USER=n8n
+          DB_POSTGRESDB_PASSWORD=strong_pw
+          ENV
+          cat > .github/echo_products/ibm-baw/JDBC.sample.properties <<'PROPS'
+          db.type=postgres
+          db.url=jdbc:postgresql://db.example.com:5432/bawdb?sslmode=require
+          db.user=baw
+          db.password=*****
+          PROPS
+          cat > .github/echo_products/sharepoint-wfm/SETUP_CHECKLIST.md <<'MD'
+          - SQL Server: TCP/IP(1433) 활성, SQL Browser 실행
+          - Azure Service Fabric Runtime 설치
+          - 팜 구성 계정/권한, 방화벽 예외
+          MD
+          cat > .github/echo_ansible/inventory.ini <<'INV'
+          [db_local]
+          127.0.0.1 ansible_connection=local
+          INV
+          cat > .github/echo_ansible/group_vars/all.yml <<'YML'
+          db_name: appdb
+          db_user: appuser
+          db_password: CHANGE_ME
+          grant_model: strict
+          target_db: all
+          YML
+          cat > .github/echo_ansible/roles/db_tasks/tasks/main.yml <<'YML'
+          ---
+          - name: Show DB variables
+            debug:
+              msg:
+                db_name: "{{ db_name }}"
+                db_user: "{{ db_user }}"
+                grant_model: "{{ grant_model }}"
+                target_db: "{{ target_db }}"
+          - name: Display note
+            debug:
+              msg: "로컬 생성된 SQL 템플릿을 배포/적용하는 골격 예시입니다."
+          YML
+          cat > .github/echo_ansible/site.yml <<'YML'
+          ---
+          - hosts: db_local
+            gather_facts: false
+            roles:
+              - db_tasks
+          YML
+      - name: Build base release tree (no tenants)
+        if: ${{ env.ISO_ENABLE == 'true' }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          ROOT=.github/out/release_root
+          mkdir -p "$ROOT/ALL"
+          rsync -a .github/echo_db/       "$ROOT/ALL/echo_db/"
+          rsync -a .github/echo_products/ "$ROOT/ALL/echo_products/"
+          rsync -a .github/echo_ansible/  "$ROOT/ALL/echo_ansible/"
+          [ -d .github/echo_tls ] && rsync -a .github/echo_tls/ "$ROOT/ALL/echo_tls/" || true
+      - name: Make base ISO(s)
+        if: ${{ env.ISO_ENABLE == 'true' }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          TS=$(date -u +%Y%m%dT%H%M%SZ)
+          OUT=.github/out/iso
+          ROOT=.github/out/release_root
+          mkdir -p "$OUT"
+          genisoimage -quiet -J -r -V "FULLOPS_BASE" -o "$OUT/FULLOPS_BASE_${TS}.iso" "$ROOT/ALL"
+          (cd "$OUT" && sha256sum *.iso > CHECKSUMS_BASE.txt)
+      - name: Upload base artifacts/ISOs
+        if: ${{ env.CREATE_ARTIFACTS == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: base-assets
+          path: |
+            .github/echo_db/**
+            .github/echo_products/**
+            .github/echo_ansible/**
+            .github/echo_tls/**
+            .github/echo_docs/**
+            .github/out/iso/*
+
+  # 3) 샤드 병렬 처리 -------------------------------------------------------------
+  shard-apply:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
+    env:
+      WF_PRODUCT: ${{ needs.prepare.outputs.eff_wf_product }}
+      TARGET_DB: ${{ needs.prepare.outputs.eff_target_db }}
+      DB_NAME: ${{ needs.prepare.outputs.eff_db_name }}
+      DB_USER: ${{ needs.prepare.outputs.eff_db_user }}
+      DB_PASSWORD: ${{ needs.prepare.outputs.eff_db_password }}
+      GRANT_MODEL: ${{ needs.prepare.outputs.eff_grant_model }}
+      RUN_APPLY: ${{ needs.prepare.outputs.eff_run_apply }}
+      MSSQL_SA_PASSWORD: Str0ng!Passw0rd
+      SHARD_INDEX: ${{ matrix.shard_index }}
+      SHARD_START: ${{ matrix.start }}
+      SHARD_END: ${{ matrix.end }}
+      BULK_PREFIX: ${{ matrix.bulk_prefix }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cleanup any old containers on this runner
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          for n in pg mysqldb mssql; do docker rm -f "$n" >/dev/null 2>&1 || true; done
+      - name: Install tools
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          sudo apt-get update
+          sudo apt-get -y install jq rsync gettext-base openssl genisoimage mysql-client postgresql-client
+      - name: Prefer secret DB password if present
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          if [ -n "${{ secrets.DB_PASSWORD }}" ]; then
+            echo "DB_PASSWORD=${{ secrets.DB_PASSWORD }}" >> "$GITHUB_ENV"
+          fi
+          if [ -n "${{ secrets.CRED_ENC_PASS }}" ]; then
+            echo "CRED_ENC_PASS=${{ secrets.CRED_ENC_PASS }}" >> "$GITHUB_ENV"
+          fi
+      - name: Ensure classic SQL assets (fallback, idempotent)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p .github/echo_db/postgres .github/echo_db/mysql .github/echo_db/mssql
+          # Postgres base files
+          [ -s .github/echo_db/postgres/01_roles.sql ] || cat > .github/echo_db/postgres/01_roles.sql <<'SQL'
+          DO $$
+          BEGIN
+            IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='${DB_USER}') THEN
+              EXECUTE format('CREATE ROLE %I LOGIN PASSWORD %L', '${DB_USER}', '${DB_PASSWORD}');
+            END IF;
+          END$$;
+          DO $$
+          BEGIN
+            IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='app_read') THEN CREATE ROLE app_read NOLOGIN; END IF;
+            IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='app_write') THEN CREATE ROLE app_write NOLOGIN; END IF;
+          END$$;
+          GRANT app_read TO "${DB_USER}";
+          GRANT app_write TO "${DB_USER}";
+          SQL
+          [ -s .github/echo_db/postgres/02_schema_grants.sql ] || cat > .github/echo_db/postgres/02_schema_grants.sql <<'SQL'
+          ALTER SCHEMA public OWNER TO "${DB_USER}";
+          ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO app_read;
+          ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT,INSERT,UPDATE,DELETE ON TABLES TO app_write;
+          SQL
+          [ -s .github/echo_db/postgres/03_model_strict.sql ] || cat > .github/echo_db/postgres/03_model_strict.sql <<'SQL'
+          CREATE TABLE IF NOT EXISTS public.process_instance(
+            id BIGSERIAL PRIMARY KEY,
+            status TEXT NOT NULL,
+            assignee TEXT,
+            created_at TIMESTAMPTZ DEFAULT now()
+          );
+          REVOKE ALL ON public.process_instance FROM PUBLIC;
+          GRANT SELECT ON public.process_instance TO app_read;
+          GRANT SELECT,INSERT,UPDATE,DELETE ON public.process_instance TO app_write;
+          SQL
+          [ -s .github/echo_db/postgres/03_model_basic.sql ] || cat > .github/echo_db/postgres/03_model_basic.sql <<'SQL'
+          GRANT USAGE ON SCHEMA public TO app_read, app_write;
+          GRANT SELECT ON ALL TABLES IN SCHEMA public TO app_read;
+          GRANT SELECT,INSERT,UPDATE,DELETE ON ALL TABLES IN SCHEMA public TO app_write;
+          SQL
+          # MySQL base files
+          [ -s .github/echo_db/mysql/00_create_db.sql ] || echo "CREATE DATABASE IF NOT EXISTS \`${DB_NAME}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;" > .github/echo_db/mysql/00_create_db.sql
+          [ -s .github/echo_db/mysql/01_user.sql ] || echo "CREATE USER IF NOT EXISTS '${DB_USER}'@'%' IDENTIFIED BY '${DB_PASSWORD}'; GRANT USAGE ON *.* TO '${DB_USER}'@'%';" > .github/echo_db/mysql/01_user.sql
+          [ -s .github/echo_db/mysql/02_grants_basic.sql ] || echo "GRANT SELECT ON \`${DB_NAME}\`.* TO '${DB_USER}'@'%'; GRANT INSERT, UPDATE, DELETE ON \`${DB_NAME}\`.* TO '${DB_USER}'@'%'; FLUSH PRIVILEGES;" > .github/echo_db/mysql/02_grants_basic.sql
+          [ -s .github/echo_db/mysql/02_grants_strict.sql ] || cat > .github/echo_db/mysql/02_grants_strict.sql <<'SQL'
+          USE `${DB_NAME}`;
+          CREATE TABLE IF NOT EXISTS process_instance(
+            id BIGINT PRIMARY KEY AUTO_INCREMENT,
+            status VARCHAR(64) NOT NULL,
+            assignee VARCHAR(128),
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+          );
+          REVOKE ALL PRIVILEGES, GRANT OPTION FROM '${DB_USER}'@'%';
+          GRANT SELECT ON `${DB_NAME}`.process_instance TO '${DB_USER}'@'%';
+          GRANT INSERT,UPDATE,DELETE ON `${DB_NAME}`.process_instance TO '${DB_USER}'@'%';
+          FLUSH PRIVILEGES;
+          SQL
+          # MSSQL base files
+          [ -s .github/echo_db/mssql/00_create_db.sql ] || printf "IF DB_ID(N'${DB_NAME}') IS NULL\n  CREATE DATABASE [${DB_NAME}];\nGO\n" > .github/echo_db/mssql/00_create_db.sql
+          [ -s .github/echo_db/mssql/01_roles.sql ] || cat > .github/echo_db/mssql/01_roles.sql <<'SQL'
+          USE [${DB_NAME}];
+          IF NOT EXISTS (SELECT 1 FROM sys.database_principals WHERE name=N'app_read')  CREATE ROLE app_read  AUTHORIZATION dbo;
+          IF NOT EXISTS (SELECT 1 FROM sys.database_principals WHERE name=N'app_write') CREATE ROLE app_write AUTHORIZATION dbo;
+          SQL
+          [ -s .github/echo_db/mssql/02_user_and_grants.sql ] || cat > .github/echo_db/mssql/02_user_and_grants.sql <<'SQL'
+          USE [${DB_NAME}];
+          IF NOT EXISTS (SELECT 1 FROM sys.sql_logins WHERE name = N'${DB_USER}')
+            CREATE LOGIN [${DB_USER}] WITH PASSWORD=N'${DB_PASSWORD}', CHECK_POLICY=ON;
+          IF NOT EXISTS (SELECT 1 FROM sys.database_principals WHERE name = N'${DB_USER}')
+            CREATE USER [${DB_USER}] FOR LOGIN [${DB_USER}];
+          EXEC sp_addrolemember N'app_read',  N'${DB_USER}';
+          EXEC sp_addrolemember N'app_write', N'${DB_USER}';
+          SQL
+      - name: Start PostgreSQL (if needed)
+        if: ${{ env.RUN_APPLY == 'true' && (env.TARGET_DB == 'postgres' || env.TARGET_DB == 'all') }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          if ! docker ps --format '{{.Names}}' | grep -qx pg; then
+            docker run -d --name pg -e POSTGRES_PASSWORD=postgres -p 5432:5432 \
+              --health-cmd="pg_isready -U postgres || exit 1" --health-interval=5s --health-retries=30 postgres:16
+          fi
+          # 대기 (health)
+          for i in {1..60}; do docker exec pg pg_isready -U postgres >/dev/null 2>&1 && break || sleep 2; done
+          # 샤드 DB 미리 생성
+          for i in $(seq -w ${SHARD_START} ${SHARD_END}); do docker exec -u postgres pg createdb "${DB_NAME}_${i}" >/dev/null 2>&1 || true; done
+          docker exec -u postgres pg createdb "${DB_NAME}" >/dev/null 2>&1 || true
+      - name: Start MySQL (if needed)
+        if: ${{ env.RUN_APPLY == 'true' && (env.TARGET_DB == 'mysql' || env.TARGET_DB == 'all') }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          if ! docker ps --format '{{.Names}}' | grep -qx mysqldb; then
+            docker run -d --name mysqldb -e MYSQL_ROOT_PASSWORD=root -p 3306:3306 \
+              --health-cmd="mysqladmin ping -h 127.0.0.1 -proot || exit 1" --health-interval=5s --health-retries=30 mysql:8
+          fi
+          mkdir -p .github/secure
+          cat > .github/secure/mysql.cnf <<'CNF'
+          [client]
+          host=127.0.0.1
+          user=root
+          password=root
+          port=3306
+          CNF
+          chmod 600 .github/secure/mysql.cnf
+          for i in {1..60}; do mysqladmin --defaults-extra-file=.github/secure/mysql.cnf ping --silent && break || sleep 2; done
+      - name: Install MSSQL tools & Start MSSQL (if needed)
+        if: ${{ env.RUN_APPLY == 'true' && (env.TARGET_DB == 'mssql' || env.TARGET_DB == 'all') }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          sudo apt-get update
+          sudo apt-get install -y curl ca-certificates gnupg apt-transport-https
+          curl -fsSL https://packages.microsoft.com/keys/microsoft.asc | sudo gpg --dearmor -o /usr/share/keyrings/microsoft.gpg
+          echo "deb [arch=amd64 signed-by=/usr/share/keyrings/microsoft.gpg] https://packages.microsoft.com/ubuntu/22.04/prod jammy main" | sudo tee /etc/apt/sources.list.d/mssql-release.list
+          sudo apt-get update || (sleep 5 && sudo apt-get update)
+          sudo ACCEPT_EULA=Y apt-get install -y msodbcsql18 mssql-tools18
+          export PATH="$PATH:/opt/mssql-tools18/bin"
+          if ! docker ps --format '{{.Names}}' | grep -qx mssql; then
+            docker run -d --name mssql -e "ACCEPT_EULA=Y" -e "MSSQL_SA_PASSWORD=${MSSQL_SA_PASSWORD}" -p 1433:1433 \
+              --health-cmd="/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -C -Q 'SELECT 1' || exit 1" \
+              --health-interval=5s --health-retries=30 mcr.microsoft.com/mssql/server:2022-latest
+          fi
+          for i in {1..80}; do docker exec -e SQLCMDPASSWORD="${MSSQL_SA_PASSWORD}" mssql /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -C -Q "SELECT 1" >/dev/null 2>&1 && break || sleep 2; done
+      - name: Generate per-shard credentials & SQL (unique passwords)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p .github/secure/creds .github/echo_db/{postgres,mysql,mssql}
+          set +x
+          mkpw(){ openssl rand -base64 18 | tr -d '\n'; }
+          echo "dbms,tenant,username,password,database" > .github/secure/creds/tenants-shard-${SHARD_INDEX}.csv
+          { echo "/* Shard ${SHARD_INDEX} tenants ${SHARD_START}-${SHARD_END} (PostgreSQL) */"; cat <<'EOS'
+          DO $$
+          BEGIN
+            IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='app_read') THEN CREATE ROLE app_read NOLOGIN; END IF;
+            IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='app_write') THEN CREATE ROLE app_write NOLOGIN; END IF;
+          END$$;
+          EOS
+            for i in $(seq -w ${SHARD_START} ${SHARD_END}); do
+              uname="${BULK_PREFIX}${i}"; db="${DB_NAME}_${i}"; pw="$(mkpw)"; >&2 echo "::add-mask::$pw"
+              printf "postgres,%s,%s,%s,%s\n" "$i" "$uname" "$pw" "$db" >> .github/secure/creds/tenants-shard-${SHARD_INDEX}.csv
+              cat <<EOS
+          DO $$
+          BEGIN
+            IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='${uname}') THEN
+              EXECUTE format('CREATE ROLE %I LOGIN PASSWORD %L', '${uname}', '${pw}');
+            END IF;
+          END$$;
+          \connect "${db}"
+          ALTER SCHEMA public OWNER TO "${uname}";
+          GRANT app_read  TO "${uname}";
+          GRANT app_write TO "${uname}";
+          \connect postgres
+          EOS
+            done; } > .github/echo_db/postgres/98_bulk_creds.sql
+          { echo "/* Shard ${SHARD_INDEX} (MySQL) */"; for i in $(seq -w ${SHARD_START} ${SHARD_END}); do
+              uname="${BULK_PREFIX}${i}"; db="${DB_NAME}_${i}"; pw="$(mkpw)"; >&2 echo "::add-mask::$pw"
+              printf "mysql,%s,%s,%s,%s\n" "$i" "$uname" "$pw" "$db" >> .github/secure/creds/tenants-shard-${SHARD_INDEX}.csv
+              cat <<EOS
+          CREATE DATABASE IF NOT EXISTS \`${db}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;
+          CREATE USER IF NOT EXISTS '${uname}'@'%' IDENTIFIED BY '${pw}';
+          GRANT SELECT,INSERT,UPDATE,DELETE ON \`${db}\`.* TO '${uname}'@'%';
+          FLUSH PRIVILEGES;
+          EOS
+            done; } > .github/echo_db/mysql/98_bulk_creds.sql
+          { echo "/* Shard ${SHARD_INDEX} (MSSQL) */"; for i in $(seq -w ${SHARD_START} ${SHARD_END}); do
+              uname="${BULK_PREFIX}${i}"; db="${DB_NAME}_${i}"; pw="$(mkpw)"; >&2 echo "::add-mask::$pw"
+              printf "mssql,%s,%s,%s,%s\n" "$i" "$uname" "$pw" "$db" >> .github/secure/creds/tenants-shard-${SHARD_INDEX}.csv
+              cat <<EOS
+          IF DB_ID(N'${db}') IS NULL CREATE DATABASE [${db}];
+          IF NOT EXISTS (SELECT 1 FROM sys.sql_logins WHERE name = N'${uname}')
+            CREATE LOGIN [${uname}] WITH PASSWORD=N'${pw}', CHECK_POLICY=ON;
+          EOS
+            done; } > .github/echo_db/mssql/98_bulk_creds.sql
+          set -x
+      - name: Apply per-shard SQL (PostgreSQL)
+        if: ${{ env.RUN_APPLY == 'true' && (env.TARGET_DB == 'postgres' || env.TARGET_DB == 'all') }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          umask 077; printf "127.0.0.1:5432:*:postgres:postgres\n" > ~/.pgpass
+          envsubst < .github/echo_db/postgres/98_bulk_creds.sql | psql -h 127.0.0.1 -U postgres -d postgres -v ON_ERROR_STOP=1
+      - name: Apply per-shard SQL (MySQL)
+        if: ${{ env.RUN_APPLY == 'true' && (env.TARGET_DB == 'mysql' || env.TARGET_DB == 'all') }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          envsubst < .github/echo_db/mysql/98_bulk_creds.sql | mysql --defaults-extra-file=.github/secure/mysql.cnf
+          shred -u .github/secure/mysql.cnf || rm -f .github/secure/mysql.cnf
+      - name: Apply per-shard SQL (MSSQL)
+        if: ${{ env.RUN_APPLY == 'true' && (env.TARGET_DB == 'mssql' || env.TARGET_DB == 'all') }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          export PATH="$PATH:/opt/mssql-tools18/bin"
+          export SQLCMDPASSWORD="${MSSQL_SA_PASSWORD}"
+          envsubst < .github/echo_db/mssql/98_bulk_creds.sql | sqlcmd -S 127.0.0.1 -U sa -C
+      - name: Upload shard credentials
+        uses: actions/upload-artifact@v4
+        with:
+          name: creds-shard-${{ matrix.shard_index }}
+          path: .github/secure/creds/*
+
+  # 4) 최종 병합 & 릴리즈 ---------------------------------------------------------
+  finalize:
+    needs: [prepare, base, shard-apply]
+    runs-on: ubuntu-latest
+    env:
+      RELEASE_ENABLE: ${{ needs.prepare.outputs.release_enable }}
+      RELEASE_PRERELEASE: ${{ needs.prepare.outputs.release_prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download all shard creds
+        uses: actions/download-artifact@v4
+        with:
+          pattern: creds-shard-*
+          merge-multiple: true
+      - name: Merge credentials & (optional) encrypt
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p .github/secure/merged
+          { echo "dbms,tenant,username,password,database"; cat tenants-shard-*.csv 2>/dev/null || true; } > .github/secure/merged/tenants.csv
+          [ -f services.csv ] && mv services.csv .github/secure/merged/services.csv || true
+          tar czf .github/secure/merged/credentials.tar.gz -C .github/secure/merged tenants.csv services.csv 2>/dev/null || tar czf .github/secure/merged/credentials.tar.gz -C .github/secure/merged tenants.csv
+          if [ -n "${{ secrets.CRED_ENC_PASS }}" ]; then
+            openssl enc -aes-256-cbc -salt -pbkdf2 -in .github/secure/merged/credentials.tar.gz -out .github/secure/merged/credentials.tar.gz.enc -pass env:CRED_PASS
+            rm -f .github/secure/merged/credentials.tar.gz
+          fi
+        env:
+          CRED_PASS: ${{ secrets.CRED_ENC_PASS }}
+      - name: Upload consolidated credentials
+        uses: actions/upload-artifact@v4
+        with:
+          name: credentials-merged
+          path: .github/secure/merged/*
+      - name: Create GitHub Release (attach base ISOs + creds if encrypted)
+        if: ${{ env.RELEASE_ENABLE == 'true' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare.outputs.release_tag }}
+          name: "Workflow DB FullOps ULTRA ${{ needs.prepare.outputs.release_tag }}"
+          body: |
+            DB FullOps ULTRA 릴리즈 (초대량/매트릭스)
+            - 제품: ${{ needs.prepare.outputs.eff_wf_product }}
+            - 대상 DB: ${{ needs.prepare.outputs.eff_target_db }}
+            - 권한 모델: ${{ needs.prepare.outputs.eff_grant_model }}
+            - 샤딩: 자동 계산 (range per shard)
+            - 포함: Base ISO, (암호화된) Credentials
+          draft: false
+          prerelease: ${{ needs.prepare.outputs.release_prerelease == 'true' }}
+          files: |
+            .github/out/iso/*.iso
+            .github/out/iso/CHECKSUMS_BASE.txt
+            .github/secure/merged/credentials.tar.gz.enc
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

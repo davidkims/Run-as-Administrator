@@ -1,0 +1,731 @@
+name: "🐧 Linux/RHEL Image Suite — Split (All-in-One, Split by Service, Anti-Disk-Full)"
+
+on:
+  workflow_dispatch:
+    inputs:
+      distro:
+        description: "배포판 (ubuntu|debian|rocky|alma|rhel)"
+        type: choice
+        required: true
+        default: "ubuntu"
+        options: [ "ubuntu", "debian", "rocky", "alma", "rhel" ]
+      qcow_size_gb:
+        description: "QCOW2 사이즈(GB)"
+        required: true
+        default: "8"
+      release_tag:
+        description: "Release 태그(비우면 auto-{run_id})"
+        required: false
+        default: ""
+  workflow_call:
+    inputs:
+      distro: { type: string, required: true }
+      qcow_size_gb: { type: string, default: "8" }
+      release_tag: { type: string, default: "" }
+
+permissions:
+  contents: write
+  packages: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: linux-rhel-image-suite-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # 공통 기본값
+  ECHO_ROOT: .github/echo_linux
+  DIST_DIR: dist
+  ISO_DIR: dist/isos
+  IMG_DIR: dist/images
+  LOG_DIR: dist/logs
+  META_DIR: dist/meta
+  SEED_DIR: dist/seed
+  WORK_DIR: dist/work
+  TMP_DIR: dist/tmp
+  GHCR_BASE: ghcr.io/${{ github.repository }}/image-suite
+
+  # 디스크/임계치
+  FREE_TARGET_GB: "25"
+  HIGH_WATER_PCT: "80"
+  SPILL_PRIORITY: "oras,s3,azure,gcs"
+  SPILL_TO_ALL: "true"
+  SPILL_MIN_FREE_GB: "5"
+  KEEP_LOCAL_AFTER_SPILL: "false"
+
+  # Pages
+  PAGES_ARTIFACT_NAME: image-suite-pages-${{ github.run_id }}
+
+  # 클라우드 자격(있으면 사용) → env 로 노출
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  ECHO_S3_BUCKET: ${{ secrets.ECHO_S3_BUCKET }}
+  AWS_ROLE_TO_ASSUME: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+  AZURE_STORAGE_ACCOUNT: ${{ secrets.AZURE_STORAGE_ACCOUNT }}
+  AZURE_STORAGE_KEY: ${{ secrets.AZURE_STORAGE_KEY }}
+  ECHO_AZURE_CONTAINER: ${{ secrets.ECHO_AZURE_CONTAINER }}
+
+  ECHO_GCS_BUCKET: ${{ secrets.ECHO_GCS_BUCKET }}
+  GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+  GCP_SERVICE_ACCOUNT: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+  GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+
+jobs:
+  build-iso:
+    name: "Build ISO (Download + Verify + Payload/Seed + Installer) → Spill"
+    runs-on: ubuntu-latest
+    env:
+      GH_USER: ${{ github.actor }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Pre-clean (free tens of GB)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup \
+                       /opt/hostedtoolcache/CodeQL /opt/hostedtoolcache/go /opt/microsoft \
+                       /usr/lib/jvm /usr/local/lib/node_modules || true
+          sudo docker system prune -af || true
+          sudo apt-get clean || true
+          sudo rm -rf /var/lib/apt/lists/* || true
+          mkdir -p dist/tmp
+          echo "TMPDIR=$PWD/dist/tmp" >> "$GITHUB_ENV"
+          echo "TMP=$PWD/dist/tmp" >> "$GITHUB_ENV"
+          echo "TEMP=$PWD/dist/tmp" >> "$GITHUB_ENV"
+          df -h
+
+      - name: Init dirs
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p "$ECHO_ROOT"/{linux,rhel}/bulk \
+                   "$DIST_DIR" "$ISO_DIR" "$IMG_DIR" "$LOG_DIR" "$META_DIR" \
+                   "$SEED_DIR"/{cloud-init,preseed,kickstart} "$WORK_DIR" "$TMP_DIR"
+
+      - name: Echo tools (space/spill utils)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cat > "$ECHO_ROOT/echo_tools.sh" <<'EOS'
+          set -Eeuo pipefail
+          TS(){ date -u +'%Y-%m-%dT%H:%M:%SZ'; }
+          echoe(){ printf '[%s] %s\n' "$(TS)" "$*"; }
+          notify(){ echo "::warning ::$*"; echoe "$*"; }
+          softfail(){ echoe "::warning ::$*"; echoe "Continuing despite error"; }
+          df_info(){ df -hT . || true; }
+          disk_free_gb(){ df -PB1G . | awk 'NR==2{print $4}' | sed 's/[^0-9]//g'; }
+          disk_used_pct(){ df -P . | awk 'NR==2{gsub("%","",$5); print $5}'; }
+          reclaim_space(){ sudo docker system prune -af || true; sudo apt-get clean || true; sudo rm -rf /var/lib/apt/lists/* || true; rm -rf dist/tmp/* 2>/dev/null || true; df_info; }
+          ensure_cmd(){ local c="$1"; command -v "$c" >/dev/null 2>&1 && return; sudo apt-get update -y || true; case "$c" in
+            mkisofs) sudo apt-get install -y genisoimage;; xorriso) sudo apt-get install -y xorriso;;
+            isohybrid|isohdpfx.bin) sudo apt-get install -y syslinux-utils isolinux || true;;
+            qemu-img) sudo apt-get install -y qemu-utils;; curl|jq) sudo apt-get install -y curl jq;;
+            sha256sum|sha512sum) sudo apt-get install -y coreutils;; file) sudo apt-get install -y file;;
+            gpg|gpgv|dirmngr) sudo apt-get install -y gnupg dirmngr;;
+            debian-archive-keyring) sudo apt-get install -y debian-archive-keyring;;
+            ubuntu-keyring) sudo apt-get install -y ubuntu-keyring;;
+            aws) sudo apt-get install -y python3-pip && sudo pip3 install --no-cache-dir awscli || true;;
+            az) curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash || true;;
+            google-cloud-cli)
+              echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] http://packages.cloud.google.com/apt cloud-sdk main" | sudo tee /etc/apt/sources.list.d/google-cloud-sdk.list >/dev/null
+              curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | sudo gpg --yes --dearmor -o /usr/share/keyrings/cloud.google.gpg
+              sudo apt-get update -y && sudo apt-get install -y google-cloud-cli;;
+            oras)
+              command -v curl >/dev/null 2>&1 || sudo apt-get install -y curl
+              command -v jq >/dev/null 2>&1 || sudo apt-get install -y jq
+              arch="$(uname -m)"; case "$arch" in x86_64|amd64) goarch="amd64";; aarch64|arm64) goarch="arm64";; s390x) goarch="s390x";; ppc64le) goarch="ppc64le";; *) goarch="amd64";; esac
+              tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
+              ver="$(curl -fsSL --retry 5 --retry-connrefused https://api.github.com/repos/oras-project/oras/releases/latest | jq -r '.tag_name' | sed 's/^v//')"
+              [ -z "$ver" -o "$ver" = "null" ] && ver="1.2.2"
+              url="https://github.com/oras-project/oras/releases/download/v${ver}/oras_${ver}_linux_${goarch}.tar.gz"
+              curl -fsSL --retry 5 --retry-connrefused -o "$tmp/oras.tgz" "$url" || { softfail "oras download failed"; return 0; }
+              sudo tar -xzf "$tmp/oras.tgz" -C /usr/local/bin oras || softfail "oras extract failed"
+              /usr/local/bin/oras version || softfail "oras verify failed";;
+            syft)
+              command -v curl >/dev/null 2>&1 || sudo apt-get install -y curl
+              command -v jq >/dev/null 2>&1 || sudo apt-get install -y jq
+              arch="$(uname -m)"; case "$arch" in x86_64|amd64) goarch="amd64";; aarch64|arm64) goarch="arm64";; s390x) goarch="s390x";; ppc64le) goarch="ppc64le";; *) goarch="amd64";; esac
+              tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
+              ver="$(curl -fsSL --retry 5 --retry-connrefused https://api.github.com/repos/anchore/syft/releases/latest | jq -r '.tag_name' | sed 's/^v//')"
+              [ -z "$ver" -o "$ver" = "null" ] && ver="1.31.0"
+              url="https://github.com/anchore/syft/releases/download/v${ver}/syft_${ver}_linux_${goarch}.tar.gz"
+              curl -fsSL --retry 5 --retry-connrefused -o "$tmp/syft.tgz" "$url" || { softfail "syft download failed"; return 0; }
+              sudo tar -xzf "$tmp/syft.tgz" -C /usr/local/bin syft || softfail "syft extract failed"
+              /usr/local/bin/syft version || softfail "syft verify failed";;
+            *) sudo apt-get install -y "$c" || true;;
+          esac; }
+          available_remotes(){
+            local out=()
+            command -v oras >/dev/null 2>&1 && out+=("oras")
+            [ -n "${ECHO_S3_BUCKET:-}" ] && out+=("s3")
+            [ -n "${AZURE_STORAGE_ACCOUNT:-}" ] && [ -n "${AZURE_STORAGE_KEY:-}" ] && [ -n "${ECHO_AZURE_CONTAINER:-}" ] && out+=("azure")
+            [ -n "${ECHO_GCS_BUCKET:-}" ] && out+=("gcs")
+            printf "%s\n" "${out[@]}"
+          }
+          oras_login(){ [ -z "${GH_TOKEN:-}" ] && return 1; echo "${GH_TOKEN}" | oras login ghcr.io -u "${GH_USER:-github-actions}" --password-stdin; }
+          spill_to_one(){
+            local f="$1" mt="$2" r="$3"
+            case "$r" in
+              oras)
+                ensure_cmd oras; oras_login || softfail "oras login failed"
+                local base_lc="$(echo "${GHCR_BASE}" | tr '[:upper:]' '[:lower:]')"
+                local ref="${base_lc}:${GITHUB_RUN_ID:-manual}"
+                oras push "${ref}" "${f}:${mt}" --artifact-type application/vnd.echo.bundle || softfail "oras push failed";;
+              s3)
+                ensure_cmd aws; aws s3 cp "${f}" "s3://${ECHO_S3_BUCKET}/$(basename "$f")" || softfail "s3 cp failed";;
+              azure)
+                ensure_cmd az; az storage blob upload --account-name "$AZURE_STORAGE_ACCOUNT" --account-key "$AZURE_STORAGE_KEY" -f "${f}" -c "$ECHO_AZURE_CONTAINER" -n "$(basename "$f")" --overwrite true || softfail "azure upload failed";;
+              gcs)
+                ensure_cmd google-cloud-cli; gsutil cp "${f}" "gs://${ECHO_GCS_BUCKET}/" || softfail "gcs cp failed";;
+            esac
+          }
+          spill_file(){
+            local f="$1"; [ ! -f "$f" ] && { softfail "spill_file: not found $f"; return 0; }
+            local mt="application/octet-stream"
+            case "$f" in
+              *.json) mt="application/json";;
+              *.spdx.json) mt="application/spdx+json";;
+              *.txt|*.log|*.md) mt="text/plain";;
+              *.tar) mt="application/x-tar";;
+              *.iso) mt="application/x-cd-image";;
+              *.qcow2) mt="application/x-qemu-disk";;
+            esac
+            mapfile -t rems < <(available_remotes)
+            if [ "${#rems[@]}" -eq 0 ]; then
+              notify "No remote available for spill; keeping local"
+              if [ "$(disk_free_gb)" -lt "${SPILL_MIN_FREE_GB:-5}" ] && [ "${KEEP_LOCAL_AFTER_SPILL:-false}" != "true" ]; then
+                rm -f "${f}" || true; echoe "Disk critical → removed: ${f}"
+              fi
+              return 0
+            fi
+            if [ "${SPILL_TO_ALL:-false}" = "true" ]; then
+              for r in "${rems[@]}"; do spill_to_one "$f" "$mt" "$r"; done
+            else
+              spill_to_one "$f" "$mt" "${rems[0]}"
+            fi
+            [ "${KEEP_LOCAL_AFTER_SPILL:-false}" != "true" ] && { rm -f "${f}" || true; echoe "Spilled & removed: ${f}"; }
+          }
+          ensure_space(){
+            local target_gb="${FREE_TARGET_GB:-20}"; local high_pct="${HIGH_WATER_PCT:-85}"
+            local free="$(disk_free_gb)"; local used="$(disk_used_pct)"
+            echoe "SPACE CHECK: free=${free}GB used=${used}%"
+            if [ "$used" -ge "$high_pct" ] || [ "$free" -lt "$target_gb" ]; then
+              reclaim_space
+              free="$(disk_free_gb)"; used="$(disk_used_pct)"
+              if [ "$used" -ge "$high_pct" ] || [ "$free" -lt "$target_gb" ]; then
+                echoe "SPACE STILL LOW → spill >500M"
+                find dist -type f -size +500M -print0 2>/dev/null | xargs -0 -I{} bash -lc 'source "'"$ECHO_ROOT"'/echo_tools.sh"; spill_file "{}"' || true
+              fi
+            fi
+          }
+          set_official_iso_vars(){
+            local d="$1"
+            case "$d" in
+              ubuntu)
+                ISO_URL="https://releases.ubuntu.com/24.04.3/ubuntu-24.04.3-live-server-amd64.iso"
+                FILE_NAME="ubuntu-24.04.3-live-server-amd64.iso"
+                SUM_TYPE="sha256"
+                SUM_URL="https://releases.ubuntu.com/24.04.3/SHA256SUMS"
+                SUM_SIG_URL="https://releases.ubuntu.com/24.04.3/SHA256SUMS.gpg";;
+              debian)
+                ISO_URL="https://cdimage.debian.org/debian-cd/current/amd64/iso-cd/debian-13.1.0-amd64-netinst.iso"
+                FILE_NAME="debian-13.1.0-amd64-netinst.iso"
+                SUM_TYPE="sha512"
+                SUM_URL="https://cdimage.debian.org/debian-cd/current/amd64/iso-cd/SHA512SUMS"
+                SUM_SIG_URL="https://cdimage.debian.org/debian-cd/current/amd64/iso-cd/SHA512SUMS.sign";;
+              rocky)
+                ISO_URL="https://download.rockylinux.org/pub/rocky/9/isos/x86_64/Rocky-9-latest-x86_64-minimal.iso"
+                FILE_NAME="Rocky-9-latest-x86_64-minimal.iso"
+                SUM_TYPE="sha256"
+                SUM_URL="https://download.rockylinux.org/pub/rocky/9/isos/x86_64/CHECKSUM";;
+              alma|rhel)
+                ISO_URL="https://repo.almalinux.org/almalinux/9/isos/x86_64/AlmaLinux-9-latest_x86_64-minimal.iso"
+                FILE_NAME="AlmaLinux-9-latest_x86_64-minimal.iso"
+                SUM_TYPE="sha256"
+                SUM_URL="https://repo.almalinux.org/almalinux/9/isos/x86_64/CHECKSUM"
+                [ "$d" = "rhel" ] && FALLBACK_NOTE="Requested 'rhel' but used AlmaLinux (auth required for RHEL).";;
+            esac
+          }
+          verify_sum(){ local f="$1" st="$2" lst="$3"; local dir base; dir="$(dirname "$f")"; base="$(basename "$f")";
+            if [[ -n "$lst" && -f "$lst" ]]; then
+              tmp="$dir/.sum.$$.$st"; awk -v f="$base" '{ fn=$2; sub(/^\*/, "", fn); if (fn==f) print $1 "  " f }' "$lst" > "$tmp"
+              if [[ -s "$tmp" ]]; then
+                if [[ "$st" = "sha512" ]]; then ( cd "$dir" && sha512sum -c "$(basename "$tmp")" ) || true
+                else ( cd "$dir" && sha256sum -c "$(basename "$tmp")" ) || true; fi
+                rm -f "$tmp"
+              else
+                ( cd "$dir"; [ "$st" = "sha512" ] && sha512sum "$base" | tee "${base}.sha512.txt" || sha256sum "$base" | tee "${base}.sha256.txt" )
+              fi
+            else
+              ( cd "$dir"; [ "$st" = "sha512" ] && sha512sum "$base" | tee "${base}.sha512.txt" || sha256sum "$base" | tee "${base}.sha256.txt" )
+            fi
+          }
+          verify_gpg(){ local sums="$2" sig="$3" distro="$4";
+            case "$distro" in
+              ubuntu)
+                if [ -f /usr/share/keyrings/ubuntu-archive-keyring.gpg ]; then
+                  gpgv --keyring /usr/share/keyrings/ubuntu-archive-keyring.gpg "$sig" "$sums" || true
+                else
+                  gpg --batch --keyserver hkps://keyserver.ubuntu.com --recv-keys 0xD94AA3F0EFE21092 0x46181433FBB75451 || true
+                  gpg --verify "$sig" "$sums" || true
+                fi;;
+              debian)
+                [ -f /usr/share/keyrings/debian-archive-keyring.gpg ] && gpgv --keyring /usr/share/keyrings/debian-archive-keyring.gpg "$sig" "$sums" || true;;
+            esac
+          }
+          record_download(){ echo "$1 -> $2" >> "dist/meta/DOWNLOADS.txt"; }
+          EOS
+          chmod +x "$ECHO_ROOT/echo_tools.sh"
+
+      - name: Build & Spill — ISO pipeline
+        shell: bash
+        continue-on-error: true
+        run: |
+          set -Eeuo pipefail
+          source "$ECHO_ROOT/echo_tools.sh"
+          ensure_cmd curl; ensure_cmd sha256sum; ensure_cmd sha512sum; ensure_cmd file; ensure_cmd jq
+          ensure_cmd gpg; ensure_cmd gpgv; ensure_cmd dirmngr
+          ensure_cmd debian-archive-keyring || true
+          ensure_cmd ubuntu-keyring || true
+
+          D="${{ inputs.distro || github.event.inputs.distro }}"
+          set_official_iso_vars "$D"
+          [ -z "${ISO_URL:-}" ] && exit 0
+          OUT="$ISO_DIR/$FILE_NAME"
+          curl -fL --progress-bar "$ISO_URL" -o "$OUT"
+          [ -f "$OUT" ] && record_download "$ISO_URL" "$OUT"
+          if [ -n "${SUM_URL:-}" ]; then LIST="$ISO_DIR/$(basename "$SUM_URL")"; curl -fsSL "$SUM_URL" -o "$LIST" || true; fi
+          if [ -n "${SUM_SIG_URL:-}" ] && [ -f "${LIST:-}" ]; then SIG="$ISO_DIR/$(basename "$SUM_SIG_URL")"; curl -fsSL "$SUM_SIG_URL" -o "$SIG" || true; verify_gpg "${SUM_TYPE:-sha256}" "$LIST" "$SIG" "$D" || true; fi
+          verify_sum "$OUT" "${SUM_TYPE:-sha256}" "${LIST:-}"
+          ensure_space
+
+          # Payload ISO → spill
+          ensure_cmd mkisofs || ensure_cmd xorriso
+          LABEL="ECHO_DATA_$(date -u +%Y%m%d)"
+          PISO="$ISO_DIR/custom_payload.iso"
+          if command -v mkisofs >/dev/null 2>&1; then mkisofs -V "$LABEL" -J -R -o "$PISO" "$ECHO_ROOT" || true
+          else xorriso -as mkisofs -V "$LABEL" -J -R -o "$PISO" "$ECHO_ROOT" || true; fi
+          [ -f "$PISO" ] && sha256sum "$PISO" | tee "$META_DIR/custom_payload.sha256.txt" >/dev/null || true
+          spill_file "$PISO"
+
+          # Seed (cloud-init) → spill
+          mkdir -p "$SEED_DIR/cloud-init"
+          cat > "$SEED_DIR/cloud-init/user-data" <<'UD'
+          #cloud-config
+          hostname: echo-host
+          users: [{ name: ubuntu, sudo: "ALL=(ALL) NOPASSWD:ALL", groups: [users, admin, sudo], lock_passwd: false, plain_text_passwd: "echo1234" }]
+          ssh_pwauth: true
+          packages: [vim, curl]
+          runcmd: [ [ bash, -lc, "echo 'hello from cloud-init' > /root/hello.txt" ] ]
+          UD
+          echo "instance-id: iid-echo; local-hostname: echo-host" > "$SEED_DIR/cloud-init/meta-data"
+          CIDATA="$ISO_DIR/seed-cidata.iso"
+          if command -v mkisofs >/dev/null 2>&1; then mkisofs -V CIDATA -J -R -o "$CIDATA" "$SEED_DIR/cloud-init" || true
+          else xorriso -as mkisofs -V CIDATA -J -R -o "$CIDATA" "$SEED_DIR/cloud-init" || true; fi
+          [ -f "$CIDATA" ] && sha256sum "$CIDATA" | tee "$META_DIR/seed_cidata.sha256.txt" >/dev/null || true
+          spill_file "$CIDATA"
+
+          # Full installer ISO → spill & base ISO 삭제
+          ensure_cmd xorriso; ensure_cmd isohybrid || true; ensure_cmd isohdpfx.bin || true
+          WORK="$WORK_DIR/root"; rm -rf "$WORK"; mkdir -p "$WORK"
+          xorriso -osirrox on -indev "$OUT" -extract / "$WORK" || true
+          chmod -R u+w "$WORK" || true
+          case "$D" in
+            ubuntu)
+              mkdir -p "$WORK/nocloud"; cp "$SEED_DIR/cloud-init/"{user-data,meta-data} "$WORK/nocloud/" || true
+              for CFG in "$WORK/boot/grub/grub.cfg" "$WORK/EFI/BOOT/grub.cfg" "$WORK/isolinux/txt.cfg" "$WORK/boot/grub/loopback.cfg"; do
+                [ -f "$CFG" ] || continue
+                sed -i 's,^\(\s*linux[^#]*\)$,\1 autoinstall ds=nocloud;s=/cdrom/nocloud/,' "$CFG" || true
+                sed -i 's,^\(\s*append .*\)$,\1 autoinstall ds=nocloud;s=/cdrom/nocloud/,' "$CFG" || true
+              done
+            ;;
+            debian)
+              mkdir -p "$WORK/preseed"; echo "d-i time/zone string UTC" > "$WORK/preseed/preseed.cfg"
+              for CFG in "$WORK/isolinux/txt.cfg" "$WORK/boot/grub/grub.cfg" "$WORK/EFI/BOOT/grub.cfg"; do
+                [ -f "$CFG" ] || continue
+                sed -i 's,^\(\s*linux[^#]*\)$,\1 auto=true priority=critical file=/cdrom/preseed/preseed.cfg,' "$CFG" || true
+                sed -i 's,^\(\s*append .*\)$,\1 auto=true priority=critical file=/cdrom/preseed/preseed.cfg,' "$CFG" || true
+              done
+            ;;
+            rocky|alma|rhel)
+              echo -e "#version=RHEL9\ntext\nlang en_US.UTF-8\nkeyboard us\ntimezone UTC\nrootpw echo1234" > "$WORK/ks.cfg"
+              for CFG in "$WORK/isolinux/isolinux.cfg" "$WORK/EFI/BOOT/grub.cfg" "$WORK/boot/grub/grub.cfg"; do
+                [ -f "$CFG" ] || continue
+                sed -i 's,^\(\s*linuxefi\?\s\+\S\+\s\+.*\)$,\1 inst.ks=cdrom:/ks.cfg,' "$CFG" || true
+                sed -i 's,^\(\s*append .*\)$,\1 inst.ks=cdrom:/ks.cfg,' "$CFG" || true
+              done
+            ;;
+          esac
+          BIOS_IMG=""; EFI_IMG=""; CATALOG=""
+          [ -f "$WORK/boot/grub/i386-pc/eltorito.img" ] && { BIOS_IMG="boot/grub/i386-pc/eltorito.img"; CATALOG="boot.catalog"; }
+          [ -z "$BIOS_IMG" ] && [ -f "$WORK/isolinux/isolinux.bin" ] && { BIOS_IMG="isolinux/isolinux.bin"; CATALOG="isolinux/boot.cat"; }
+          [ -f "$WORK/boot/grub/efi.img" ] && EFI_IMG="boot/grub/efi.img"
+          [ -z "$EFI_IMG" ] && [ -f "$WORK/EFI/BOOT/efiboot.img" ] && EFI_IMG="EFI/BOOT/efiboot.img"
+          [ -z "$EFI_IMG" ] && [ -f "$WORK/efi.img" ] && EFI_IMG="efi.img"
+          LABEL="ECHO_INST_${D}_$(date -u +%Y%m%d | tr -cd 0-9)"
+          OUTISO="$ISO_DIR/custom_installer_${D}.iso"
+          if [ -n "$BIOS_IMG" ] && [ -n "$EFI_IMG" ]; then
+            xorriso -as mkisofs -r -V "$LABEL" -o "$OUTISO" -J -l ${CATALOG:+-c "$CATALOG"} -b "$BIOS_IMG" -no-emul-boot -boot-load-size 4 -boot-info-table -eltorito-alt-boot -e "$EFI_IMG" -no-emul-boot -isohybrid-gpt-basdat "$WORK" || true
+          elif [ -n "$BIOS_IMG" ]; then
+            xorriso -as mkisofs -r -V "$LABEL" -o "$OUTISO" -J -l ${CATALOG:+-c "$CATALOG"} -b "$BIOS_IMG" -no-emul-boot -boot-load-size 4 -boot-info-table "$WORK" || true
+          elif [ -n "$EFI_IMG" ]; then
+            xorriso -as mkisofs -r -V "$LABEL" -o "$OUTISO" -J -l -e "$EFI_IMG" -no-emul-boot -isohybrid-gpt-basdat "$WORK" || true
+          fi
+          [ -f "$OUTISO" ] && sha256sum "$OUTISO" | tee "$META_DIR/custom_installer.sha256.txt" >/dev/null || true
+          spill_file "$OUTISO"
+          rm -f "$OUT" || true
+          ensure_space
+
+      - name: Upload tiny artifacts from ISO job
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-small-iso-${{ github.run_id }}
+          path: |
+            dist/**
+            dist/.**
+          if-no-files-found: warn
+          retention-days: 7
+
+  build-qcow:
+    name: "Build QCOW2 (base+snap) → Spill"
+    runs-on: ubuntu-latest
+    needs: [build-iso]
+    env:
+      GH_USER: ${{ github.actor }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Pre-clean
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup \
+                       /opt/hostedtoolcache/CodeQL /opt/hostedtoolcache/go /opt/microsoft \
+                       /usr/lib/jvm /usr/local/lib/node_modules || true
+          sudo docker system prune -af || true
+          sudo apt-get clean || true
+          sudo rm -rf /var/lib/apt/lists/* || true
+          mkdir -p dist/tmp
+          echo "TMPDIR=$PWD/dist/tmp" >> "$GITHUB_ENV"
+
+      - name: Echo tools (minimal)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cat > "$ECHO_ROOT/echo_tools.sh" <<'EOS'
+          set -Eeuo pipefail
+          ensure_cmd(){ command -v "$1" >/dev/null 2>&1 || sudo apt-get update -y || true; command -v "$1" >/dev/null 2>&1 || sudo apt-get install -y "$1" || true; }
+          spill_all(){
+            local f="$1"
+            [ -f "$f" ] || return 0
+            if command -v oras >/dev/null 2>&1 && [ -n "${GH_TOKEN:-}" ]; then echo "${GH_TOKEN}" | oras login ghcr.io -u "${GH_USER:-github-actions}" --password-stdin || true; base_lc="$(echo "${GHCR_BASE}" | tr '[:upper:]' '[:lower:]')"; ref="${base_lc}:${GITHUB_RUN_ID:-manual}"; oras push "${ref}" "${f}:application/octet-stream" --artifact-type application/vnd.echo.bundle || true; fi
+            [ -n "${ECHO_S3_BUCKET:-}" ] && command -v aws >/dev/null 2>&1 && aws s3 cp "${f}" "s3://${ECHO_S3_BUCKET}/$(basename "$f")" || true
+            [ -n "${AZURE_STORAGE_ACCOUNT:-}" ] && [ -n "${AZURE_STORAGE_KEY:-}" ] && [ -n "${ECHO_AZURE_CONTAINER:-}" ] && command -v az >/dev/null 2>&1 && az storage blob upload --account-name "$AZURE_STORAGE_ACCOUNT" --account-key "$AZURE_STORAGE_KEY" -f "${f}" -c "$ECHO_AZURE_CONTAINER" -n "$(basename "$f")" --overwrite true || true
+            [ -n "${ECHO_GCS_BUCKET:-}" ] && command -v gsutil >/dev/null 2>&1 && gsutil cp "${f}" "gs://${ECHO_GCS_BUCKET}/" || true
+            [ "${KEEP_LOCAL_AFTER_SPILL:-false}" != "true" ] && rm -f "${f}" || true
+          }
+          EOS
+          chmod +x "$ECHO_ROOT/echo_tools.sh"
+
+      - name: Build QCOW2 & Spill
+        shell: bash
+        continue-on-error: true
+        run: |
+          set -Eeuo pipefail
+          source "$ECHO_ROOT/echo_tools.sh"
+          ensure_cmd qemu-img
+          mkdir -p "$IMG_DIR" "$META_DIR" "$LOG_DIR"
+          SIZE_GB="${{ inputs.qcow_size_gb || github.event.inputs.qcow_size_gb }}"
+          DISTRO="${{ inputs.distro || github.event.inputs.distro }}"
+          pushd "$IMG_DIR" >/dev/null
+          BASE="base_${DISTRO}.qcow2"; SNAP="snap_${DISTRO}.qcow2"
+          qemu-img create -f qcow2 -o cluster_size=65536,compression_type=zlib "$BASE" "${SIZE_GB}G" || true
+          qemu-img create -f qcow2 -b "$BASE" -F qcow2 "$SNAP" || true
+          popd >/dev/null
+          source "$ECHO_ROOT/echo_tools.sh"; spill_all "$IMG_DIR/$BASE"
+          source "$ECHO_ROOT/echo_tools.sh"; spill_all "$IMG_DIR/$SNAP"
+          echo "{}" > "$META_DIR/qcow2.done.json"
+
+      - name: Upload tiny artifacts from QCOW job
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-small-qcow-${{ github.run_id }}
+          path: |
+            dist/**
+            dist/.**
+          if-no-files-found: warn
+          retention-days: 7
+
+  sbom-hash:
+    name: "SBOM + Hash Catalog (merge small artifacts) → Pages artifact"
+    runs-on: ubuntu-latest
+    needs: [build-iso, build-qcow]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Pre-clean
+        run: |
+          sudo docker system prune -af || true
+          sudo apt-get clean || true
+          sudo rm -rf /var/lib/apt/lists/* || true
+
+      - name: Download small artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: .
+
+      - name: Merge to dist/
+        run: |
+          mkdir -p dist
+          shopt -s dotglob
+          for d in dist-small-iso-* dist-small-qcow-*; do
+            [ -d "$d" ] || continue
+            rsync -a "$d"/ dist/
+          done
+
+      - name: SBOM & Hash
+        shell: bash
+        continue-on-error: true
+        run: |
+          set -Eeuo pipefail
+          sudo apt-get update -y || true
+          sudo apt-get install -y jq coreutils || true
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin || true
+          mkdir -p dist/sbom dist/meta
+          /usr/local/bin/syft dir:"dist" -o spdx-json > "dist/sbom/dist.spdx.json" || true
+          HASH_JSON="dist/meta/hash_index.json"; : > "$HASH_JSON"; echo "[" >> "$HASH_JSON"; first=1
+          while IFS= read -r -d '' f; do
+            sha256=$(sha256sum "$f" | awk '{print $1}')
+            sha512=$(sha512sum "$f" | awk '{print $1}')
+            size=$(stat -c%s "$f"); rel="${f#dist/}"
+            entry=$(jq -n --arg path "$rel" --arg sha256 "$sha256" --arg sha512 "$sha512" --argjson size "$size" '{path:$path,sha256:$sha256,sha512:$sha512,size:$size}')
+            if [ $first -eq 1 ]; then echo "  $entry" >> "$HASH_JSON"; first=0; else echo " ,$entry" >> "$HASH_JSON"; fi
+          done < <(find dist -type f -print0)
+          echo "]" >> "$HASH_JSON"
+
+      - name: Upload tiny artifact (merged dist) for later steps
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-small-merged-${{ github.run_id }}
+          path: |
+            dist/**
+            dist/.**
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Prepare Pages Artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+          name: ${{ env.PAGES_ARTIFACT_NAME }}
+
+  deploy-ghcr:
+    name: "Deploy leftovers → GHCR (ORAS)"
+    runs-on: ubuntu-latest
+    needs: [sbom-hash]
+    env:
+      GH_USER: ${{ github.actor }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Guard:GHCR token present?
+        id: guard
+        shell: bash
+        run: |
+          if [ -n "${GH_TOKEN:-}" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "GH_TOKEN missing → skip job steps."
+          fi
+
+      - uses: actions/download-artifact@v4
+        if: ${{ steps.guard.outputs.run == 'true' }}
+        with:
+          name: dist-small-merged-${{ github.run_id }}
+
+      - name: Push remaining small files via ORAS
+        if: ${{ steps.guard.outputs.run == 'true' }}
+        shell: bash
+        continue-on-error: true
+        run: |
+          set -Eeuo pipefail
+          sudo apt-get update -y || true
+          sudo apt-get install -y curl jq || true
+          arch="$(uname -m)"; case "$arch" in x86_64|amd64) goarch="amd64";; aarch64|arm64) goarch="arm64";; *) goarch="amd64";; esac
+          ver="$(curl -fsSL https://api.github.com/repos/oras-project/oras/releases/latest | jq -r '.tag_name' | sed 's/^v//')"
+          [ -z "$ver" -o "$ver" = "null" ] && ver="1.2.2"
+          curl -fsSL -o /tmp/oras.tgz "https://github.com/oras-project/oras/releases/download/v${ver}/oras_${ver}_linux_${goarch}.tar.gz"
+          sudo tar -xzf /tmp/oras.tgz -C /usr/local/bin oras
+          echo "${GH_TOKEN}" | oras login ghcr.io -u "${GH_USER}" --password-stdin
+          BASE_LC="$(echo "${GHCR_BASE}" | tr '[:upper:]' '[:lower:]')"; REF="${BASE_LC}:${{ github.run_id }}"
+          args=(push "$REF" --artifact-type application/vnd.echo.bundle)
+          while IFS= read -r -d '' f; do
+            mt="application/octet-stream"
+            case "$f" in *.json) mt="application/json";; *.spdx.json) mt="application/spdx+json";; *.txt|*.log|*.md) mt="text/plain";; *.tar) mt="application/x-tar";; esac
+            args+=("$f:$mt")
+          done < <(find dist -type f -maxdepth 3 -print0)
+          "${args[@]}" || true
+
+  deploy-s3:
+    name: "Deploy to S3 (small dist)"
+    runs-on: ubuntu-latest
+    needs: [sbom-hash]
+    steps:
+      - name: Guard:S3 config present?
+        id: guard
+        shell: bash
+        run: |
+          if [ -n "${ECHO_S3_BUCKET:-}" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "ECHO_S3_BUCKET missing → skip job steps."
+          fi
+
+      - uses: actions/download-artifact@v4
+        if: ${{ steps.guard.outputs.run == 'true' }}
+        with:
+          name: dist-small-merged-${{ github.run_id }}
+
+      - name: Configure AWS
+        if: ${{ steps.guard.outputs.run == 'true' }}
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Sync dist/ → s3://${{ env.ECHO_S3_BUCKET }}/
+        if: ${{ steps.guard.outputs.run == 'true' }}
+        shell: bash
+        run: |
+          aws s3 sync "dist/" "s3://${ECHO_S3_BUCKET}/" --delete || true
+
+  deploy-azure:
+    name: "Deploy to Azure Blob (small dist)"
+    runs-on: ubuntu-latest
+    needs: [sbom-hash]
+    steps:
+      - name: Guard:Azure config present?
+        id: guard
+        shell: bash
+        run: |
+          if [ -n "${AZURE_STORAGE_ACCOUNT:-}" ] && [ -n "${AZURE_STORAGE_KEY:-}" ] && [ -n "${ECHO_AZURE_CONTAINER:-}" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "Azure secrets incomplete → skip job steps."
+          fi
+
+      - uses: actions/download-artifact@v4
+        if: ${{ steps.guard.outputs.run == 'true' }}
+        with:
+          name: dist-small-merged-${{ github.run_id }}
+
+      - name: Upload-batch to Azure
+        if: ${{ steps.guard.outputs.run == 'true' }}
+        shell: bash
+        run: |
+          curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash || true
+          az storage blob upload-batch \
+            --account-name "${AZURE_STORAGE_ACCOUNT}" \
+            --account-key "${AZURE_STORAGE_KEY}" \
+            -d "${ECHO_AZURE_CONTAINER}" \
+            -s "dist" --overwrite true || true
+
+  deploy-gcs:
+    name: "Deploy to GCS (small dist)"
+    runs-on: ubuntu-latest
+    needs: [sbom-hash]
+    steps:
+      - name: Guard:GCS bucket present?
+        id: guard
+        shell: bash
+        run: |
+          if [ -n "${ECHO_GCS_BUCKET:-}" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "ECHO_GCS_BUCKET missing → skip job steps."
+          fi
+
+      - uses: actions/download-artifact@v4
+        if: ${{ steps.guard.outputs.run == 'true' }}
+        with:
+          name: dist-small-merged-${{ github.run_id }}
+
+      # NEW: guard WIF in a step (no secrets.* in expressions)
+      - name: Guard:GCP WIF present?
+        id: guard_wif
+        if: ${{ steps.guard.outputs.run == 'true' }}
+        shell: bash
+        run: |
+          if [ -n "${GCP_WORKLOAD_IDENTITY_PROVIDER:-}" ] && [ -n "${GCP_SERVICE_ACCOUNT:-}" ]; then
+            echo "wif=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "wif=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Auth (optional WIF)
+        id: wif
+        if: ${{ steps.guard.outputs.run == 'true' && steps.guard_wif.outputs.wif == 'true' }}
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ env.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ env.GCP_SERVICE_ACCOUNT }}
+          project_id: ${{ env.GCP_PROJECT_ID }}
+
+      - name: Setup gcloud
+        if: ${{ steps.guard.outputs.run == 'true' }}
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: rsync to GCS
+        if: ${{ steps.guard.outputs.run == 'true' }}
+        shell: bash
+        run: |
+          gsutil -m rsync -d -r "dist" "gs://${ECHO_GCS_BUCKET}" || true
+
+  deploy-pages:
+    name: "Deploy to GitHub Pages"
+    runs-on: ubuntu-latest
+    needs: [sbom-hash]
+    steps:
+      - name: Deploy Pages
+        uses: actions/deploy-pages@v4
+        with:
+          artifact_name: ${{ env.PAGES_ARTIFACT_NAME }}
+
+  release:
+    name: "Create GitHub Release (small files only)"
+    runs-on: ubuntu-latest
+    needs: [sbom-hash]
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist-small-merged-${{ github.run_id }}
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        continue-on-error: true
+        with:
+          tag_name: ${{ inputs.release_tag && inputs.release_tag != '' && inputs.release_tag || format('auto-{0}', github.run_id) }}
+          name: "Linux/RHEL Image Suite • ${{ inputs.distro || github.event.inputs.distro }}"
+          body: |
+            Split pipeline with aggressive spilling to ORAS/S3/Azure/GCS and per-service deploy jobs to avoid disk-full on hosted runners.
+            - Distro: `${{ inputs.distro || github.event.inputs.distro }}`
+            - See `dist/meta/*.json` for checksums/index.
+            - Large artifacts (ISO/QCOW2) were uploaded to configured remotes during build jobs.
+          files: |
+            dist/meta/**
+            dist/logs/**
+            dist/sbom/**
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
